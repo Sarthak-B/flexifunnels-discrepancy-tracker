@@ -7,6 +7,11 @@ permissions:
   contents: read
 
 jobs:
+
+  # ============================================================
+  # JOB 1: GOOGLE SHEETS CONNECTION TEST
+  # ============================================================
+
   test-google-sheets:
     name: Test Google Sheets Connection
     runs-on: ubuntu-latest
@@ -29,6 +34,9 @@ jobs:
           RAW_DATA_SHEET_ID: ${{ vars.RAW_DATA_SHEET_ID }}
           UTM_SHEET_ID: ${{ vars.UTM_SHEET_ID }}
           DISCREPANCY_SHEET_ID: ${{ vars.DISCREPANCY_SHEET_ID }}
+          UTM_LANDING_TAB: ${{ vars.UTM_LANDING_TAB }}
+          UTM_REG_TAB: ${{ vars.UTM_REG_TAB }}
+          DISCREPANCY_TAB_NAME: ${{ vars.DISCREPANCY_TAB_NAME }}
 
         run: |
           python -u - <<'PY'
@@ -39,7 +47,7 @@ jobs:
           from google.oauth2.service_account import Credentials
 
           print("=" * 60)
-          print("GOOGLE SHEETS CONNECTION TEST")
+          print("GOOGLE SHEETS CONNECTION TEST - VERSION 5")
           print("=" * 60)
 
           required = [
@@ -68,24 +76,62 @@ jobs:
 
           client = gspread.authorize(credentials)
 
-          sheets = {
+          spreadsheets = {
               "RAW DATA": os.environ["RAW_DATA_SHEET_ID"],
               "UTM": os.environ["UTM_SHEET_ID"],
               "DISCREPANCY STATS": os.environ["DISCREPANCY_SHEET_ID"],
           }
 
-          for label, sheet_id in sheets.items():
+          opened = {}
+
+          for label, sheet_id in spreadsheets.items():
               spreadsheet = client.open_by_key(sheet_id)
+              opened[label] = spreadsheet
 
               print("\n" + label + ": CONNECTED")
               print("Spreadsheet:", spreadsheet.title)
 
-              for worksheet in spreadsheet.worksheets():
+              worksheets = spreadsheet.worksheets()
+
+              print("Total tabs:", len(worksheets))
+
+              for worksheet in worksheets:
                   print("  Tab:", worksheet.title)
 
-          print("\nALL GOOGLE SHEETS CONNECTIONS SUCCESSFUL")
+          print("\nCHECKING CONFIGURED SOURCE TABS")
+
+          checks = [
+              ("UTM_LANDING_TAB", "UTM"),
+              ("UTM_REG_TAB", "UTM"),
+              ("DISCREPANCY_TAB_NAME", "DISCREPANCY STATS"),
+          ]
+
+          for variable, spreadsheet_label in checks:
+              tab_name = os.environ.get(variable, "").strip()
+
+              if not tab_name:
+                  print(variable + ": NOT CONFIGURED")
+                  continue
+
+              spreadsheet = opened[spreadsheet_label]
+
+              try:
+                  spreadsheet.worksheet(tab_name)
+                  print(variable + ": FOUND")
+              except gspread.WorksheetNotFound:
+                  raise RuntimeError(
+                      variable + " does not match an existing tab."
+                  )
+
+          print("\n" + "=" * 60)
+          print("GOOGLE SHEETS CONNECTION TEST SUCCESSFUL")
           print("READ-ONLY TEST: NO DATA MODIFIED")
+          print("=" * 60)
           PY
+
+  # ============================================================
+  # JOB 2: FLEXIFUNNELS LOGIN + SUB-USER SELECTION
+  # ============================================================
 
   test-flexifunnels-login:
     name: Test FlexiFunnels Login
@@ -104,22 +150,28 @@ jobs:
           python -m pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Diagnose login and account selection
+      - name: Test login, sub-user selection, and project
         env:
           FLEXIFUNNELS_EMAIL: ${{ secrets.FLEXIFUNNELS_EMAIL }}
           FLEXIFUNNELS_PASSWORD: ${{ secrets.FLEXIFUNNELS_PASSWORD }}
           FLEXIFUNNELS_PROJECT_URL: ${{ vars.FLEXIFUNNELS_PROJECT_URL }}
+          FLEXIFUNNELS_SUB_USER: Saurabh Bhatnagar
 
         run: |
           python -u - <<'PY'
           import os
           import time
+          import re
 
           from urllib.parse import urlparse
-          from playwright.sync_api import sync_playwright
+
+          from playwright.sync_api import (
+              sync_playwright,
+              TimeoutError as PlaywrightTimeout,
+          )
 
           print("=" * 60)
-          print("FLEXIFUNNELS LOGIN TEST - VERSION 4")
+          print("FLEXIFUNNELS LOGIN TEST - VERSION 5")
           print("=" * 60)
 
           email = os.environ.get(
@@ -134,9 +186,23 @@ jobs:
               "FLEXIFUNNELS_PROJECT_URL", ""
           ).strip()
 
-          if not email or not password:
+          sub_user = os.environ.get(
+              "FLEXIFUNNELS_SUB_USER", ""
+          ).strip()
+
+          if not email:
               raise RuntimeError(
-                  "FlexiFunnels login secrets are missing."
+                  "FLEXIFUNNELS_EMAIL is missing."
+              )
+
+          if not password:
+              raise RuntimeError(
+                  "FLEXIFUNNELS_PASSWORD is missing."
+              )
+
+          if not sub_user:
+              raise RuntimeError(
+                  "FLEXIFUNNELS_SUB_USER is missing."
               )
 
           parsed_project = urlparse(project_url)
@@ -151,6 +217,10 @@ jobs:
                   "Unexpected FlexiFunnels project URL."
               )
 
+          expected_project_path = (
+              parsed_project.path.rstrip("/")
+          )
+
           def safe_location(page):
               parsed = urlparse(page.url)
 
@@ -162,7 +232,9 @@ jobs:
               )
 
           def visible_first(locator):
-              for index in range(min(locator.count(), 30)):
+              count = min(locator.count(), 50)
+
+              for index in range(count):
                   item = locator.nth(index)
 
                   if item.is_visible():
@@ -170,180 +242,148 @@ jobs:
 
               return None
 
-          def inspect_controls(page):
+          def wait_for_path_change(page, original_path, seconds=30):
+              deadline = time.monotonic() + seconds
+
+              while time.monotonic() < deadline:
+                  current = urlparse(page.url).path.rstrip("/")
+
+                  if current != original_path:
+                      return current
+
+                  time.sleep(1)
+
+              return urlparse(page.url).path.rstrip("/")
+
+          def click_named_sub_user(page, name):
               """
-              Print only structural metadata.
+              Select only the requested sub-user.
 
-              Never print:
-              - Account or workspace names
-              - Email addresses
-              - Passwords
-              - Page text or HTML
-              - Cookies or tokens
-              - Form values
+              Never click an unrelated account or an
+              arbitrary button based on its position.
               """
 
-              print("\nACCOUNT SELECTION DIAGNOSTICS")
-              print("=" * 60)
+              print("\nSTEP 7: Finding requested sub-user")
 
-              print("Location:", safe_location(page))
+              print("Expected sub-user: Saurabh Bhatnagar")
 
-              categories = {
-                  "buttons": "button",
-                  "links": "a",
-                  "dialogs": '[role="dialog"]',
-                  "radio_inputs": 'input[type="radio"]',
-                  "checkboxes": 'input[type="checkbox"]',
-                  "select_menus": "select",
-                  "listboxes": '[role="listbox"]',
-                  "options": '[role="option"]',
-                  "comboboxes": '[role="combobox"]',
-                  "forms": "form",
-                  "images": "img",
-              }
+              page.wait_for_timeout(3000)
 
-              for label, selector in categories.items():
-                  locator = page.locator(selector)
-
-                  total = locator.count()
-
-                  visible = sum(
-                      locator.nth(i).is_visible()
-                      for i in range(min(total, 100))
-                  )
-
-                  print(
-                      f"{label}: total={total}, "
-                      f"visible={visible}"
-                  )
-
-              print("\nVISIBLE BUTTON STRUCTURE")
-              print("-" * 60)
-
-              buttons = page.locator(
-                  'button, [role="button"]'
+              exact_name = re.compile(
+                  r"^\s*" + re.escape(name) + r"\s*$",
+                  re.IGNORECASE,
               )
 
-              button_number = 0
+              # First try accessible controls that carry
+              # the exact requested account name.
 
-              for index in range(min(buttons.count(), 50)):
-                  button = buttons.nth(index)
+              candidate_locators = [
+                  (
+                      "Exact button name",
+                      page.get_by_role(
+                          "button",
+                          name=exact_name,
+                      ),
+                  ),
+                  (
+                      "Exact link name",
+                      page.get_by_role(
+                          "link",
+                          name=exact_name,
+                      ),
+                  ),
+                  (
+                      "Exact text",
+                      page.get_by_text(
+                          exact_name,
+                      ),
+                  ),
+              ]
 
-                  if not button.is_visible():
+              for description, locator in candidate_locators:
+
+                  matches = [
+                      locator.nth(index)
+                      for index in range(min(locator.count(), 30))
+                      if locator.nth(index).is_visible()
+                  ]
+
+                  if len(matches) != 1:
                       continue
 
-                  button_number += 1
+                  candidate = matches[0]
 
-                  tag = button.evaluate(
+                  print(
+                      "Found unique account match using:",
+                      description,
+                  )
+
+                  # Click the named element itself if it
+                  # is an interactive control.
+
+                  tag = candidate.evaluate(
                       "(element) => element.tagName.toLowerCase()"
                   )
 
-                  button_type = button.get_attribute(
-                      "type"
-                  ) or "none"
+                  role = candidate.get_attribute("role")
 
-                  if button_type not in [
-                      "button",
-                      "submit",
-                      "reset",
-                      "none",
-                  ]:
-                      button_type = "other"
+                  if tag in ("button", "a") or role == "button":
+                      candidate.click(timeout=10000)
 
-                  disabled = button.is_disabled()
+                      print("Named sub-user control clicked.")
+                      return True
 
-                  in_dialog = button.evaluate(
-                      """(element) => Boolean(
-                          element.closest('[role="dialog"]')
-                      )"""
+                  # Otherwise, find a directly associated
+                  # interactive ancestor.
+
+                  # Do not select arbitrary buttons in
+                  # other account rows.
+
+                  ancestor = candidate.locator(
+                      "xpath=ancestor::*["
+                      "self::button or "
+                      "self::a or "
+                      "@role='button'"
+                      "][1]"
                   )
 
-                  print(
-                      f"Button {button_number}: "
-                      f"tag={tag}, "
-                      f"type={button_type}, "
-                      f"disabled={disabled}, "
-                      f"inside_dialog={in_dialog}"
-                  )
+                  if ancestor.count() == 1:
+                      if ancestor.is_visible():
+                          ancestor.click(timeout=10000)
 
-              print("\nVISIBLE LINK STRUCTURE")
-              print("-" * 60)
+                          print(
+                              "Sub-user account control clicked."
+                          )
 
-              links = page.locator("a")
+                          return True
 
-              link_number = 0
+                  # Some interfaces make the account
+                  # name itself clickable through JS.
+                  # Try a normal Playwright click only
+                  # when the exact name is unique.
 
-              for index in range(min(links.count(), 50)):
-                  link = links.nth(index)
+                  try:
+                      candidate.click(
+                          timeout=5000,
+                      )
 
-                  if not link.is_visible():
-                      continue
+                      print(
+                          "Exact sub-user name clicked."
+                      )
 
-                  link_number += 1
+                      return True
 
-                  href = link.get_attribute("href") or ""
+                  except PlaywrightTimeout:
+                      print(
+                          "Name found but not directly clickable."
+                      )
 
-                  # Do not print hrefs: they may contain
-                  # account IDs, tokens, or other private data.
+              print(
+                  "Could not safely identify a unique "
+                  "clickable control for the requested sub-user."
+              )
 
-                  if not href:
-                      href_type = "no_href"
-                  elif href.startswith("#"):
-                      href_type = "fragment"
-                  elif href.startswith("javascript:"):
-                      href_type = "javascript"
-                  elif href.startswith("/"):
-                      href_type = "internal_relative"
-                  elif href.startswith("https://"):
-                      href_type = "absolute_https"
-                  else:
-                      href_type = "other"
-
-                  in_dialog = link.evaluate(
-                      """(element) => Boolean(
-                          element.closest('[role="dialog"]')
-                      )"""
-                  )
-
-                  print(
-                      f"Link {link_number}: "
-                      f"href_type={href_type}, "
-                      f"inside_dialog={in_dialog}"
-                  )
-
-              print("\nDIALOG STRUCTURE")
-              print("-" * 60)
-
-              dialogs = page.locator('[role="dialog"]')
-
-              for index in range(min(dialogs.count(), 10)):
-                  dialog = dialogs.nth(index)
-
-                  if not dialog.is_visible():
-                      continue
-
-                  print(
-                      f"Dialog {index + 1}: visible=True"
-                  )
-
-                  print(
-                      "  Buttons:",
-                      dialog.locator("button").count()
-                  )
-
-                  print(
-                      "  Links:",
-                      dialog.locator("a").count()
-                  )
-
-                  print(
-                      "  Inputs:",
-                      dialog.locator("input").count()
-                  )
-
-              print("\nACCOUNT SELECTION NOT PERFORMED")
-              print("NO ACCOUNT NAMES OR EMAILS PRINTED")
-              print("=" * 60)
+              return False
 
           with sync_playwright() as p:
 
@@ -365,6 +405,10 @@ jobs:
 
               try:
 
+                  # ============================================
+                  # STEP 1: OPEN LOGIN
+                  # ============================================
+
                   print("\nSTEP 1: Opening FlexiFunnels")
 
                   page.goto(
@@ -374,6 +418,10 @@ jobs:
                   )
 
                   print("Location:", safe_location(page))
+
+                  # ============================================
+                  # STEP 2: FIND LOGIN FIELDS
+                  # ============================================
 
                   print("\nSTEP 2: Finding login fields")
 
@@ -386,7 +434,9 @@ jobs:
                   )
 
                   password_field = visible_first(
-                      page.locator('input[type="password"]')
+                      page.locator(
+                          'input[type="password"]'
+                      )
                   )
 
                   if email_field is None:
@@ -401,12 +451,20 @@ jobs:
 
                   print("Login fields found.")
 
+                  # ============================================
+                  # STEP 3: ENTER CREDENTIALS
+                  # ============================================
+
                   print("\nSTEP 3: Entering credentials")
 
                   email_field.fill(email)
                   password_field.fill(password)
 
                   print("Credentials entered.")
+
+                  # ============================================
+                  # STEP 4: FIND LOGIN BUTTON
+                  # ============================================
 
                   print("\nSTEP 4: Finding login button")
 
@@ -427,11 +485,17 @@ jobs:
 
                       if candidate is not None:
                           login_button = candidate
+
                           print(
-                              "Login button selector:",
-                              selector
+                              "Login button found using:",
+                              selector,
                           )
+
                           break
+
+                  # ============================================
+                  # STEP 5: SUBMIT LOGIN
+                  # ============================================
 
                   print("\nSTEP 5: Submitting login")
 
@@ -442,26 +506,93 @@ jobs:
 
                   print("Login submitted.")
 
-                  print("\nSTEP 6: Waiting for authentication")
+                  # ============================================
+                  # STEP 6: WAIT FOR ACCOUNT SELECTION
+                  # ============================================
 
-                  deadline = time.monotonic() + 45
+                  print(
+                      "\nSTEP 6: Waiting for authentication"
+                  )
 
-                  while time.monotonic() < deadline:
+                  current_path = wait_for_path_change(
+                      page,
+                      "/login",
+                      seconds=30,
+                  )
+
+                  print(
+                      "Location after login:",
+                      safe_location(page),
+                  )
+
+                  if current_path == "/login":
+
+                      print(
+                          "Still on login URL. "
+                          "Checking protected project route."
+                      )
+
+                      page.goto(
+                          project_url,
+                          wait_until="domcontentloaded",
+                          timeout=60000,
+                      )
+
+                      page.wait_for_timeout(3000)
+
                       current_path = urlparse(
                           page.url
                       ).path.rstrip("/")
 
-                      if current_path != "/login":
-                          break
-
-                      time.sleep(1)
-
                   print(
-                      "Location after waiting:",
-                      safe_location(page)
+                      "Current location:",
+                      safe_location(page),
                   )
 
-                  print("\nSTEP 7: Opening project")
+                  # ============================================
+                  # STEP 7: SELECT SUB-USER
+                  # ============================================
+
+                  if current_path == "/switch-sub-users":
+
+                      print(
+                          "\nSUB-USER SELECTION SCREEN DETECTED"
+                      )
+
+                      selected = click_named_sub_user(
+                          page,
+                          sub_user,
+                      )
+
+                      if not selected:
+                          raise RuntimeError(
+                              "Requested sub-user could not "
+                              "be safely selected."
+                          )
+
+                      print(
+                          "\nSTEP 8: Waiting after sub-user selection"
+                      )
+
+                      page.wait_for_timeout(5000)
+
+                      print(
+                          "Location after selection:",
+                          safe_location(page),
+                      )
+
+                  else:
+
+                      print(
+                          "\nSub-user selection page "
+                          "not currently displayed."
+                      )
+
+                  # ============================================
+                  # STEP 9: OPEN PROJECT
+                  # ============================================
+
+                  print("\nSTEP 9: Opening FlexiFunnels project")
 
                   page.goto(
                       project_url,
@@ -469,76 +600,90 @@ jobs:
                       timeout=60000,
                   )
 
-                  page.wait_for_timeout(5000)
-
                   print(
-                      "Location after project navigation:",
-                      safe_location(page)
+                      "Project navigation completed."
                   )
 
-                  print("\nSTEP 8: Checking account selection")
+                  print(
+                      "Current location:",
+                      safe_location(page),
+                  )
 
-                  current_path = urlparse(
-                      page.url
-                  ).path.rstrip("/")
+                  # ============================================
+                  # STEP 10: VERIFY PROJECT
+                  # ============================================
 
-                  if current_path == "/switch-sub-users":
+                  print("\nSTEP 10: Verifying project access")
 
-                      print(
-                          "ACCOUNT SELECTION SCREEN DETECTED"
-                      )
+                  deadline = time.monotonic() + 30
 
-                      inspect_controls(page)
+                  verified = False
 
-                      print("\n" + "=" * 60)
-                      print("LOGIN FLOW DIAGNOSTIC COMPLETED")
-                      print("ACCOUNT SELECTION REQUIRED")
-                      print("PROJECT ACCESS NOT YET VERIFIED")
-                      print("NO GOOGLE SHEETS MODIFIED")
-                      print("=" * 60)
+                  while time.monotonic() < deadline:
 
-                  elif current_path == parsed_project.path.rstrip("/"):
+                      current_path = urlparse(
+                          page.url
+                      ).path.rstrip("/")
 
-                      project_content = page.get_by_text(
-                          "Funnel Builder Agent",
-                          exact=False,
-                      )
+                      if current_path == expected_project_path:
 
-                      project_content.first.wait_for(
-                          state="visible",
-                          timeout=15000,
-                      )
+                          project_content = page.get_by_text(
+                              "Funnel Builder Agent",
+                              exact=False,
+                          )
 
-                      print(
-                          "SUCCESS: PROJECT ACCESS VERIFIED"
-                      )
+                          if visible_first(project_content) is not None:
+                              verified = True
+                              break
 
-                  else:
+                      time.sleep(2)
+
+                  if not verified:
 
                       print(
-                          "Unexpected location:",
-                          safe_location(page)
+                          "Project verification unsuccessful."
+                      )
+
+                      print(
+                          "Final location:",
+                          safe_location(page),
                       )
 
                       raise RuntimeError(
-                          "Login flow did not reach the "
-                          "project or account-selection screen."
+                          "Project could not be verified "
+                          "after sub-user selection."
                       )
+
+                  # ============================================
+                  # SUCCESS
+                  # ============================================
+
+                  print("\n" + "=" * 60)
+                  print("SUCCESS: FLEXIFUNNELS LOGIN VERIFIED")
+                  print("SUCCESS: SUB-USER SELECTION COMPLETED")
+                  print("SUCCESS: PROJECT ACCESS VERIFIED")
+                  print("NO REPORTS DOWNLOADED")
+                  print("NO GOOGLE SHEETS MODIFIED")
+                  print("=" * 60)
 
               except Exception as exc:
 
-                  print("\nFLEXIFUNNELS TEST FAILED")
+                  print("\n" + "=" * 60)
+                  print("FLEXIFUNNELS TEST FAILED")
                   print(
                       "Error type:",
-                      type(exc).__name__
+                      type(exc).__name__,
                   )
                   print(
-                      "Location:",
-                      safe_location(page)
+                      "Last browser location:",
+                      safe_location(page),
                   )
+                  print("=" * 60)
 
                   raise RuntimeError(
-                      "FlexiFunnels login diagnostic failed."
+                      "FlexiFunnels login, sub-user "
+                      "selection, or project verification failed. "
+                      "Review the numbered steps above."
                   ) from None
 
               finally:
