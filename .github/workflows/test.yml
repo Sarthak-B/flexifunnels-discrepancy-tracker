@@ -160,6 +160,7 @@ jobs:
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
+          print('WORKFLOW REVISION: V14-R6 — applied range and sibling count verification')
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
           PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
           LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
@@ -1027,6 +1028,79 @@ jobs:
                   print('Calendar-only diagnostics unavailable.')
 
 
+          def range_dates(value):
+              # Read the two ISO dates independently of spacing or the display separator.
+              return re.findall(r'\b\d{4}-\d{2}-\d{2}\b', value.strip()) if len(value) <= 100 else []
+
+
+          def applied_range_matches(page):
+              expected_dates = [yesterday.isoformat(), today.isoformat()]
+              values = [field.input_value() for field in visible_items(page.locator('input'))]
+              if any(range_dates(value) == expected_dates for value in values):
+                  return True
+              # The selected range can be rendered as text rather than an input value.
+              pattern = re.compile(r'^\s*' + yesterday.isoformat() + r'\s*(?:to|[-–—~])\s*' + today.isoformat() + r'\s*$', re.IGNORECASE)
+              return unique_visible(page.get_by_text(pattern)) is not None
+
+
+          def read_report_count(page):
+              heading = unique_visible(page.get_by_text(re.compile(r'^\s*Page Reports\b')))
+              if heading is None:
+                  return None
+              # The [count] badge may be a sibling of the Page Reports text. Read only
+              # its nearby header, not the whole report or any customer rows.
+              text = heading.evaluate('''el => {
+                  for (let i = 0; el && i < 4; i++, el = el.parentElement) {
+                      const text = (el.innerText || '').trim();
+                      if (text.length <= 200 && /^Page Reports\\s*\\[\\s*[\\d,]+\\s*\\]/.test(text)) return text;
+                  }
+                  return '';
+              }''')
+              match = re.search(r'^Page Reports\s*\[\s*([\d,]+)\s*\]', text)
+              return int(match.group(1).replace(',', '')) if match else None
+
+
+          def wait_applied_report(page):
+              deadline = time.monotonic() + 60
+              previous_count = None
+              stable_since = None
+              range_confirmed = False
+              while time.monotonic() < deadline:
+                  range_confirmed = applied_range_matches(page)
+                  count = read_report_count(page)
+                  if range_confirmed and count is not None:
+                      if count != previous_count or stable_since is None:
+                          previous_count, stable_since = count, time.monotonic()
+                      elif time.monotonic() - stable_since >= 3:
+                          print('Applied range verified:', yesterday.isoformat(), 'through', today.isoformat())
+                          print('Filtered Page Reports count:', count)
+                          return count
+                  else:
+                      previous_count, stable_since = None, None
+                  time.sleep(0.5)
+              # Emit only the known report header and date-control evidence.
+              print('Applied range matched:', range_confirmed)
+              print('Page Reports count parsed:', read_report_count(page))
+              Path('diagnostics').mkdir(exist_ok=True)
+              import json
+              heading = unique_visible(page.get_by_text(re.compile(r'^\s*Page Reports\b')))
+              nearby = heading.evaluate('''el => {
+                  const out = [];
+                  for (let i = 0; el && i < 4; i++, el = el.parentElement) {
+                      const text = (el.innerText || '').trim();
+                      if (text.length <= 200) out.push(text);
+                  }
+                  return out;
+              }''') if heading else []
+              dates = [field.input_value() for field in visible_items(page.locator('input'))
+                       if range_dates(field.input_value())]
+              Path('diagnostics/applied-filter.json').write_text(json.dumps({
+                  'expectedDates': [yesterday.isoformat(), today.isoformat()],
+                  'visibleDateValues': dates, 'reportHeader': nearby,
+              }, indent=2))
+              raise RuntimeError('Applied range or nearby Page Reports count could not be verified; see applied-filter diagnostics.')
+
+
           def set_recorded_date_range(page):
               # At 14–15 seconds in the recording, clicking Filters reveals All Time.
               # Each published URL is opened afresh before this function is called.
@@ -1057,19 +1131,7 @@ jobs:
               except Exception:
                   save_calendar_diagnostic(page)
                   raise
-              expected = yesterday.isoformat() + ' to ' + today.isoformat()
-              deadline = time.monotonic() + 45
-              while time.monotonic() < deadline:
-                  values = [x.input_value() for x in visible_items(page.locator('input'))]
-                  if expected in values or unique_visible(page.get_by_text(expected, exact=True)):
-                      # Wait for report loading to settle; range display alone is insufficient.
-                      page.wait_for_timeout(2000)
-                      count_text = page.get_by_text(re.compile(r'^Page Reports')).inner_text()
-                      match = re.search(r'\[(\d+)\]', count_text)
-                      if match:
-                          return int(match.group(1))
-                  time.sleep(0.5)
-              raise RuntimeError('Applied report date range/count could not be verified.')
+              return wait_applied_report(page)
 
 
           def download_rows(page):
@@ -1153,7 +1215,7 @@ jobs:
                   browser.close()
 
           PY
-      - name: Upload calendar diagnostics if selection fails
+      - name: Upload report-control diagnostics if verification fails
         if: failure()
         uses: actions/upload-artifact@v4
         with:
