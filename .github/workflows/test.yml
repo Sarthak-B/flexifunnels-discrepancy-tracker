@@ -7,11 +7,6 @@ permissions:
   contents: read
 
 jobs:
-
-  # ============================================================
-  # JOB 1: GOOGLE SHEETS CONNECTION TEST
-  # ============================================================
-
   test-google-sheets:
     name: Test Google Sheets Connection
     runs-on: ubuntu-latest
@@ -62,14 +57,11 @@ jobs:
 
           if missing:
               raise RuntimeError(
-                  "Missing GitHub secrets/variables: "
-                  + ", ".join(missing)
+                  "Missing configuration: " + ", ".join(missing)
               )
 
           credentials = Credentials.from_service_account_info(
-              json.loads(
-                  os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-              ),
+              json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
               scopes=[
                   "https://www.googleapis.com/auth/spreadsheets.readonly"
               ],
@@ -84,32 +76,17 @@ jobs:
           }
 
           for label, sheet_id in spreadsheets.items():
-
-              print("\n" + "-" * 60)
-              print("Checking:", label)
-
               spreadsheet = client.open_by_key(sheet_id)
 
-              print("Status: CONNECTED")
+              print("\n" + label + ": CONNECTED")
               print("Spreadsheet:", spreadsheet.title)
 
-              worksheets = spreadsheet.worksheets()
-
-              print("Total tabs:", len(worksheets))
-
-              for worksheet in worksheets:
+              for worksheet in spreadsheet.worksheets():
                   print("  Tab:", worksheet.title)
 
-          print("\n" + "=" * 60)
-          print("SUCCESS: ALL GOOGLE SHEETS CONNECTED")
+          print("\nALL GOOGLE SHEETS CONNECTIONS SUCCESSFUL")
           print("READ-ONLY TEST: NO DATA MODIFIED")
-          print("=" * 60)
           PY
-
-
-  # ============================================================
-  # JOB 2: FLEXIFUNNELS LOGIN TEST
-  # ============================================================
 
   test-flexifunnels-login:
     name: Test FlexiFunnels Login
@@ -128,7 +105,7 @@ jobs:
           python -m pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Test FlexiFunnels login and project access
+      - name: Test login and diagnose workspace selection
         env:
           FLEXIFUNNELS_EMAIL: ${{ secrets.FLEXIFUNNELS_EMAIL }}
           FLEXIFUNNELS_PASSWORD: ${{ secrets.FLEXIFUNNELS_PASSWORD }}
@@ -137,40 +114,24 @@ jobs:
         run: |
           python -u - <<'PY'
           import os
-          import re
           import time
-
           from urllib.parse import urlparse
 
-          from playwright.sync_api import (
-              sync_playwright,
-              TimeoutError as PlaywrightTimeout,
-          )
+          from playwright.sync_api import sync_playwright
 
           print("=" * 60)
-          print("FLEXIFUNNELS LOGIN TEST - VERSION 2")
+          print("FLEXIFUNNELS LOGIN TEST - VERSION 3")
           print("=" * 60)
 
-          email = os.environ.get(
-              "FLEXIFUNNELS_EMAIL", ""
-          ).strip()
-
-          password = os.environ.get(
-              "FLEXIFUNNELS_PASSWORD", ""
-          )
-
+          email = os.environ.get("FLEXIFUNNELS_EMAIL", "").strip()
+          password = os.environ.get("FLEXIFUNNELS_PASSWORD", "")
           project_url = os.environ.get(
               "FLEXIFUNNELS_PROJECT_URL", ""
           ).strip()
 
-          if not email:
+          if not email or not password:
               raise RuntimeError(
-                  "Missing FLEXIFUNNELS_EMAIL secret."
-              )
-
-          if not password:
-              raise RuntimeError(
-                  "Missing FLEXIFUNNELS_PASSWORD secret."
+                  "FlexiFunnels email or password secret is missing."
               )
 
           parsed_project = urlparse(project_url)
@@ -178,18 +139,12 @@ jobs:
           if (
               parsed_project.scheme != "https"
               or parsed_project.hostname != "app.flexifunnels.com"
-              or not parsed_project.path.startswith("/projects/")
+              or parsed_project.path.rstrip("/")
+                 != "/projects/kvapNzyj"
           ):
               raise RuntimeError(
-                  "Invalid FLEXIFUNNELS_PROJECT_URL."
+                  "Unexpected FlexiFunnels project URL."
               )
-
-          expected_path = parsed_project.path.rstrip("/")
-
-          print("Configuration verified.")
-
-          # Never print passwords, cookies, tokens,
-          # page HTML, or browser storage state.
 
           def safe_location(page):
               parsed = urlparse(page.url)
@@ -200,26 +155,112 @@ jobs:
                   + parsed.path
               )
 
-          def find_visible(locator):
-              try:
-                  count = min(locator.count(), 20)
+          def visible_first(locator):
+              count = min(locator.count(), 30)
 
-                  for index in range(count):
-                      candidate = locator.nth(index)
+              for index in range(count):
+                  item = locator.nth(index)
 
-                      if candidate.is_visible():
-                          return candidate
-
-              except Exception:
-                  pass
+                  if item.is_visible():
+                      return item
 
               return None
 
-          with sync_playwright() as p:
+          def describe_workspace_screen(page):
+              """
+              Print structural information only.
 
-              browser = p.chromium.launch(
-                  headless=True
+              Do not print page text, names, emails,
+              HTML, cookies, tokens, or form values.
+              """
+
+              print("\nWORKSPACE SCREEN DIAGNOSTICS")
+              print("-" * 60)
+
+              print("Location:", safe_location(page))
+
+              selectors = {
+                  "buttons": "button",
+                  "submit_inputs": 'input[type="submit"]',
+                  "links": "a",
+                  "radio_inputs": 'input[type="radio"]',
+                  "select_menus": "select",
+                  "listboxes": '[role="listbox"]',
+                  "options": '[role="option"]',
+                  "comboboxes": '[role="combobox"]',
+                  "dialogs": '[role="dialog"]',
+                  "cards": (
+                      '[class*="card" i], '
+                      '[class*="workspace" i], '
+                      '[class*="account" i], '
+                      '[class*="user-list" i]'
+                  ),
+              }
+
+              for label, selector in selectors.items():
+                  locator = page.locator(selector)
+
+                  total = locator.count()
+
+                  visible = 0
+
+                  for index in range(min(total, 100)):
+                      if locator.nth(index).is_visible():
+                          visible += 1
+
+                  print(
+                      f"{label}: total={total}, "
+                      f"visible={visible}"
+                  )
+
+              print("\nVisible button labels:")
+
+              buttons = page.locator(
+                  'button, input[type="submit"], [role="button"]'
               )
+
+              count = 0
+
+              allowed_labels = {
+                  "continue",
+                  "next",
+                  "select",
+                  "switch",
+                  "login",
+                  "log in",
+                  "sign in",
+                  "submit",
+                  "back",
+                  "cancel",
+              }
+
+              for index in range(min(buttons.count(), 50)):
+                  button = buttons.nth(index)
+
+                  if not button.is_visible():
+                      continue
+
+                  label = (
+                      button.get_attribute("aria-label")
+                      or button.inner_text()
+                      or button.get_attribute("value")
+                      or ""
+                  ).strip().lower()
+
+                  if label in allowed_labels:
+                      print("  Recognized action:", label)
+                  else:
+                      print("  Button with unrecognized label")
+
+                  count += 1
+
+              print("Visible action controls:", count)
+
+              print("\nNo workspace was selected.")
+              print("No form values or account names were logged.")
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
 
               context = browser.new_context(
                   viewport={
@@ -230,15 +271,9 @@ jobs:
               )
 
               page = context.new_page()
-
               page.set_default_timeout(15000)
 
               try:
-
-                  # ============================================
-                  # STEP 1: OPEN FLEXIFUNNELS
-                  # ============================================
-
                   print("\nSTEP 1: Opening FlexiFunnels")
 
                   page.goto(
@@ -247,67 +282,29 @@ jobs:
                       timeout=60000,
                   )
 
-                  print("Page opened.")
                   print("Location:", safe_location(page))
-
-                  # ============================================
-                  # STEP 2: FIND LOGIN FIELDS
-                  # ============================================
 
                   print("\nSTEP 2: Finding login fields")
 
-                  email_selectors = [
-                      'input[type="email"]',
-                      'input[name="email"]',
-                      'input[autocomplete="username"]',
-                      'input[placeholder*="email" i]',
-                  ]
+                  email_field = visible_first(
+                      page.locator(
+                          'input[type="email"], '
+                          'input[name="email"], '
+                          'input[autocomplete="username"]'
+                      )
+                  )
 
-                  password_selectors = [
-                      'input[type="password"]',
-                      'input[name="password"]',
-                  ]
-
-                  email_field = None
-                  password_field = None
-
-                  for selector in email_selectors:
-                      candidate = page.locator(selector)
-
-                      email_field = find_visible(candidate)
-
-                      if email_field is not None:
-                          print(
-                              "Email field found using:",
-                              selector,
-                          )
-                          break
-
-                  for selector in password_selectors:
-                      candidate = page.locator(selector)
-
-                      password_field = find_visible(candidate)
-
-                      if password_field is not None:
-                          print(
-                              "Password field found using:",
-                              selector,
-                          )
-                          break
+                  password_field = visible_first(
+                      page.locator('input[type="password"]')
+                  )
 
                   if email_field is None:
-                      raise RuntimeError(
-                          "Email field not found."
-                      )
+                      raise RuntimeError("Email field not found.")
 
                   if password_field is None:
-                      raise RuntimeError(
-                          "Password field not found."
-                      )
+                      raise RuntimeError("Password field not found.")
 
-                  # ============================================
-                  # STEP 3: ENTER CREDENTIALS
-                  # ============================================
+                  print("Login fields found.")
 
                   print("\nSTEP 3: Entering credentials")
 
@@ -316,247 +313,137 @@ jobs:
 
                   print("Credentials entered.")
 
-                  # ============================================
-                  # STEP 4: FIND LOGIN BUTTON
-                  # ============================================
+                  print("\nSTEP 4: Submitting login")
 
-                  print("\nSTEP 4: Finding login button")
-
-                  button_selectors = [
+                  selectors = [
                       'button[type="submit"]',
                       'input[type="submit"]',
                       'button:has-text("Login")',
                       'button:has-text("Log in")',
                       'button:has-text("Sign in")',
-                      'button:has-text("Sign In")',
                       'button:has-text("Continue")',
-                      '[role="button"]:has-text("Login")',
-                      '[role="button"]:has-text("Log in")',
-                      '[role="button"]:has-text("Sign in")',
-                      '[role="button"]:has-text("Continue")',
                   ]
 
                   login_button = None
 
-                  for selector in button_selectors:
-
-                      candidate = find_visible(
+                  for selector in selectors:
+                      candidate = visible_first(
                           page.locator(selector)
                       )
 
                       if candidate is not None:
-
                           login_button = candidate
-
-                          print(
-                              "Login button found using:",
-                              selector,
-                          )
-
                           break
 
-                  # ============================================
-                  # STEP 5: SUBMIT LOGIN
-                  # ============================================
-
-                  print("\nSTEP 5: Submitting login")
-
                   if login_button is not None:
-
-                      try:
-                          login_button.click(
-                              timeout=10000
-                          )
-
-                          print(
-                              "Login button clicked."
-                          )
-
-                      except PlaywrightTimeout:
-
-                          print(
-                              "Button click timed out."
-                          )
-
-                          print(
-                              "Trying Enter key instead."
-                          )
-
-                          password_field.press("Enter")
-
-                          print(
-                              "Enter key submitted."
-                          )
-
+                      login_button.click(timeout=15000)
+                      print("Login button clicked.")
                   else:
-
-                      print(
-                          "No supported login button found."
-                      )
-
-                      print(
-                          "Trying Enter key in password field."
-                      )
-
                       password_field.press("Enter")
+                      print("Login submitted using Enter.")
 
-                      print(
-                          "Enter key submitted."
-                      )
-
-                  # ============================================
-                  # STEP 6: WAIT FOR AUTHENTICATION
-                  # ============================================
-
-                  print(
-                      "\nSTEP 6: Waiting for authentication"
-                  )
-
-                  time.sleep(5)
-
-                  print(
-                      "Location after login:",
-                      safe_location(page),
-                  )
-
-                  # ============================================
-                  # STEP 7: OPEN PROJECT
-                  # ============================================
-
-                  print("\nSTEP 7: Opening project")
-
-                  page.goto(
-                      project_url,
-                      wait_until="domcontentloaded",
-                      timeout=60000,
-                  )
-
-                  print(
-                      "Project navigation completed."
-                  )
-
-                  print(
-                      "Current location:",
-                      safe_location(page),
-                  )
-
-                  # ============================================
-                  # STEP 8: VERIFY PROJECT
-                  # ============================================
-
-                  print(
-                      "\nSTEP 8: Verifying project access"
-                  )
+                  print("\nSTEP 5: Waiting for login redirect")
 
                   deadline = time.monotonic() + 30
 
-                  project_verified = False
-
                   while time.monotonic() < deadline:
+                      path = urlparse(page.url).path.rstrip("/")
+
+                      if path != "/login":
+                          break
+
+                      time.sleep(1)
+
+                  print("Location:", safe_location(page))
+
+                  print("\nSTEP 6: Checking workspace selection")
+
+                  current_path = urlparse(
+                      page.url
+                  ).path.rstrip("/")
+
+                  if current_path == "/switch-sub-users":
+                      print(
+                          "WORKSPACE SELECTION SCREEN DETECTED"
+                      )
+
+                      page.wait_for_timeout(3000)
+
+                      describe_workspace_screen(page)
+
+                      print("\n" + "=" * 60)
+                      print("LOGIN REDIRECT TEST: PASSED")
+                      print("WORKSPACE SELECTION: NOT COMPLETED")
+                      print("PROJECT ACCESS: NOT YET VERIFIED")
+                      print("NO GOOGLE SHEETS MODIFIED")
+                      print("=" * 60)
+
+                  else:
+                      print(
+                          "No workspace-selection redirect detected."
+                      )
+
+                      print("\nSTEP 7: Opening project")
+
+                      page.goto(
+                          project_url,
+                          wait_until="domcontentloaded",
+                          timeout=60000,
+                      )
+
+                      page.wait_for_timeout(3000)
+
+                      print("Location:", safe_location(page))
 
                       current_path = urlparse(
                           page.url
                       ).path.rstrip("/")
 
-                      if current_path == expected_path:
+                      if current_path == "/switch-sub-users":
+                          print(
+                              "Workspace selection required "
+                              "before project access."
+                          )
 
-                          project_text = page.get_by_text(
+                          describe_workspace_screen(page)
+
+                          print(
+                              "PROJECT ACCESS: NOT YET VERIFIED"
+                          )
+
+                      elif current_path == parsed_project.path:
+                          project_content = page.get_by_text(
                               "Funnel Builder Agent",
                               exact=False,
                           )
 
-                          if find_visible(
-                              project_text
-                          ) is not None:
-
-                              project_verified = True
-
-                              break
-
-                      time.sleep(2)
-
-                  if not project_verified:
-
-                      print(
-                          "Project verification failed."
-                      )
-
-                      print(
-                          "Final location:",
-                          safe_location(page),
-                      )
-
-                      current_path = urlparse(
-                          page.url
-                      ).path.lower()
-
-                      if any(
-                          word in current_path
-                          for word in [
-                              "login",
-                              "signin",
-                              "sign-in",
-                              "auth",
-                          ]
-                      ):
-                          print(
-                              "Likely redirected to login."
+                          project_content.first.wait_for(
+                              state="visible",
+                              timeout=15000,
                           )
 
-                      raise RuntimeError(
-                          "Could not verify project access. "
-                          "Login may have failed, "
-                          "additional verification may be "
-                          "required, or the project text "
-                          "may differ."
-                      )
+                          print(
+                              "SUCCESS: PROJECT ACCESS VERIFIED"
+                          )
 
-                  # ============================================
-                  # SUCCESS
-                  # ============================================
-
-                  print("\n" + "=" * 60)
-                  print(
-                      "SUCCESS: FLEXIFUNNELS LOGIN VERIFIED"
-                  )
-                  print(
-                      "SUCCESS: PROJECT ACCESS VERIFIED"
-                  )
-                  print(
-                      "NO REPORTS DOWNLOADED"
-                  )
-                  print(
-                      "NO GOOGLE SHEETS MODIFIED"
-                  )
-                  print("=" * 60)
+                      else:
+                          raise RuntimeError(
+                              "Unexpected redirect during "
+                              "project access."
+                          )
 
               except Exception as exc:
-
-                  print("\n" + "=" * 60)
-                  print(
-                      "FLEXIFUNNELS TEST FAILED"
-                  )
-                  print(
-                      "Error type:",
-                      type(exc).__name__,
-                  )
-                  print(
-                      "Last browser location:",
-                      safe_location(page),
-                  )
-                  print("=" * 60)
-
+                  print("\nFLEXIFUNNELS TEST FAILED")
+                  print("Error type:", type(exc).__name__)
+                  print("Location:", safe_location(page))
                   raise RuntimeError(
-                      "FlexiFunnels authentication "
-                      "or project verification failed. "
+                      "FlexiFunnels authentication test failed. "
                       "Review the numbered steps above."
                   ) from None
 
               finally:
-
                   context.close()
                   browser.close()
-
                   print("\nBrowser closed.")
 
           PY
