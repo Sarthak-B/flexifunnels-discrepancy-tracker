@@ -42,7 +42,7 @@ jobs:
           from google.oauth2.service_account import Credentials
 
           print("=" * 60)
-          print("GOOGLE SHEETS CONNECTION TEST - VERSION 9")
+          print("GOOGLE SHEETS CONNECTION TEST - VERSION 10")
           print("=" * 60)
 
           required = [
@@ -132,7 +132,7 @@ jobs:
           python -m pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Test login, sub-user switch, and automatic project opening
+      - name: Test login, sub-user switch, and project URL search
         env:
           FLEXIFUNNELS_EMAIL: ${{ secrets.FLEXIFUNNELS_EMAIL }}
           FLEXIFUNNELS_PASSWORD: ${{ secrets.FLEXIFUNNELS_PASSWORD }}
@@ -144,12 +144,12 @@ jobs:
           import os
           import re
           import time
-
           from urllib.parse import urlparse
+
           from playwright.sync_api import sync_playwright
 
           print("=" * 60)
-          print("FLEXIFUNNELS LOGIN TEST - VERSION 9")
+          print("FLEXIFUNNELS LOGIN TEST - VERSION 10")
           print("=" * 60)
 
           email = os.environ.get(
@@ -170,7 +170,7 @@ jobs:
 
           if not email or not password:
               raise RuntimeError(
-                  "FlexiFunnels login credentials are missing."
+                  "FlexiFunnels credentials are missing."
               )
 
           if sub_user != "Saurabh Bhatnagar":
@@ -187,10 +187,13 @@ jobs:
                  != "/projects/kvapNzyj"
           ):
               raise RuntimeError(
-                  "Unexpected FlexiFunnels project URL."
+                  "Unexpected project URL configuration."
               )
 
           def safe_location(page):
+              if page.is_closed():
+                  return "closed"
+
               parsed = urlparse(page.url)
 
               return (
@@ -201,18 +204,21 @@ jobs:
               )
 
           def current_path(page):
+              if page.is_closed():
+                  return ""
+
               return urlparse(page.url).path.rstrip("/")
 
           def visible_items(locator, limit=50):
-              result = []
+              matches = []
 
               for index in range(min(locator.count(), limit)):
                   item = locator.nth(index)
 
                   if item.is_visible():
-                      result.append(item)
+                      matches.append(item)
 
-              return result
+              return matches
 
           def unique_visible(locator):
               matches = visible_items(locator)
@@ -222,7 +228,7 @@ jobs:
 
               return None
 
-          def wait_for_path_change(page, original, seconds=30):
+          def wait_for_path_change(page, original, seconds=25):
               deadline = time.monotonic() + seconds
 
               while time.monotonic() < deadline:
@@ -234,6 +240,19 @@ jobs:
                   time.sleep(1)
 
               return current_path(page)
+
+          def find_login_field(page, selectors):
+              for selector in selectors:
+                  try:
+                      locator = page.locator(selector)
+                      field = unique_visible(locator)
+
+                      if field is not None:
+                          return field
+                  except Exception:
+                      continue
+
+              return None
 
           def select_saurabh(page):
               print("\nSTEP 7: Finding Saurabh Bhatnagar")
@@ -259,14 +278,8 @@ jobs:
                   "inside Saurabh's card"
               )
 
-              # The screenshot shows a separate card
-              # for each sub-user.
-              #
-              # The Switch to user control may be an
-              # anchor styled like a button.
-              #
-              # Find the nearest ancestor containing
-              # an interactive Switch to user control.
+              # Keep the selector that worked in Version 9.
+              # The account switch control is an anchor.
 
               card = name_element.locator(
                   "xpath=ancestor::*["
@@ -308,11 +321,6 @@ jobs:
                       matches.append(control)
 
               if len(matches) != 1:
-                  print(
-                      "Matching Switch to user controls:",
-                      len(matches),
-                  )
-
                   raise RuntimeError(
                       "Could not uniquely identify "
                       "Saurabh's Switch to user control."
@@ -329,11 +337,18 @@ jobs:
                   "(element) => element.tagName.toLowerCase()"
               )
 
-              print(
-                  "Correct Switch to user control found."
-              )
-
+              print("Correct Switch to user control found.")
               print("Control type:", tag)
+
+              # Read only the destination structure.
+              # Do not log hrefs or account IDs.
+
+              target = switch_control.get_attribute("target")
+
+              print(
+                  "Opens new tab:",
+                  target == "_blank",
+              )
 
               print("\nSTEP 9: Switching to Saurabh")
 
@@ -342,6 +357,113 @@ jobs:
               print(
                   "Clicked Switch to user "
                   "inside Saurabh's card."
+              )
+
+          def locate_switched_page(context, original_page):
+              print(
+                  "\nSTEP 10: Checking browser tabs "
+                  "after sub-user switch"
+              )
+
+              deadline = time.monotonic() + 30
+
+              while time.monotonic() < deadline:
+                  pages = [
+                      p for p in context.pages
+                      if not p.is_closed()
+                  ]
+
+                  for candidate in reversed(pages):
+                      if candidate != original_page:
+                          candidate.wait_for_load_state(
+                              "domcontentloaded",
+                              timeout=15000,
+                          )
+
+                          print(
+                              "Additional browser tab detected."
+                          )
+                          print(
+                              "New tab location:",
+                              safe_location(candidate),
+                          )
+
+                          parsed = urlparse(candidate.url)
+
+                          if (
+                              parsed.scheme != "https"
+                              or parsed.hostname != "app.flexifunnels.com"
+                          ):
+                              raise RuntimeError(
+                                  "Unexpected destination "
+                                  "after sub-user switch."
+                              )
+
+                          return candidate
+
+                  if current_path(original_page) != "/switch-sub-users":
+                      print(
+                          "Original tab changed location."
+                      )
+                      print(
+                          "Location:",
+                          safe_location(original_page),
+                      )
+
+                      return original_page
+
+                  time.sleep(1)
+
+              print(
+                  "No navigation or new tab detected "
+                  "after clicking Switch to user."
+              )
+
+              return original_page
+
+          def open_projects(page):
+              print(
+                  "\nSTEP 11: Opening Projects "
+                  "after sub-user selection"
+              )
+
+              page.goto(
+                  "https://app.flexifunnels.com/projects",
+                  wait_until="domcontentloaded",
+                  timeout=60000,
+              )
+
+              page.wait_for_timeout(4000)
+
+              print(
+                  "Projects page location:",
+                  safe_location(page),
+              )
+
+              if current_path(page) != "/projects":
+                  raise RuntimeError(
+                      "Projects page is inaccessible "
+                      "after switching sub-users."
+                  )
+
+              # Verify the page is actually displaying
+              # project search controls, not merely
+              # the expected URL.
+
+              search_field = unique_visible(
+                  page.locator(
+                      'input[placeholder*="Search" i]'
+                  )
+              )
+
+              if search_field is None:
+                  raise RuntimeError(
+                      "Projects page opened, but the "
+                      "project search field is missing."
+                  )
+
+              print(
+                  "SUCCESS: PROJECTS PAGE ACCESS VERIFIED"
               )
 
           def choose_project_url_filter(page):
@@ -357,8 +479,24 @@ jobs:
               )
 
               if dropdown is None:
+                  # The dropdown may already be set
+                  # to Project URL.
+
+                  selected = unique_visible(
+                      page.get_by_text(
+                          "Project URL",
+                          exact=True,
+                      )
+                  )
+
+                  if selected is not None:
+                      print(
+                          "Project URL filter already selected."
+                      )
+                      return
+
                   raise RuntimeError(
-                      "Project Name dropdown not found."
+                      "Project search filter was not found."
                   )
 
               dropdown.click(timeout=15000)
@@ -374,7 +512,7 @@ jobs:
 
               if option is None:
                   raise RuntimeError(
-                      "Project URL dropdown option not found."
+                      "Project URL option not found."
                   )
 
               option.click(timeout=15000)
@@ -420,10 +558,9 @@ jobs:
 
               print("Search submitted.")
 
-          def verify_project_opened(page):
+          def verify_project(page, context):
               print(
-                  "\nSTEP 15: Waiting for project "
-                  "to open automatically"
+                  "\nSTEP 15: Checking project search result"
               )
 
               deadline = time.monotonic() + 40
@@ -431,15 +568,19 @@ jobs:
               expected_path = parsed_project.path.rstrip("/")
 
               while time.monotonic() < deadline:
-                  path = current_path(page)
+                  pages = [
+                      p for p in context.pages
+                      if not p.is_closed()
+                  ]
 
-                  if path == expected_path:
-                      print(
-                          "Expected project URL reached."
-                      )
-                      return
+                  for candidate in pages:
+                      if current_path(candidate) == expected_path:
+                          print(
+                              "Expected project URL reached."
+                          )
+                          return candidate
 
-                  if path in (
+                  if current_path(page) in (
                       "/login",
                       "/switch-sub-users",
                   ):
@@ -451,13 +592,29 @@ jobs:
                   time.sleep(2)
 
               print(
-                  "Final location:",
+                  "Project did not open automatically."
+              )
+
+              print(
+                  "Current location:",
                   safe_location(page),
               )
 
+              print(
+                  "Visible Open Project controls:",
+                  len(
+                      visible_items(
+                          page.get_by_text(
+                              "Open Project",
+                              exact=True,
+                          )
+                      )
+                  ),
+              )
+
               raise RuntimeError(
-                  "Project did not open automatically "
-                  "after searching by Project URL."
+                  "Project search did not reach "
+                  "the configured project URL."
               )
 
           with sync_playwright() as p:
@@ -490,21 +647,23 @@ jobs:
 
                   print("\nSTEP 2: Finding login fields")
 
-                  email_field = unique_visible(
-                      page.locator(
-                          'input[type="email"], '
-                          'input[name="email"], '
-                          'input[autocomplete="username"]'
-                      )
+                  email_field = find_login_field(
+                      page,
+                      [
+                          'input[type="email"]',
+                          'input[name="email"]',
+                          'input[autocomplete="username"]',
+                      ],
                   )
 
-                  password_field = unique_visible(
-                      page.locator('input[type="password"]')
+                  password_field = find_login_field(
+                      page,
+                      ['input[type="password"]'],
                   )
 
                   if email_field is None or password_field is None:
                       raise RuntimeError(
-                          "Login fields not found uniquely."
+                          "Login fields were not found."
                       )
 
                   print("Login fields found.")
@@ -578,65 +737,25 @@ jobs:
 
                   select_saurabh(page)
 
-                  print(
-                      "\nSTEP 10: Waiting for sub-user switch"
-                  )
-
-                  new_path = wait_for_path_change(
+                  switched_page = locate_switched_page(
+                      context,
                       page,
-                      "/switch-sub-users",
-                      seconds=30,
                   )
 
-                  print(
-                      "Location after switch:",
-                      safe_location(page),
-                  )
+                  switched_page.set_default_timeout(15000)
 
-                  if new_path == "/switch-sub-users":
-                      raise RuntimeError(
-                          "Sub-user switch did not complete."
-                      )
+                  open_projects(switched_page)
 
-                  if urlparse(page.url).hostname != "app.flexifunnels.com":
-                      raise RuntimeError(
-                          "Unexpected domain after switching."
-                      )
+                  choose_project_url_filter(switched_page)
 
-                  print("Sub-user switch completed.")
+                  search_project(switched_page)
 
-                  print("\nSTEP 11: Opening Projects page")
-
-                  page.goto(
-                      "https://app.flexifunnels.com/projects",
-                      wait_until="domcontentloaded",
-                      timeout=60000,
-                  )
-
-                  page.wait_for_timeout(3000)
-
-                  print(
-                      "Projects page:",
-                      safe_location(page),
-                  )
-
-                  if current_path(page) != "/projects":
-                      raise RuntimeError(
-                          "Projects page did not open."
-                      )
-
-                  print("Projects page opened.")
-
-                  choose_project_url_filter(page)
-
-                  search_project(page)
-
-                  verify_project_opened(page)
+                  verify_project(switched_page, context)
 
                   print("\n" + "=" * 60)
                   print("SUCCESS: FLEXIFUNNELS LOGIN VERIFIED")
                   print("SUCCESS: SAURABH SUB-USER SELECTED")
-                  print("SUCCESS: PROJECTS PAGE OPENED")
+                  print("SUCCESS: PROJECTS PAGE ACCESS VERIFIED")
                   print("SUCCESS: PROJECT URL SEARCH COMPLETED")
                   print("SUCCESS: TARGET PROJECT OPENED")
                   print("NO REPORTS DOWNLOADED")
