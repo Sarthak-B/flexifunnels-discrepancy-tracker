@@ -14,6 +14,10 @@ jobs:
     name: Test Google Sheets Connection
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      utm_landing_tab: ${{ steps.verify-sheets.outputs.utm_landing_tab }}
+      utm_reg_tab: ${{ steps.verify-sheets.outputs.utm_reg_tab }}
+      utm_tab_date: ${{ steps.verify-sheets.outputs.utm_tab_date }}
 
     steps:
 
@@ -27,20 +31,23 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install gspread google-auth
 
-      - name: Verify Google Sheets access
+      - name: Verify Google Sheets access and discover daily UTM tabs
+        id: verify-sheets
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           RAW_DATA_SHEET_ID: ${{ vars.RAW_DATA_SHEET_ID }}
           UTM_SHEET_ID: ${{ vars.UTM_SHEET_ID }}
           DISCREPANCY_SHEET_ID: ${{ vars.DISCREPANCY_SHEET_ID }}
-          UTM_LANDING_TAB: ${{ vars.UTM_LANDING_TAB }}
-          UTM_REG_TAB: ${{ vars.UTM_REG_TAB }}
           DISCREPANCY_TAB_NAME: ${{ vars.DISCREPANCY_TAB_NAME }}
+          TIMEZONE: ${{ vars.TIMEZONE }}
 
         run: |
           python -u - <<'PY'
           import json
           import os
+          import re
+          from datetime import date, datetime, timedelta
+          from zoneinfo import ZoneInfo
 
           import gspread
           from google.oauth2.service_account import Credentials
@@ -54,8 +61,6 @@ jobs:
               "RAW_DATA_SHEET_ID",
               "UTM_SHEET_ID",
               "DISCREPANCY_SHEET_ID",
-              "UTM_LANDING_TAB",
-              "UTM_REG_TAB",
               "DISCREPANCY_TAB_NAME",
           ]
 
@@ -98,25 +103,60 @@ jobs:
               print("Spreadsheet:", spreadsheet.title)
               print("Tabs:", len(spreadsheet.worksheets()))
 
-          checks = [
-              ("UTM_LANDING_TAB", "UTM"),
-              ("UTM_REG_TAB", "UTM"),
-              ("DISCREPANCY_TAB_NAME", "DISCREPANCY STATS"),
-          ]
+          def discover_daily_utm_tabs(worksheets, target_date):
+              # Match the event-tab names supplied by the user, not unrelated daily tabs.
+              pattern = re.compile(
+                  r'^\s*(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+'
+                  r'7\s*:\s*30\s*PM\s+Flexi\s+Genie\s+10\s+Mins?\s+'
+                  r'(Busines(?:s)?|Reg\s+team)\s*$', re.IGNORECASE,
+              )
+              months = {name.lower(): index + 1 for index, name in enumerate(
+                  'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split())}
+              matches = {'business': [], 'registration': []}
+              for worksheet in worksheets:
+                  title = worksheet.title
+                  if '\n' in title or '\r' in title:
+                      continue
+                  match = pattern.fullmatch(title)
+                  if not match:
+                      continue
+                  day, month, year, kind = match.groups()
+                  try:
+                      tab_date = date(int(year), months[month.lower()], int(day))
+                  except (ValueError, KeyError):
+                      continue
+                  if tab_date != target_date:
+                      continue
+                  key = 'registration' if kind.lower().startswith('reg') else 'business'
+                  matches[key].append(worksheet)
+              for kind, items in matches.items():
+                  if len(items) != 1:
+                      raise RuntimeError(
+                          'Expected exactly one ' + kind + ' UTM tab dated ' + target_date.isoformat()
+                          + '; found ' + str(len(items)) + '. No older tab will be substituted.'
+                      )
+              return matches['business'][0], matches['registration'][0]
 
-          for variable, spreadsheet_label in checks:
+          # These are next-day event tabs: on 13 Oct the user creates tabs named 14 Oct.
+          # The report range remains yesterday through today; tab dates are event dates.
+          timezone_name = os.environ.get('TIMEZONE', '').strip() or 'Asia/Kolkata'
+          run_date = datetime.now(ZoneInfo(timezone_name)).date()
+          target_tab_date = run_date + timedelta(days=1)
+          landing_tab, reg_tab = discover_daily_utm_tabs(opened['UTM'].worksheets(), target_tab_date)
+          print('UTM target event date:', target_tab_date.isoformat())
+          print('Business tab selected:', landing_tab.title)
+          print('Registration tab selected:', reg_tab.title)
 
-              tab_name = os.environ[variable].strip()
+          discrepancy_name = os.environ['DISCREPANCY_TAB_NAME'].strip()
+          opened['DISCREPANCY STATS'].worksheet(discrepancy_name)
+          print('DISCREPANCY_TAB_NAME: FOUND')
 
-              try:
-                  opened[spreadsheet_label].worksheet(tab_name)
-
-                  print(variable + ": FOUND")
-
-              except gspread.WorksheetNotFound:
-                  raise RuntimeError(
-                      variable + " does not match an existing tab."
-                  )
+          output_file = os.environ.get('GITHUB_OUTPUT')
+          if output_file:
+              with open(output_file, 'a', encoding='utf-8') as output:
+                  output.write('utm_landing_tab=' + landing_tab.title + '\n')
+                  output.write('utm_reg_tab=' + reg_tab.title + '\n')
+                  output.write('utm_tab_date=' + target_tab_date.isoformat() + '\n')
 
           print()
           print("=" * 60)
@@ -160,7 +200,7 @@ jobs:
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
-          print('WORKFLOW REVISION: V14-R7 — Downloads heading and empty-list verification')
+          print('WORKFLOW REVISION: V14-R8 — automatic daily UTM tab discovery')
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
           PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
           LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
