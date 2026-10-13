@@ -42,7 +42,7 @@ jobs:
           from google.oauth2.service_account import Credentials
 
           print("=" * 60)
-          print("GOOGLE SHEETS CONNECTION TEST - VERSION 10")
+          print("GOOGLE SHEETS CONNECTION TEST - VERSION 11")
           print("=" * 60)
 
           required = [
@@ -132,7 +132,7 @@ jobs:
           python -m pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Test login, sub-user switch, and project URL search
+      - name: Test login and Project URL search
         env:
           FLEXIFUNNELS_EMAIL: ${{ secrets.FLEXIFUNNELS_EMAIL }}
           FLEXIFUNNELS_PASSWORD: ${{ secrets.FLEXIFUNNELS_PASSWORD }}
@@ -144,12 +144,12 @@ jobs:
           import os
           import re
           import time
-          from urllib.parse import urlparse
 
+          from urllib.parse import urlparse
           from playwright.sync_api import sync_playwright
 
           print("=" * 60)
-          print("FLEXIFUNNELS LOGIN TEST - VERSION 10")
+          print("FLEXIFUNNELS LOGIN TEST - VERSION 11")
           print("=" * 60)
 
           email = os.environ.get(
@@ -243,14 +243,12 @@ jobs:
 
           def find_login_field(page, selectors):
               for selector in selectors:
-                  try:
-                      locator = page.locator(selector)
-                      field = unique_visible(locator)
+                  field = unique_visible(
+                      page.locator(selector)
+                  )
 
-                      if field is not None:
-                          return field
-                  except Exception:
-                      continue
+                  if field is not None:
+                      return field
 
               return None
 
@@ -278,8 +276,8 @@ jobs:
                   "inside Saurabh's card"
               )
 
-              # Keep the selector that worked in Version 9.
-              # The account switch control is an anchor.
+              # Preserve the selector that worked
+              # in Versions 9 and 10.
 
               card = name_element.locator(
                   "xpath=ancestor::*["
@@ -340,16 +338,6 @@ jobs:
               print("Correct Switch to user control found.")
               print("Control type:", tag)
 
-              # Read only the destination structure.
-              # Do not log hrefs or account IDs.
-
-              target = switch_control.get_attribute("target")
-
-              print(
-                  "Opens new tab:",
-                  target == "_blank",
-              )
-
               print("\nSTEP 9: Switching to Saurabh")
 
               switch_control.click(timeout=15000)
@@ -365,7 +353,7 @@ jobs:
                   "after sub-user switch"
               )
 
-              deadline = time.monotonic() + 30
+              deadline = time.monotonic() + 15
 
               while time.monotonic() < deadline:
                   pages = [
@@ -375,17 +363,8 @@ jobs:
 
                   for candidate in reversed(pages):
                       if candidate != original_page:
-                          candidate.wait_for_load_state(
-                              "domcontentloaded",
-                              timeout=15000,
-                          )
-
                           print(
                               "Additional browser tab detected."
-                          )
-                          print(
-                              "New tab location:",
-                              safe_location(candidate),
                           )
 
                           parsed = urlparse(candidate.url)
@@ -395,37 +374,26 @@ jobs:
                               or parsed.hostname != "app.flexifunnels.com"
                           ):
                               raise RuntimeError(
-                                  "Unexpected destination "
-                                  "after sub-user switch."
+                                  "Unexpected sub-user destination."
                               )
 
                           return candidate
 
                   if current_path(original_page) != "/switch-sub-users":
-                      print(
-                          "Original tab changed location."
-                      )
-                      print(
-                          "Location:",
-                          safe_location(original_page),
-                      )
-
+                      print("Original tab changed location.")
                       return original_page
 
                   time.sleep(1)
 
               print(
-                  "No navigation or new tab detected "
-                  "after clicking Switch to user."
+                  "No navigation or new tab detected. "
+                  "Continuing to Projects page."
               )
 
               return original_page
 
           def open_projects(page):
-              print(
-                  "\nSTEP 11: Opening Projects "
-                  "after sub-user selection"
-              )
+              print("\nSTEP 11: Opening Projects")
 
               page.goto(
                   "https://app.flexifunnels.com/projects",
@@ -442,13 +410,8 @@ jobs:
 
               if current_path(page) != "/projects":
                   raise RuntimeError(
-                      "Projects page is inaccessible "
-                      "after switching sub-users."
+                      "Projects page is inaccessible."
                   )
-
-              # Verify the page is actually displaying
-              # project search controls, not merely
-              # the expected URL.
 
               search_field = unique_visible(
                   page.locator(
@@ -458,8 +421,8 @@ jobs:
 
               if search_field is None:
                   raise RuntimeError(
-                      "Projects page opened, but the "
-                      "project search field is missing."
+                      "Projects page opened, but "
+                      "the search field is missing."
                   )
 
               print(
@@ -471,53 +434,189 @@ jobs:
                   "\nSTEP 12: Selecting Project URL filter"
               )
 
-              dropdown = unique_visible(
+              # The Projects screenshot shows a dropdown
+              # displaying Project Name by default.
+              #
+              # Try native selects first, then custom
+              # dropdown controls.
+
+              native_selects = visible_items(
+                  page.locator("select")
+              )
+
+              for select in native_selects:
+                  options = select.locator("option")
+
+                  option_labels = [
+                      options.nth(i).inner_text().strip()
+                      for i in range(options.count())
+                  ]
+
+                  if "Project URL" in option_labels:
+                      select.select_option(
+                          label="Project URL"
+                      )
+
+                      print(
+                          "Project URL selected using "
+                          "native HTML dropdown."
+                      )
+
+                      return
+
+              print(
+                  "No matching native select. "
+                  "Checking custom dropdown."
+              )
+
+              dropdown_candidates = [
+                  page.get_by_role(
+                      "combobox",
+                      name=re.compile(
+                          r"Project",
+                          re.IGNORECASE,
+                      ),
+                  ),
+                  page.get_by_role(
+                      "button",
+                      name=re.compile(
+                          r"Project Name",
+                          re.IGNORECASE,
+                      ),
+                  ),
+                  page.locator(
+                      '[role="combobox"]'
+                  ),
                   page.get_by_text(
                       "Project Name",
                       exact=True,
-                  )
-              )
+                  ),
+              ]
+
+              dropdown = None
+
+              for index, locator in enumerate(
+                  dropdown_candidates
+              ):
+                  candidate = unique_visible(locator)
+
+                  if candidate is not None:
+                      dropdown = candidate
+
+                      print(
+                          "Custom dropdown found using "
+                          "method:",
+                          index + 1,
+                      )
+
+                      break
 
               if dropdown is None:
-                  # The dropdown may already be set
-                  # to Project URL.
-
-                  selected = unique_visible(
-                      page.get_by_text(
-                          "Project URL",
-                          exact=True,
-                      )
+                  print(
+                      "Visible native selects:",
+                      len(native_selects),
                   )
 
-                  if selected is not None:
-                      print(
-                          "Project URL filter already selected."
-                      )
-                      return
+                  print(
+                      "Visible comboboxes:",
+                      len(
+                          visible_items(
+                              page.locator(
+                                  '[role="combobox"]'
+                              )
+                          )
+                      ),
+                  )
+
+                  print(
+                      "Exact Project Name matches:",
+                      len(
+                          visible_items(
+                              page.get_by_text(
+                                  "Project Name",
+                                  exact=True,
+                              )
+                          )
+                      ),
+                  )
 
                   raise RuntimeError(
-                      "Project search filter was not found."
+                      "Project search dropdown "
+                      "could not be identified."
                   )
 
               dropdown.click(timeout=15000)
 
-              page.wait_for_timeout(1000)
+              print("Custom dropdown clicked.")
 
-              option = unique_visible(
+              page.wait_for_timeout(1200)
+
+              option_candidates = [
+                  page.get_by_role(
+                      "option",
+                      name=re.compile(
+                          r"^\s*Project URL\s*$",
+                          re.IGNORECASE,
+                      ),
+                  ),
+                  page.get_by_role(
+                      "menuitem",
+                      name=re.compile(
+                          r"^\s*Project URL\s*$",
+                          re.IGNORECASE,
+                      ),
+                  ),
                   page.get_by_text(
                       "Project URL",
                       exact=True,
-                  )
-              )
+                  ),
+              ]
+
+              option = None
+
+              for index, locator in enumerate(
+                  option_candidates
+              ):
+                  candidate = unique_visible(locator)
+
+                  if candidate is not None:
+                      option = candidate
+
+                      print(
+                          "Project URL option found "
+                          "using method:",
+                          index + 1,
+                      )
+
+                      break
 
               if option is None:
+                  print(
+                      "Visible Project URL text matches:",
+                      len(
+                          visible_items(
+                              page.get_by_text(
+                                  "Project URL",
+                                  exact=True,
+                              )
+                          )
+                      ),
+                  )
+
                   raise RuntimeError(
-                      "Project URL option not found."
+                      "Dropdown opened, but the "
+                      "Project URL option was not found."
                   )
 
               option.click(timeout=15000)
 
-              print("Project URL filter selected.")
+              print("Project URL option clicked.")
+
+              page.wait_for_timeout(700)
+
+              print(
+                  "SUCCESS: PROJECT URL FILTER SELECTED"
+              )
 
           def search_project(page):
               print("\nSTEP 13: Entering project URL")
@@ -560,7 +659,7 @@ jobs:
 
           def verify_project(page, context):
               print(
-                  "\nSTEP 15: Checking project search result"
+                  "\nSTEP 15: Checking automatic project opening"
               )
 
               deadline = time.monotonic() + 40
@@ -578,6 +677,7 @@ jobs:
                           print(
                               "Expected project URL reached."
                           )
+
                           return candidate
 
                   if current_path(page) in (
@@ -590,10 +690,6 @@ jobs:
                       )
 
                   time.sleep(2)
-
-              print(
-                  "Project did not open automatically."
-              )
 
               print(
                   "Current location:",
@@ -613,8 +709,8 @@ jobs:
               )
 
               raise RuntimeError(
-                  "Project search did not reach "
-                  "the configured project URL."
+                  "Project search did not automatically "
+                  "open the configured project."
               )
 
           with sync_playwright() as p:
@@ -631,7 +727,6 @@ jobs:
               )
 
               page = context.new_page()
-
               page.set_default_timeout(15000)
 
               try:
@@ -756,7 +851,8 @@ jobs:
                   print("SUCCESS: FLEXIFUNNELS LOGIN VERIFIED")
                   print("SUCCESS: SAURABH SUB-USER SELECTED")
                   print("SUCCESS: PROJECTS PAGE ACCESS VERIFIED")
-                  print("SUCCESS: PROJECT URL SEARCH COMPLETED")
+                  print("SUCCESS: PROJECT URL FILTER SELECTED")
+                  print("SUCCESS: PROJECT SEARCH COMPLETED")
                   print("SUCCESS: TARGET PROJECT OPENED")
                   print("NO REPORTS DOWNLOADED")
                   print("NO GOOGLE SHEETS MODIFIED")
