@@ -2,6 +2,8 @@ name: FlexiFunnels Discrepancy Tracker
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "30 0 * * *" # Daily at 06:00 Asia/Kolkata
 
 permissions:
   contents: read
@@ -44,7 +46,7 @@ jobs:
           from google.oauth2.service_account import Credentials
 
           print("=" * 60)
-          print("GOOGLE SHEETS TEST - VERSION 13")
+          print("GOOGLE SHEETS TEST - VERSION 14")
           print("=" * 60)
 
           required = [
@@ -125,24 +127,19 @@ jobs:
 
 
   test-flexifunnels:
-    name: Test FlexiFunnels Reports Navigation
+    name: Download both filtered FlexiFunnels reports (Version 14)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-
+    timeout-minutes: 35
     steps:
-
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-
       - name: Install Playwright
         run: |
-          python -m pip install --upgrade pip
           python -m pip install playwright
           python -m playwright install --with-deps chromium
-
-      - name: Test login, both searches, and Reports access
+      - name: Export yesterday through today
         env:
           FLEXIFUNNELS_EMAIL: ${{ secrets.FLEXIFUNNELS_EMAIL }}
           FLEXIFUNNELS_PASSWORD: ${{ secrets.FLEXIFUNNELS_PASSWORD }}
@@ -150,42 +147,22 @@ jobs:
           FLEXIFUNNELS_LANDING_URL: ${{ vars.FLEXIFUNNELS_LANDING_URL }}
           FLEXIFUNNELS_REG_URL: ${{ vars.FLEXIFUNNELS_REG_URL }}
           TIMEZONE: ${{ vars.TIMEZONE }}
-
         run: |
           python -u - <<'PY'
-
           import os
           import re
           import time
-
+          import csv
+          from pathlib import Path
           from datetime import datetime, timedelta
           from urllib.parse import urlparse
           from zoneinfo import ZoneInfo
-
           from playwright.sync_api import sync_playwright
 
-
-          print("=" * 60)
-          print("FLEXIFUNNELS REPORTS TEST - VERSION 13")
-          print("=" * 60)
-
-
-          EMAIL = os.environ.get(
-              "FLEXIFUNNELS_EMAIL", ""
-          ).strip()
-
-          PASSWORD = os.environ.get(
-              "FLEXIFUNNELS_PASSWORD", ""
-          )
-
-          PROJECT_URL = os.environ.get(
-              "FLEXIFUNNELS_PROJECT_URL", ""
-          ).strip()
-
-          LANDING_URL = os.environ.get(
-              "FLEXIFUNNELS_LANDING_URL", ""
-          ).strip()
-
+          EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
+          PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
+          PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
+          LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
           REG_URL = os.environ.get(
               "FLEXIFUNNELS_REG_URL", ""
           ).strip()
@@ -814,407 +791,193 @@ jobs:
               )
 
 
-          def visible_report_controls(page):
-
-              patterns = [
-                  re.compile(
-                      r"^\s*Reports?\s*$",
-                      re.IGNORECASE,
-                  ),
-                  re.compile(
-                      r"^\s*Page Reports?\s*$",
-                      re.IGNORECASE,
-                  ),
-              ]
-
-              found = []
-
-              for pattern in patterns:
-
-                  locator = page.get_by_text(pattern)
-
-                  for item in visible_items(locator):
-
-                      if item not in found:
-                          found.append(item)
-
-              return found
-
-
-          def inspect_report_navigation(page, context):
-
-              print()
-              print("Checking Reports interface")
-
-              deadline = time.monotonic() + 20
-
+          def wait_unique(locator, description, seconds=30):
+              deadline = time.monotonic() + seconds
               while time.monotonic() < deadline:
+                  item = unique_visible(locator)
+                  if item is not None:
+                      return item
+                  time.sleep(0.25)
+              raise RuntimeError(description + ' missing or ambiguous; stopping.')
 
-                  pages = [
-                      candidate
-                      for candidate in context.pages
-                      if not candidate.is_closed()
-                  ]
 
-                  for candidate in reversed(pages):
+          def click_text(page, text):
+              wait_unique(page.get_by_text(text, exact=True), text).click()
 
-                      controls = visible_report_controls(
-                          candidate
-                      )
 
-                      if controls:
+          def verify_overview(page, published_url):
+              # Published URL search selects the page automatically in the recording.
+              # Require the requested URL to be displayed in Overview before proceeding.
+              deadline = time.monotonic() + 45
+              while time.monotonic() < deadline:
+                  if current_path(page) != urlparse(PROJECT_URL).path.rstrip('/'):
+                      time.sleep(0.5)
+                      continue
+                  values = [x.input_value() for x in visible_items(page.locator('input'))]
+                  exact = visible_items(page.get_by_text(published_url, exact=True))
+                  if published_url in values or len(exact) == 1:
+                      return
+                  time.sleep(0.5)
+              raise RuntimeError('Overview did not confirm the requested published URL.')
 
-                          print(
-                              "Reports-related controls found:",
-                              len(controls),
-                          )
 
-                          print(
-                              "Reports page location:",
-                              safe_location(candidate),
-                          )
-
-                          return candidate, controls
-
-                  time.sleep(1)
-
-              print(
-                  "No Reports interface detected."
-              )
-
-              print(
-                  "Current location:",
-                  safe_location(page),
-              )
-
-              print()
-              print("DIAGNOSTIC: Visible navigation labels")
-
-              # Log only known UI labels.
-              # Do not print page HTML, input values,
-              # cookies, tokens, or private data.
-
-              diagnostic_labels = [
-                  "Reports",
-                  "Report",
-                  "Page Reports",
-                  "Pages",
-                  "Funnels",
-                  "Analytics",
-                  "Filters",
-                  "Export Data",
-                  "Downloads",
-                  "Open Project",
+          def open_recorded_reports(page):
+              # The recorded purple icon has the hover tooltip "Reports".
+              # Resolve semantic metadata at runtime; never click by icon position.
+              locators = [
+                  page.get_by_role('button', name='Reports', exact=True),
+                  page.get_by_role('link', name='Reports', exact=True),
+                  page.locator('[title="Reports"], [data-bs-original-title="Reports"], '
+                               '[data-original-title="Reports"], [data-tooltip="Reports"]'),
               ]
-
-              for label in diagnostic_labels:
-
-                  count = len(
-                      visible_items(
-                          page.get_by_text(
-                              label,
-                              exact=True,
-                          )
-                      )
-                  )
-
-                  print(
-                      label + ":",
-                      count,
-                  )
-
-              raise RuntimeError(
-                  "Published URL search completed, "
-                  "but Reports interface was not found. "
-                  "Need to identify the correct navigation "
-                  "control before exporting data."
-              )
+              control = first_unique_visible(locators)
+              if control is None:
+                  # Hover only to identify the recorded tooltip; do not click unknown icons.
+                  candidates = visible_items(page.locator('button, a, [role="button"]'), 200)
+                  matches = []
+                  for candidate in candidates:
+                      candidate.hover()
+                      page.wait_for_timeout(200)
+                      tooltip = page.get_by_text('Reports', exact=True)
+                      if unique_visible(tooltip) is not None:
+                          matches.append(candidate)
+                  if len(matches) != 1:
+                      raise RuntimeError('Recorded Reports icon cannot be identified uniquely.')
+                  control = matches[0]
+              control.click()
+              page.get_by_text(re.compile(r'^Page Reports')).wait_for(timeout=45000)
+              wait_unique(page.get_by_text('Export Data', exact=True), 'Export Data', 45)
 
 
-          def open_reports(page, context):
+          def set_recorded_date_range(page):
+              # Filters is visible beside an existing All Time select. The recording
+              # changes that select directly; it does not open a separate Filters panel.
+              selects = []
+              for item in visible_items(page.locator('select')):
+                  labels = item.locator('option').all_text_contents()
+                  if any(x.strip() == 'Custom range' for x in labels):
+                      selects.append(item)
+              if len(selects) != 1:
+                  raise RuntimeError('Recorded date dropdown not uniquely identified.')
+              selects[0].select_option(label='Custom range')
+              click_text(page, 'Select Date Range') if unique_visible(page.get_by_text('Select Date Range', exact=True)) else wait_unique(page.locator('input[placeholder="Select Date Range"]'), 'Select Date Range').click()
 
-              report_page, controls = inspect_report_navigation(
-                  page,
-                  context,
-              )
-
-              print()
-              print("Opening Reports interface")
-
-              # Prefer explicit navigation controls.
-              # Avoid clicking generic text when
-              # multiple matches exist.
-
-              report_button = first_unique_visible(
-                  [
-                      report_page.get_by_role(
-                          "button",
-                          name=re.compile(
-                              r"^\s*Page Reports?\s*$",
-                              re.IGNORECASE,
-                          ),
-                      ),
-                      report_page.get_by_role(
-                          "link",
-                          name=re.compile(
-                              r"^\s*Page Reports?\s*$",
-                              re.IGNORECASE,
-                          ),
-                      ),
-                      report_page.get_by_role(
-                          "button",
-                          name=re.compile(
-                              r"^\s*Reports?\s*$",
-                              re.IGNORECASE,
-                          ),
-                      ),
-                      report_page.get_by_role(
-                          "link",
-                          name=re.compile(
-                              r"^\s*Reports?\s*$",
-                              re.IGNORECASE,
-                          ),
-                      ),
-                  ]
-              )
-
-              if report_button is None:
-
-                  if len(controls) == 1:
-                      report_button = controls[0]
-
-                  else:
-                      raise RuntimeError(
-                          "Multiple Reports controls found. "
-                          "Cannot safely choose one."
-                      )
-
-              report_button.click(timeout=15000)
-
-              report_page.wait_for_timeout(3000)
-
-              print(
-                  "Reports location:",
-                  safe_location(report_page),
-              )
-
-              return report_page
+              # The calendar visibly contains start/end ISO date fields. Fill only those
+              # editable fields. If this UI uses read-only fields, fail instead of guessing
+              # calendar classes, month arrows or day positions.
+              fields = []
+              for field in visible_items(page.locator('input')):
+                  if re.fullmatch(r'\d{4}-\d{2}-\d{2}', field.input_value().strip()):
+                      fields.append(field)
+              if len(fields) != 2 or not all(f.is_editable() for f in fields):
+                  raise RuntimeError('Calendar start/end fields are not two editable ISO dates; need DOM verification.')
+              for field, value in zip(fields, [yesterday.isoformat(), today.isoformat()]):
+                  field.fill(value)
+                  field.press('Tab')
+                  if field.input_value() != value:
+                      raise RuntimeError('Calendar did not accept the requested date.')
+              click_text(page, 'OK')
+              expected = yesterday.isoformat() + ' to ' + today.isoformat()
+              deadline = time.monotonic() + 45
+              while time.monotonic() < deadline:
+                  values = [x.input_value() for x in visible_items(page.locator('input'))]
+                  if expected in values or unique_visible(page.get_by_text(expected, exact=True)):
+                      # Wait for report loading to settle; range display alone is insufficient.
+                      page.wait_for_timeout(2000)
+                      count_text = page.get_by_text(re.compile(r'^Page Reports')).inner_text()
+                      match = re.search(r'\[(\d+)\]', count_text)
+                      if match:
+                          return int(match.group(1))
+                  time.sleep(0.5)
+              raise RuntimeError('Applied report date range/count could not be verified.')
 
 
-          def inspect_report_controls(page):
-
-              print()
-              print("INSPECTING REPORT FILTER AND EXPORT CONTROLS")
-
-              labels = [
-                  "Filters",
-                  "Filter",
-                  "Custom",
-                  "Custom Range",
-                  "Custom Date",
-                  "Date Range",
-                  "Export Data",
-                  "Filtered Data",
-                  "Downloads",
-              ]
-
-              found = {}
-
-              for label in labels:
-
-                  count = len(
-                      visible_items(
-                          page.get_by_text(
-                              label,
-                              exact=True,
-                          )
-                      )
-                  )
-
-                  found[label] = count
-
-                  print(
-                      label + ":",
-                      count,
-                  )
-
-              print()
-              print(
-                  "Visible date inputs:",
-                  len(
-                      visible_items(
-                          page.locator(
-                              'input[type="date"]'
-                          )
-                      )
-                  ),
-              )
-
-              print(
-                  "Visible select elements:",
-                  len(
-                      visible_items(
-                          page.locator("select")
-                      )
-                  ),
-              )
-
-              print()
-              print("Required date range:")
-              print("Start:", yesterday.isoformat())
-              print("End:", today.isoformat())
-
-              print()
-              print(
-                  "REPORTS INTERFACE INSPECTION COMPLETE"
-              )
-
-              print(
-                  "No export triggered in this test."
-              )
-
-              return found
+          def download_rows(page):
+              # Use table rows containing the recorded "Filter: Custom" marker.
+              return page.get_by_role('row').filter(has_text='Filter: Custom')
 
 
-          def test_page(
-              page,
-              context,
-              label,
-              published_url,
-          ):
+          def export_current_report(page, label, count):
+              click_text(page, 'Downloads')
+              page.get_by_text('FILE DETAILS', exact=True).wait_for(timeout=30000)
+              before = download_rows(page).all_text_contents()
+              click_text(page, 'Reports')
+              wait_unique(page.get_by_text('Export Data', exact=True), 'Export Data').click()
+              click_text(page, 'Filtered Data')
+              click_text(page, 'Downloads')
+              deadline = time.monotonic() + 600
+              seen_new = False
+              while time.monotonic() < deadline:
+                  rows = download_rows(page)
+                  texts = rows.all_text_contents()
+                  if texts:
+                      # Recorded exports prepend to Downloads. Require evidence of a new
+                      # row, so an old Completed export cannot be downloaded by mistake.
+                      normalize = lambda s: re.sub(r'Pending|Completed|Queued\.\.\.|Download', '', s).strip()
+                      if len(texts) > len(before) or not before or normalize(texts[0]) != normalize(before[0]):
+                          seen_new = True
+                      first = rows.first
+                      if seen_new:
+                          cells = first.get_by_role('cell')
+                          if cells.count() < 5:
+                              raise RuntimeError('Downloads columns differ from the recording.')
+                          if cells.nth(1).inner_text().strip() != str(count):
+                              raise RuntimeError('New export record count differs from filtered report.')
+                          status = cells.nth(2).inner_text().strip()
+                          if status == 'Completed':
+                              with page.expect_download(timeout=60000) as event:
+                                  wait_unique(first.get_by_text('Download', exact=True), 'new export Download').click()
+                              download = event.value
+                              if download.failure():
+                                  raise RuntimeError('CSV download failed.')
+                              path = Path('reports') / (label + '.csv')
+                              download.save_as(str(path))
+                              with path.open(encoding='utf-8-sig', newline='') as source:
+                                  reader = csv.reader(source)
+                                  header = next(reader, None)
+                                  total = sum(1 for row in reader if any(row))
+                              if not header or total != count:
+                                  raise RuntimeError('Downloaded CSV row count does not match report.')
+                              print(label + ': CSV verified; records=' + str(total))
+                              return
+                          if status not in ('Pending', 'Processing', 'Queued'):
+                              raise RuntimeError('Unexpected export status; stopping.')
+                  time.sleep(2)
+              raise RuntimeError('New export did not complete within 10 minutes. No refresh attempted.')
 
-              print()
-              print("=" * 60)
-              print("TESTING:", label)
-              print("=" * 60)
 
-              open_projects(page)
-
-              select_published_url(page)
-
-              search_published_url(
-                  page,
-                  published_url,
-              )
-
-              report_page = open_reports(
-                  page,
-                  context,
-              )
-
-              inspect_report_controls(
-                  report_page
-              )
-
-              print()
-              print(
-                  "SUCCESS:",
-                  label,
-                  "Reports interface reached."
-              )
-
-              return report_page
-
-
+          Path('reports').mkdir(exist_ok=True)
           with sync_playwright() as playwright:
-
-              browser = playwright.chromium.launch(
-                  headless=True
-              )
-
-              context = browser.new_context(
-                  viewport={
-                      "width": 1440,
-                      "height": 900,
-                  },
-                  accept_downloads=False,
-              )
-
+              browser = playwright.chromium.launch(headless=True)
+              context = browser.new_context(viewport={'width': 1440, 'height': 900}, accept_downloads=True, timezone_id=TIMEZONE)
               page = context.new_page()
-
               page.set_default_timeout(15000)
-
               try:
-
                   login(page)
-
                   select_saurabh(page)
-
-                  switched_page = locate_switched_page(
-                      context,
-                      page,
-                  )
-
-                  switched_page.set_default_timeout(15000)
-
-                  first_report_page = test_page(
-                      switched_page,
-                      context,
-                      "FUNNEL AGENT",
-                      LANDING_URL,
-                  )
-
-                  second_report_page = test_page(
-                      first_report_page,
-                      context,
-                      "FUNNEL AGENT REG",
-                      REG_URL,
-                  )
-
-                  print()
-                  print("=" * 60)
-                  print("VERSION 13 NAVIGATION TEST SUCCESSFUL")
-                  print("=" * 60)
-
-                  print("LOGIN: VERIFIED")
-                  print("SAURABH SWITCH CONTROL: CLICKED")
-                  print("PUBLISHED URL FILTER: VERIFIED")
-                  print("FUNNEL AGENT REPORTS: REACHED")
-                  print("FUNNEL AGENT REG REPORTS: REACHED")
-
-                  print()
-                  print("NO REPORTS EXPORTED")
-                  print("NO GOOGLE SHEETS MODIFIED")
-
-                  print("=" * 60)
-
-              except Exception as exc:
-
-                  print()
-                  print("=" * 60)
-                  print("VERSION 13 TEST FAILED")
-                  print("=" * 60)
-
-                  print(
-                      "Error type:",
-                      type(exc).__name__,
-                  )
-
-                  print(
-                      "Failure detail:",
-                      str(exc)[:300],
-                  )
-
-                  print(
-                      "Last location:",
-                      safe_location(page),
-                  )
-
-                  print("=" * 60)
-
-                  raise RuntimeError(
-                      "FlexiFunnels navigation or Reports "
-                      "inspection failed. "
-                      "Review the detailed logs above."
-                  ) from None
-
+                  page = locate_switched_page(context, page)
+                  page.set_default_timeout(15000)
+                  for label, published_url in [('funnel-agent', LANDING_URL), ('flexi-genie-regteam', REG_URL)]:
+                      open_projects(page)
+                      select_published_url(page)
+                      search_published_url(page, published_url)
+                      verify_overview(page, published_url)
+                      open_recorded_reports(page)
+                      count = set_recorded_date_range(page)
+                      export_current_report(page, label, count)
+                  print('VERSION 14: both CSVs verified; Google Sheets remain read-only.')
+              except Exception as error:
+                  print('VERSION 14 stopped:', type(error).__name__, str(error))
+                  raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
-
-                  context.close()
-
                   browser.close()
 
-                  print()
-                  print("Browser closed.")
-
           PY
+      - name: Upload verified CSV reports
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flexifunnels-reports-${{ github.run_id }}
+          path: reports/*.csv
+          if-no-files-found: error
+          retention-days: 7
