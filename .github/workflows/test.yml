@@ -927,6 +927,10 @@ jobs:
 
 
           def set_recorded_date_range(page):
+              # At 14–15 seconds in the recording, clicking Filters reveals All Time.
+              # Each published URL is opened afresh before this function is called.
+              click_text(page, 'Filters')
+              print('Filters clicked; waiting for the date control to appear.')
               choose_recorded_custom_range(page)
               # Wait for the date picker to appear after selection instead of inspecting
               # it immediately while the report UI is still updating.
