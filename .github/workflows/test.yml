@@ -7,12 +7,14 @@ permissions:
   contents: read
 
 jobs:
+
   test-google-sheets:
     name: Test Google Sheets Connection
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
@@ -42,7 +44,7 @@ jobs:
           from google.oauth2.service_account import Credentials
 
           print("=" * 60)
-          print("GOOGLE SHEETS CONNECTION TEST - VERSION 12")
+          print("GOOGLE SHEETS TEST - VERSION 13")
           print("=" * 60)
 
           required = [
@@ -56,9 +58,9 @@ jobs:
           ]
 
           missing = [
-              name
-              for name in required
-              if not os.environ.get(name, "").strip()
+              key
+              for key in required
+              if not os.environ.get(key, "").strip()
           ]
 
           if missing:
@@ -75,7 +77,7 @@ jobs:
 
           client = gspread.authorize(credentials)
 
-          spreadsheet_ids = {
+          spreadsheets = {
               "RAW DATA": os.environ["RAW_DATA_SHEET_ID"],
               "UTM": os.environ["UTM_SHEET_ID"],
               "DISCREPANCY STATS": os.environ["DISCREPANCY_SHEET_ID"],
@@ -83,15 +85,16 @@ jobs:
 
           opened = {}
 
-          for label, spreadsheet_id in spreadsheet_ids.items():
+          for label, spreadsheet_id in spreadsheets.items():
+
               spreadsheet = client.open_by_key(spreadsheet_id)
+
               opened[label] = spreadsheet
 
-              print("\n" + label + ": CONNECTED")
+              print()
+              print(label + ": CONNECTED")
               print("Spreadsheet:", spreadsheet.title)
-              print("Total tabs:", len(spreadsheet.worksheets()))
-
-          print("\nCHECKING CONFIGURED SOURCE TABS")
+              print("Tabs:", len(spreadsheet.worksheets()))
 
           checks = [
               ("UTM_LANDING_TAB", "UTM"),
@@ -100,10 +103,12 @@ jobs:
           ]
 
           for variable, spreadsheet_label in checks:
+
               tab_name = os.environ[variable].strip()
 
               try:
                   opened[spreadsheet_label].worksheet(tab_name)
+
                   print(variable + ": FOUND")
 
               except gspread.WorksheetNotFound:
@@ -111,18 +116,21 @@ jobs:
                       variable + " does not match an existing tab."
                   )
 
-          print("\n" + "=" * 60)
-          print("GOOGLE SHEETS CONNECTION TEST SUCCESSFUL")
-          print("READ-ONLY TEST: NO DATA MODIFIED")
+          print()
+          print("=" * 60)
+          print("GOOGLE SHEETS TEST SUCCESSFUL")
+          print("READ ONLY - NOTHING MODIFIED")
           print("=" * 60)
           PY
 
-  test-flexifunnels-login:
-    name: Test FlexiFunnels Login and Both Pages
+
+  test-flexifunnels:
+    name: Test FlexiFunnels Reports Navigation
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
@@ -134,136 +142,186 @@ jobs:
           python -m pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Test login and both Published URL searches
+      - name: Test login, both searches, and Reports access
         env:
           FLEXIFUNNELS_EMAIL: ${{ secrets.FLEXIFUNNELS_EMAIL }}
           FLEXIFUNNELS_PASSWORD: ${{ secrets.FLEXIFUNNELS_PASSWORD }}
           FLEXIFUNNELS_PROJECT_URL: ${{ vars.FLEXIFUNNELS_PROJECT_URL }}
           FLEXIFUNNELS_LANDING_URL: ${{ vars.FLEXIFUNNELS_LANDING_URL }}
           FLEXIFUNNELS_REG_URL: ${{ vars.FLEXIFUNNELS_REG_URL }}
+          TIMEZONE: ${{ vars.TIMEZONE }}
 
         run: |
           python -u - <<'PY'
+
           import os
           import re
           import time
 
+          from datetime import datetime, timedelta
           from urllib.parse import urlparse
+          from zoneinfo import ZoneInfo
+
           from playwright.sync_api import sync_playwright
 
+
           print("=" * 60)
-          print("FLEXIFUNNELS NAVIGATION TEST - VERSION 12")
+          print("FLEXIFUNNELS REPORTS TEST - VERSION 13")
           print("=" * 60)
 
-          email = os.environ.get(
+
+          EMAIL = os.environ.get(
               "FLEXIFUNNELS_EMAIL", ""
           ).strip()
 
-          password = os.environ.get(
+          PASSWORD = os.environ.get(
               "FLEXIFUNNELS_PASSWORD", ""
           )
 
-          project_url = os.environ.get(
+          PROJECT_URL = os.environ.get(
               "FLEXIFUNNELS_PROJECT_URL", ""
           ).strip()
 
-          landing_url = os.environ.get(
+          LANDING_URL = os.environ.get(
               "FLEXIFUNNELS_LANDING_URL", ""
           ).strip()
 
-          reg_url = os.environ.get(
+          REG_URL = os.environ.get(
               "FLEXIFUNNELS_REG_URL", ""
           ).strip()
 
-          if not email or not password:
-              raise RuntimeError(
-                  "FlexiFunnels credentials are missing."
-              )
+          TIMEZONE = os.environ.get(
+              "TIMEZONE", "Asia/Kolkata"
+          ).strip() or "Asia/Kolkata"
 
-          expected_project = (
+
+          EXPECTED_PROJECT_URL = (
               "https://app.flexifunnels.com/projects/kvapNzyj"
           )
 
-          if project_url.rstrip("/") != expected_project:
+          EXPECTED_LANDING_URL = (
+              "https://sb.flexifunnels.com/funnel-agent"
+          )
+
+          EXPECTED_REG_URL = (
+              "https://sb.flexifunnels.com/flexi-genie-regteam"
+          )
+
+
+          if not EMAIL or not PASSWORD:
               raise RuntimeError(
-                  "Unexpected FLEXIFUNNELS_PROJECT_URL."
+                  "FlexiFunnels credentials missing."
               )
 
-          expected_urls = {
-              "FUNNEL AGENT": (
-                  "https://sb.flexifunnels.com/funnel-agent"
-              ),
-              "FUNNEL AGENT REG": (
-                  "https://sb.flexifunnels.com/flexi-genie-regteam"
-              ),
-          }
-
-          if landing_url.rstrip("/") != expected_urls["FUNNEL AGENT"]:
+          if PROJECT_URL.rstrip("/") != EXPECTED_PROJECT_URL:
               raise RuntimeError(
-                  "Unexpected FLEXIFUNNELS_LANDING_URL."
+                  "Unexpected project URL configuration."
               )
 
-          if reg_url.rstrip("/") != expected_urls["FUNNEL AGENT REG"]:
+          if LANDING_URL.rstrip("/") != EXPECTED_LANDING_URL:
               raise RuntimeError(
-                  "Unexpected FLEXIFUNNELS_REG_URL."
+                  "Unexpected landing URL configuration."
               )
+
+          if REG_URL.rstrip("/") != EXPECTED_REG_URL:
+              raise RuntimeError(
+                  "Unexpected registration URL configuration."
+              )
+
+
+          today = datetime.now(
+              ZoneInfo(TIMEZONE)
+          ).date()
+
+          yesterday = today - timedelta(days=1)
+
+          print()
+          print("Timezone:", TIMEZONE)
+          print("Report start date:", yesterday.isoformat())
+          print("Report end date:", today.isoformat())
+          print("Date range: INCLUSIVE")
+          print()
+
 
           def safe_location(page):
+
               if page.is_closed():
                   return "closed"
 
               parsed = urlparse(page.url)
 
-              # Do not print account-switch URLs,
-              # tokens, query strings, or fragments.
+              path = parsed.path
+
               if (
-                  "login-as" in parsed.path
-                  or "switch" in parsed.path
-                  and parsed.path != "/switch-sub-users"
+                  "login-as" in path
+                  or "token" in path.lower()
+                  or "callback" in path.lower()
+                  or "auth" in path.lower()
               ):
-                  return (
-                      parsed.scheme
-                      + "://"
-                      + (parsed.hostname or "")
-                      + "/[authentication-path-redacted]"
-                  )
+                  path = "/[sensitive-path-redacted]"
 
               return (
                   parsed.scheme
                   + "://"
                   + (parsed.hostname or "")
-                  + parsed.path
+                  + path
               )
 
+
           def current_path(page):
+
               if page.is_closed():
                   return ""
 
               return urlparse(page.url).path.rstrip("/")
 
+
           def visible_items(locator, limit=50):
-              matches = []
+
+              result = []
 
               for index in range(min(locator.count(), limit)):
+
                   item = locator.nth(index)
 
                   if item.is_visible():
-                      matches.append(item)
+                      result.append(item)
 
-              return matches
+              return result
+
 
           def unique_visible(locator):
-              matches = visible_items(locator)
 
-              if len(matches) == 1:
-                  return matches[0]
+              items = visible_items(locator)
+
+              if len(items) == 1:
+                  return items[0]
 
               return None
 
-          def wait_for_path_change(page, original, seconds=25):
+
+          def first_unique_visible(locators):
+
+              for locator in locators:
+
+                  candidate = unique_visible(locator)
+
+                  if candidate is not None:
+                      return candidate
+
+              return None
+
+
+          def wait_for_path_change(
+              page,
+              original,
+              seconds=25,
+          ):
+
               deadline = time.monotonic() + seconds
 
               while time.monotonic() < deadline:
+
                   if current_path(page) != original:
                       return current_path(page)
 
@@ -271,8 +329,11 @@ jobs:
 
               return current_path(page)
 
+
           def find_login_field(page, selectors):
+
               for selector in selectors:
+
                   field = unique_visible(
                       page.locator(selector)
                   )
@@ -282,8 +343,122 @@ jobs:
 
               return None
 
+
+          def login(page):
+
+              print()
+              print("STEP 1: Opening FlexiFunnels login")
+
+              page.goto(
+                  "https://app.flexifunnels.com/login",
+                  wait_until="domcontentloaded",
+                  timeout=60000,
+              )
+
+              print("Location:", safe_location(page))
+
+              print()
+              print("STEP 2: Finding login fields")
+
+              email_field = find_login_field(
+                  page,
+                  [
+                      'input[type="email"]',
+                      'input[name="email"]',
+                      'input[autocomplete="username"]',
+                  ],
+              )
+
+              password_field = find_login_field(
+                  page,
+                  [
+                      'input[type="password"]',
+                  ],
+              )
+
+              if email_field is None or password_field is None:
+                  raise RuntimeError(
+                      "Login fields not found."
+                  )
+
+              print("Login fields found.")
+
+              print()
+              print("STEP 3: Entering credentials")
+
+              email_field.fill(EMAIL)
+
+              password_field.fill(PASSWORD)
+
+              print("Credentials entered.")
+
+              print()
+              print("STEP 4: Finding login button")
+
+              login_button = first_unique_visible(
+                  [
+                      page.locator('button[type="submit"]'),
+                      page.locator('input[type="submit"]'),
+                      page.locator(
+                          'button:has-text("Login")'
+                      ),
+                      page.locator(
+                          'button:has-text("Log in")'
+                      ),
+                      page.locator(
+                          'button:has-text("Sign in")'
+                      ),
+                  ]
+              )
+
+              print()
+              print("STEP 5: Submitting login")
+
+              if login_button is not None:
+                  login_button.click(timeout=15000)
+              else:
+                  password_field.press("Enter")
+
+              print("Login submitted.")
+
+              print()
+              print("STEP 6: Opening sub-user selection")
+
+              path = wait_for_path_change(
+                  page,
+                  "/login",
+                  seconds=25,
+              )
+
+              if path == "/login":
+
+                  page.goto(
+                      PROJECT_URL,
+                      wait_until="domcontentloaded",
+                      timeout=60000,
+                  )
+
+              page.wait_for_timeout(3000)
+
+              print(
+                  "Current location:",
+                  safe_location(page),
+              )
+
+              if current_path(page) != "/switch-sub-users":
+                  raise RuntimeError(
+                      "Sub-user selection screen missing."
+                  )
+
+              print(
+                  "SUB-USER SELECTION SCREEN DETECTED"
+              )
+
+
           def select_saurabh(page):
-              print("\nSTEP 7: Finding Saurabh Bhatnagar")
+
+              print()
+              print("STEP 7: Finding Saurabh Bhatnagar")
 
               exact_name = re.compile(
                   r"^\s*Saurabh Bhatnagar\s*$",
@@ -296,18 +471,19 @@ jobs:
 
               if name_element is None:
                   raise RuntimeError(
-                      "Saurabh Bhatnagar was not found uniquely."
+                      "Saurabh Bhatnagar not found uniquely."
                   )
 
               print("Saurabh Bhatnagar: FOUND")
 
+              print()
               print(
-                  "\nSTEP 8: Finding Switch to user "
+                  "STEP 8: Finding Switch to user "
                   "inside Saurabh's card"
               )
 
-              # Preserve the selector confirmed working
-              # in Versions 9, 10, and 11.
+              # This is the selector confirmed working
+              # in Versions 9 through 12.
 
               card = name_element.locator(
                   "xpath=ancestor::*["
@@ -326,7 +502,7 @@ jobs:
 
               if card.count() != 1 or not card.is_visible():
                   raise RuntimeError(
-                      "Could not identify Saurabh's account card."
+                      "Saurabh account card not found."
                   )
 
               print("Saurabh account card: FOUND")
@@ -343,6 +519,7 @@ jobs:
               matches = []
 
               for control in visible_items(controls):
+
                   label = control.inner_text().strip()
 
                   if switch_pattern.fullmatch(label):
@@ -350,20 +527,23 @@ jobs:
 
               if len(matches) != 1:
                   raise RuntimeError(
-                      "Could not uniquely identify "
-                      "Saurabh's Switch to user control."
+                      "Saurabh Switch to user control "
+                      "not found uniquely."
                   )
 
               switch_control = matches[0]
 
               if not switch_control.is_enabled():
                   raise RuntimeError(
-                      "Saurabh's Switch to user control is disabled."
+                      "Switch to user control disabled."
                   )
 
-              print("Correct Switch to user control found.")
+              print(
+                  "Correct Switch to user control found."
+              )
 
-              print("\nSTEP 9: Switching to Saurabh")
+              print()
+              print("STEP 9: Switching to Saurabh")
 
               switch_control.click(timeout=15000)
 
@@ -372,22 +552,32 @@ jobs:
                   "inside Saurabh's card."
               )
 
-          def locate_switched_page(context, original_page):
+
+          def locate_switched_page(
+              context,
+              original_page,
+          ):
+
+              print()
               print(
-                  "\nSTEP 10: Checking browser tabs "
+                  "STEP 10: Checking browser tabs "
                   "after sub-user switch"
               )
 
               deadline = time.monotonic() + 15
 
               while time.monotonic() < deadline:
+
                   pages = [
-                      p for p in context.pages
-                      if not p.is_closed()
+                      candidate
+                      for candidate in context.pages
+                      if not candidate.is_closed()
                   ]
 
                   for candidate in reversed(pages):
+
                       if candidate != original_page:
+
                           print(
                               "Additional browser tab detected."
                           )
@@ -400,26 +590,33 @@ jobs:
                                  != "app.flexifunnels.com"
                           ):
                               raise RuntimeError(
-                                  "Unexpected sub-user destination."
+                                  "Unexpected switch destination."
                               )
 
                           return candidate
 
                   if current_path(original_page) != "/switch-sub-users":
-                      print("Original tab changed location.")
+
+                      print(
+                          "Original tab changed location."
+                      )
+
                       return original_page
 
                   time.sleep(1)
 
               print(
                   "No navigation or new tab detected. "
-                  "Continuing to Projects page."
+                  "Continuing to Projects."
               )
 
               return original_page
 
+
           def open_projects(page):
-              print("\nOpening Projects page")
+
+              print()
+              print("Opening Projects page")
 
               page.goto(
                   "https://app.flexifunnels.com/projects",
@@ -430,13 +627,13 @@ jobs:
               page.wait_for_timeout(3000)
 
               print(
-                  "Projects page location:",
+                  "Projects location:",
                   safe_location(page),
               )
 
               if current_path(page) != "/projects":
                   raise RuntimeError(
-                      "Projects page is inaccessible."
+                      "Projects page inaccessible."
                   )
 
               search_field = unique_visible(
@@ -447,30 +644,23 @@ jobs:
 
               if search_field is None:
                   raise RuntimeError(
-                      "Projects page opened, but "
-                      "the search field is missing."
+                      "Projects search field missing."
                   )
 
-              print("Projects page access verified.")
+              print("Projects page verified.")
+
 
           def select_published_url(page):
-              print(
-                  "\nSelecting Published URL search filter"
-              )
 
-              # Screenshot confirms that the dropdown
-              # contains exactly these options:
-              #
-              # Project Name
-              # Published URL
-              #
-              # It does NOT contain "Project URL".
+              print()
+              print("Selecting Published URL filter")
 
               native_selects = visible_items(
                   page.locator("select")
               )
 
               for select in native_selects:
+
                   options = select.locator("option")
 
                   labels = [
@@ -479,6 +669,7 @@ jobs:
                   ]
 
                   if "Published URL" in labels:
+
                       select.select_option(
                           label="Published URL"
                       )
@@ -490,39 +681,32 @@ jobs:
 
                       return
 
-              dropdown_candidates = [
-                  page.get_by_role(
-                      "button",
-                      name=re.compile(
-                          r"Project Name",
-                          re.IGNORECASE,
+              dropdown = first_unique_visible(
+                  [
+                      page.get_by_role(
+                          "button",
+                          name=re.compile(
+                              r"Project Name",
+                              re.IGNORECASE,
+                          ),
                       ),
-                  ),
-                  page.get_by_role(
-                      "combobox",
-                      name=re.compile(
-                          r"Project",
-                          re.IGNORECASE,
+                      page.get_by_role(
+                          "combobox",
+                          name=re.compile(
+                              r"Project",
+                              re.IGNORECASE,
+                          ),
                       ),
-                  ),
-                  page.get_by_text(
-                      "Project Name",
-                      exact=True,
-                  ),
-              ]
-
-              dropdown = None
-
-              for locator in dropdown_candidates:
-                  candidate = unique_visible(locator)
-
-                  if candidate is not None:
-                      dropdown = candidate
-                      break
+                      page.get_by_text(
+                          "Project Name",
+                          exact=True,
+                      ),
+                  ]
+              )
 
               if dropdown is None:
                   raise RuntimeError(
-                      "Project Name dropdown not found."
+                      "Project Name dropdown missing."
                   )
 
               dropdown.click(timeout=15000)
@@ -531,48 +715,46 @@ jobs:
 
               page.wait_for_timeout(700)
 
-              option_candidates = [
-                  page.get_by_role(
-                      "option",
-                      name=re.compile(
-                          r"^\s*Published URL\s*$",
-                          re.IGNORECASE,
+              option = first_unique_visible(
+                  [
+                      page.get_by_role(
+                          "option",
+                          name=re.compile(
+                              r"^\s*Published URL\s*$",
+                              re.IGNORECASE,
+                          ),
                       ),
-                  ),
-                  page.get_by_role(
-                      "menuitem",
-                      name=re.compile(
-                          r"^\s*Published URL\s*$",
-                          re.IGNORECASE,
+                      page.get_by_role(
+                          "menuitem",
+                          name=re.compile(
+                              r"^\s*Published URL\s*$",
+                              re.IGNORECASE,
+                          ),
                       ),
-                  ),
-                  page.get_by_text(
-                      "Published URL",
-                      exact=True,
-                  ),
-              ]
-
-              option = None
-
-              for locator in option_candidates:
-                  candidate = unique_visible(locator)
-
-                  if candidate is not None:
-                      option = candidate
-                      break
+                      page.get_by_text(
+                          "Published URL",
+                          exact=True,
+                      ),
+                  ]
+              )
 
               if option is None:
                   raise RuntimeError(
-                      "Published URL option not found "
-                      "after opening the dropdown."
+                      "Published URL option missing."
                   )
 
               option.click(timeout=15000)
 
               print("Published URL selected.")
 
-          def search_published_url(page, published_url):
-              print("\nEntering published page URL")
+
+          def search_published_url(
+              page,
+              published_url,
+          ):
+
+              print()
+              print("Entering published URL")
 
               search_field = unique_visible(
                   page.locator(
@@ -582,16 +764,12 @@ jobs:
 
               if search_field is None:
                   raise RuntimeError(
-                      "Published URL search field not found."
+                      "Published URL search field missing."
                   )
 
               search_field.fill(published_url)
 
               print("Published URL entered.")
-
-              # The Projects search may be reactive:
-              # typing the URL can automatically update
-              # results or open the matching project.
 
               search_button = unique_visible(
                   page.get_by_role(
@@ -604,66 +782,309 @@ jobs:
               )
 
               if search_button is not None:
-                  print("Clicking Search button.")
+
+                  print("Clicking Search.")
+
                   search_button.click(timeout=15000)
+
               else:
+
                   print(
-                      "No separate Search button found. "
-                      "Waiting for automatic search."
+                      "No separate Search button. "
+                      "Waiting for reactive search."
                   )
 
               print("Published URL search submitted.")
 
-          def verify_project_opened(page, context):
+              # IMPORTANT CHANGE:
+              #
+              # Do not wait for the browser URL to become
+              # /projects/kvapNzyj.
+              #
+              # Do not click Open Project.
+              #
+              # Instead inspect the Reports interface
+              # after the published URL search.
+
+              page.wait_for_timeout(4000)
+
               print(
-                  "\nWaiting for project to open automatically"
+                  "Location after search:",
+                  safe_location(page),
               )
 
-              expected_path = "/projects/kvapNzyj"
-              deadline = time.monotonic() + 40
+
+          def visible_report_controls(page):
+
+              patterns = [
+                  re.compile(
+                      r"^\s*Reports?\s*$",
+                      re.IGNORECASE,
+                  ),
+                  re.compile(
+                      r"^\s*Page Reports?\s*$",
+                      re.IGNORECASE,
+                  ),
+              ]
+
+              found = []
+
+              for pattern in patterns:
+
+                  locator = page.get_by_text(pattern)
+
+                  for item in visible_items(locator):
+
+                      if item not in found:
+                          found.append(item)
+
+              return found
+
+
+          def inspect_report_navigation(page, context):
+
+              print()
+              print("Checking Reports interface")
+
+              deadline = time.monotonic() + 20
 
               while time.monotonic() < deadline:
+
                   pages = [
-                      p for p in context.pages
-                      if not p.is_closed()
+                      candidate
+                      for candidate in context.pages
+                      if not candidate.is_closed()
                   ]
 
-                  for candidate in pages:
-                      if current_path(candidate) == expected_path:
-                          print(
-                              "Expected project opened."
-                          )
+                  for candidate in reversed(pages):
 
-                          return candidate
-
-                  if current_path(page) in (
-                      "/login",
-                      "/switch-sub-users",
-                  ):
-                      raise RuntimeError(
-                          "Authentication was lost "
-                          "during published URL search."
+                      controls = visible_report_controls(
+                          candidate
                       )
 
-                  time.sleep(2)
+                      if controls:
+
+                          print(
+                              "Reports-related controls found:",
+                              len(controls),
+                          )
+
+                          print(
+                              "Reports page location:",
+                              safe_location(candidate),
+                          )
+
+                          return candidate, controls
+
+                  time.sleep(1)
+
+              print(
+                  "No Reports interface detected."
+              )
 
               print(
                   "Current location:",
                   safe_location(page),
               )
 
+              print()
+              print("DIAGNOSTIC: Visible navigation labels")
+
+              # Log only known UI labels.
+              # Do not print page HTML, input values,
+              # cookies, tokens, or private data.
+
+              diagnostic_labels = [
+                  "Reports",
+                  "Report",
+                  "Page Reports",
+                  "Pages",
+                  "Funnels",
+                  "Analytics",
+                  "Filters",
+                  "Export Data",
+                  "Downloads",
+                  "Open Project",
+              ]
+
+              for label in diagnostic_labels:
+
+                  count = len(
+                      visible_items(
+                          page.get_by_text(
+                              label,
+                              exact=True,
+                          )
+                      )
+                  )
+
+                  print(
+                      label + ":",
+                      count,
+                  )
+
               raise RuntimeError(
-                  "Published URL search did not "
-                  "automatically open project kvapNzyj."
+                  "Published URL search completed, "
+                  "but Reports interface was not found. "
+                  "Need to identify the correct navigation "
+                  "control before exporting data."
               )
 
-          def test_published_page(
+
+          def open_reports(page, context):
+
+              report_page, controls = inspect_report_navigation(
+                  page,
+                  context,
+              )
+
+              print()
+              print("Opening Reports interface")
+
+              # Prefer explicit navigation controls.
+              # Avoid clicking generic text when
+              # multiple matches exist.
+
+              report_button = first_unique_visible(
+                  [
+                      report_page.get_by_role(
+                          "button",
+                          name=re.compile(
+                              r"^\s*Page Reports?\s*$",
+                              re.IGNORECASE,
+                          ),
+                      ),
+                      report_page.get_by_role(
+                          "link",
+                          name=re.compile(
+                              r"^\s*Page Reports?\s*$",
+                              re.IGNORECASE,
+                          ),
+                      ),
+                      report_page.get_by_role(
+                          "button",
+                          name=re.compile(
+                              r"^\s*Reports?\s*$",
+                              re.IGNORECASE,
+                          ),
+                      ),
+                      report_page.get_by_role(
+                          "link",
+                          name=re.compile(
+                              r"^\s*Reports?\s*$",
+                              re.IGNORECASE,
+                          ),
+                      ),
+                  ]
+              )
+
+              if report_button is None:
+
+                  if len(controls) == 1:
+                      report_button = controls[0]
+
+                  else:
+                      raise RuntimeError(
+                          "Multiple Reports controls found. "
+                          "Cannot safely choose one."
+                      )
+
+              report_button.click(timeout=15000)
+
+              report_page.wait_for_timeout(3000)
+
+              print(
+                  "Reports location:",
+                  safe_location(report_page),
+              )
+
+              return report_page
+
+
+          def inspect_report_controls(page):
+
+              print()
+              print("INSPECTING REPORT FILTER AND EXPORT CONTROLS")
+
+              labels = [
+                  "Filters",
+                  "Filter",
+                  "Custom",
+                  "Custom Range",
+                  "Custom Date",
+                  "Date Range",
+                  "Export Data",
+                  "Filtered Data",
+                  "Downloads",
+              ]
+
+              found = {}
+
+              for label in labels:
+
+                  count = len(
+                      visible_items(
+                          page.get_by_text(
+                              label,
+                              exact=True,
+                          )
+                      )
+                  )
+
+                  found[label] = count
+
+                  print(
+                      label + ":",
+                      count,
+                  )
+
+              print()
+              print(
+                  "Visible date inputs:",
+                  len(
+                      visible_items(
+                          page.locator(
+                              'input[type="date"]'
+                          )
+                      )
+                  ),
+              )
+
+              print(
+                  "Visible select elements:",
+                  len(
+                      visible_items(
+                          page.locator("select")
+                      )
+                  ),
+              )
+
+              print()
+              print("Required date range:")
+              print("Start:", yesterday.isoformat())
+              print("End:", today.isoformat())
+
+              print()
+              print(
+                  "REPORTS INTERFACE INSPECTION COMPLETE"
+              )
+
+              print(
+                  "No export triggered in this test."
+              )
+
+              return found
+
+
+          def test_page(
               page,
               context,
               label,
               published_url,
           ):
-              print("\n" + "=" * 60)
+
+              print()
+              print("=" * 60)
               print("TESTING:", label)
               print("=" * 60)
 
@@ -676,21 +1097,28 @@ jobs:
                   published_url,
               )
 
-              opened_page = verify_project_opened(
+              report_page = open_reports(
                   page,
                   context,
               )
 
-              print(
-                  "\nSUCCESS:",
-                  label,
-                  "published URL search opened the project."
+              inspect_report_controls(
+                  report_page
               )
 
-              return opened_page
+              print()
+              print(
+                  "SUCCESS:",
+                  label,
+                  "Reports interface reached."
+              )
 
-          with sync_playwright() as p:
-              browser = p.chromium.launch(
+              return report_page
+
+
+          with sync_playwright() as playwright:
+
+              browser = playwright.chromium.launch(
                   headless=True
               )
 
@@ -703,108 +1131,12 @@ jobs:
               )
 
               page = context.new_page()
+
               page.set_default_timeout(15000)
 
               try:
-                  print("\nSTEP 1: Opening FlexiFunnels login")
 
-                  page.goto(
-                      "https://app.flexifunnels.com/login",
-                      wait_until="domcontentloaded",
-                      timeout=60000,
-                  )
-
-                  print("Location:", safe_location(page))
-
-                  print("\nSTEP 2: Finding login fields")
-
-                  email_field = find_login_field(
-                      page,
-                      [
-                          'input[type="email"]',
-                          'input[name="email"]',
-                          'input[autocomplete="username"]',
-                      ],
-                  )
-
-                  password_field = find_login_field(
-                      page,
-                      ['input[type="password"]'],
-                  )
-
-                  if email_field is None or password_field is None:
-                      raise RuntimeError(
-                          "Login fields were not found."
-                      )
-
-                  print("Login fields found.")
-
-                  print("\nSTEP 3: Entering credentials")
-
-                  email_field.fill(email)
-                  password_field.fill(password)
-
-                  print("Credentials entered.")
-
-                  print("\nSTEP 4: Finding login button")
-
-                  login_button = None
-
-                  for selector in [
-                      'button[type="submit"]',
-                      'input[type="submit"]',
-                      'button:has-text("Login")',
-                      'button:has-text("Log in")',
-                      'button:has-text("Sign in")',
-                  ]:
-                      candidate = unique_visible(
-                          page.locator(selector)
-                      )
-
-                      if candidate is not None:
-                          login_button = candidate
-                          break
-
-                  print("\nSTEP 5: Submitting login")
-
-                  if login_button is not None:
-                      login_button.click(timeout=15000)
-                  else:
-                      password_field.press("Enter")
-
-                  print("Login submitted.")
-
-                  print("\nSTEP 6: Opening sub-user selection")
-
-                  path = wait_for_path_change(
-                      page,
-                      "/login",
-                      seconds=25,
-                  )
-
-                  if path == "/login":
-                      page.goto(
-                          project_url,
-                          wait_until="domcontentloaded",
-                          timeout=60000,
-                      )
-
-                  page.wait_for_timeout(3000)
-
-                  print(
-                      "Current location:",
-                      safe_location(page),
-                  )
-
-                  if current_path(page) != "/switch-sub-users":
-                      raise RuntimeError(
-                          "Sub-user selection page "
-                          "was not displayed."
-                      )
-
-                  print(
-                      "SUB-USER SELECTION SCREEN DETECTED"
-                  )
+                  login(page)
 
                   select_saurabh(page)
 
@@ -815,59 +1147,74 @@ jobs:
 
                   switched_page.set_default_timeout(15000)
 
-                  # First search:
-                  # Funnel Agent published URL.
-
-                  first_project_page = test_published_page(
+                  first_report_page = test_page(
                       switched_page,
                       context,
                       "FUNNEL AGENT",
-                      landing_url,
+                      LANDING_URL,
                   )
 
-                  # Second search:
-                  # Funnel Agent Reg published URL.
-                  #
-                  # The Projects page is opened again
-                  # so the same UI sequence is repeated.
-
-                  second_project_page = test_published_page(
-                      first_project_page,
+                  second_report_page = test_page(
+                      first_report_page,
                       context,
                       "FUNNEL AGENT REG",
-                      reg_url,
+                      REG_URL,
                   )
 
-                  print("\n" + "=" * 60)
-                  print("FLEXIFUNNELS VERSION 12 TEST SUCCESSFUL")
+                  print()
                   print("=" * 60)
+                  print("VERSION 13 NAVIGATION TEST SUCCESSFUL")
+                  print("=" * 60)
+
                   print("LOGIN: VERIFIED")
                   print("SAURABH SWITCH CONTROL: CLICKED")
-                  print("PROJECTS PAGE: VERIFIED")
                   print("PUBLISHED URL FILTER: VERIFIED")
-                  print("FUNNEL AGENT SEARCH: VERIFIED")
-                  print("FUNNEL AGENT REG SEARCH: VERIFIED")
-                  print("TARGET PROJECT: VERIFIED")
-                  print("NO REPORTS DOWNLOADED")
+                  print("FUNNEL AGENT REPORTS: REACHED")
+                  print("FUNNEL AGENT REG REPORTS: REACHED")
+
+                  print()
+                  print("NO REPORTS EXPORTED")
                   print("NO GOOGLE SHEETS MODIFIED")
+
                   print("=" * 60)
 
               except Exception as exc:
-                  print("\n" + "=" * 60)
-                  print("FLEXIFUNNELS VERSION 12 TEST FAILED")
-                  print("Error type:", type(exc).__name__)
-                  print("Failure detail:", str(exc)[:300])
-                  print("Last location:", safe_location(page))
+
+                  print()
+                  print("=" * 60)
+                  print("VERSION 13 TEST FAILED")
+                  print("=" * 60)
+
+                  print(
+                      "Error type:",
+                      type(exc).__name__,
+                  )
+
+                  print(
+                      "Failure detail:",
+                      str(exc)[:300],
+                  )
+
+                  print(
+                      "Last location:",
+                      safe_location(page),
+                  )
+
                   print("=" * 60)
 
                   raise RuntimeError(
-                      "FlexiFunnels navigation test failed. "
-                      "Review the numbered logs above."
+                      "FlexiFunnels navigation or Reports "
+                      "inspection failed. "
+                      "Review the detailed logs above."
                   ) from None
 
               finally:
+
                   context.close()
+
                   browser.close()
 
-                  print("\nBrowser closed.")
+                  print()
+                  print("Browser closed.")
+
           PY
