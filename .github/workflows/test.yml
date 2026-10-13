@@ -157,7 +157,7 @@ jobs:
           from datetime import datetime, timedelta
           from urllib.parse import urlparse
           from zoneinfo import ZoneInfo
-          from playwright.sync_api import sync_playwright
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
@@ -821,29 +821,54 @@ jobs:
               raise RuntimeError('Overview did not confirm the requested published URL.')
 
 
-          def open_recorded_reports(page):
+          def open_recorded_reports(page, published_url):
               # The recorded purple icon has the hover tooltip "Reports".
+              # The recorded Overview card contains Page Id and More. Restrict discovery
+              # to that card, excluding global navigation and the animated onboarding CTA.
+              more = wait_unique(page.get_by_text('More', exact=True), 'Overview More')
+              card = more.locator("xpath=ancestor::*[contains(., 'Page Id')][1]")
+              if card.count() != 1 or not card.is_visible():
+                  raise RuntimeError('Page Overview card could not be identified.')
+              card_values = [x.input_value() for x in visible_items(card.locator('input'))]
+              if published_url not in card_values and published_url not in card.inner_text():
+                  raise RuntimeError('Overview card does not contain the requested published URL.')
               # Resolve semantic metadata at runtime; never click by icon position.
               locators = [
-                  page.get_by_role('button', name='Reports', exact=True),
-                  page.get_by_role('link', name='Reports', exact=True),
-                  page.locator('[title="Reports"], [data-bs-original-title="Reports"], '
+                  card.get_by_role('button', name='Reports', exact=True),
+                  card.get_by_role('link', name='Reports', exact=True),
+                  card.locator('[title="Reports"], [data-bs-original-title="Reports"], '
                                '[data-original-title="Reports"], [data-tooltip="Reports"]'),
               ]
               control = first_unique_visible(locators)
               if control is None:
                   # Hover only to identify the recorded tooltip; do not click unknown icons.
-                  candidates = visible_items(page.locator('button, a, [role="button"]'), 200)
-                  matches = []
+                  candidates = visible_items(card.locator('button, a, [role="button"], svg, '
+                                                         '[title], [data-bs-toggle="tooltip"], '
+                                                         '[data-toggle="tooltip"]'), 60)
+                  matched = {}
+                  skipped = 0
                   for candidate in candidates:
-                      candidate.hover()
-                      page.wait_for_timeout(200)
+                      # Clear prior hover state before testing another control.
+                      page.mouse.move(0, 0)
                       tooltip = page.get_by_text('Reports', exact=True)
-                      if unique_visible(tooltip) is not None:
-                          matches.append(candidate)
-                  if len(matches) != 1:
-                      raise RuntimeError('Recorded Reports icon cannot be identified uniquely.')
-                  control = matches[0]
+                      try:
+                          tooltip.wait_for(state='hidden', timeout=1500)
+                          candidate.hover(timeout=1500)
+                          tooltip.wait_for(state='visible', timeout=1000)
+                      except PlaywrightTimeoutError:
+                          skipped += 1
+                          continue
+                      # A button and its nested SVG may both trigger the same tooltip.
+                      # Group them by the element that owns the recorded interaction.
+                      key = candidate.evaluate('''el => {
+                          const owner = el.closest('button, a, [role="button"], [title], [data-bs-toggle="tooltip"], [data-toggle="tooltip"]') || el.closest('svg') || el;
+                          return Array.from(document.querySelectorAll('*')).indexOf(owner);
+                      }''')
+                      matched.setdefault(key, candidate)
+                  print('Overview hover candidates:', len(candidates), 'unmatched/unavailable:', skipped)
+                  if len(matched) != 1:
+                      raise RuntimeError('Recorded Reports icon cannot be identified uniquely inside Overview.')
+                  control = next(iter(matched.values()))
               control.click()
               page.get_by_text(re.compile(r'^Page Reports')).wait_for(timeout=45000)
               wait_unique(page.get_by_text('Export Data', exact=True), 'Export Data', 45)
@@ -962,7 +987,7 @@ jobs:
                       select_published_url(page)
                       search_published_url(page, published_url)
                       verify_overview(page, published_url)
-                      open_recorded_reports(page)
+                      open_recorded_reports(page, published_url)
                       count = set_recorded_date_range(page)
                       export_current_report(page, label, count)
                   print('VERSION 14: both CSVs verified; Google Sheets remain read-only.')
