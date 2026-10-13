@@ -42,7 +42,7 @@ jobs:
           from google.oauth2.service_account import Credentials
 
           print("=" * 60)
-          print("GOOGLE SHEETS CONNECTION TEST - VERSION 11")
+          print("GOOGLE SHEETS CONNECTION TEST - VERSION 12")
           print("=" * 60)
 
           required = [
@@ -56,7 +56,8 @@ jobs:
           ]
 
           missing = [
-              name for name in required
+              name
+              for name in required
               if not os.environ.get(name, "").strip()
           ]
 
@@ -104,6 +105,7 @@ jobs:
               try:
                   opened[spreadsheet_label].worksheet(tab_name)
                   print(variable + ": FOUND")
+
               except gspread.WorksheetNotFound:
                   raise RuntimeError(
                       variable + " does not match an existing tab."
@@ -116,9 +118,9 @@ jobs:
           PY
 
   test-flexifunnels-login:
-    name: Test FlexiFunnels Login
+    name: Test FlexiFunnels Login and Both Pages
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Set up Python
@@ -132,12 +134,13 @@ jobs:
           python -m pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Test login and Project URL search
+      - name: Test login and both Published URL searches
         env:
           FLEXIFUNNELS_EMAIL: ${{ secrets.FLEXIFUNNELS_EMAIL }}
           FLEXIFUNNELS_PASSWORD: ${{ secrets.FLEXIFUNNELS_PASSWORD }}
           FLEXIFUNNELS_PROJECT_URL: ${{ vars.FLEXIFUNNELS_PROJECT_URL }}
-          FLEXIFUNNELS_SUB_USER: Saurabh Bhatnagar
+          FLEXIFUNNELS_LANDING_URL: ${{ vars.FLEXIFUNNELS_LANDING_URL }}
+          FLEXIFUNNELS_REG_URL: ${{ vars.FLEXIFUNNELS_REG_URL }}
 
         run: |
           python -u - <<'PY'
@@ -149,7 +152,7 @@ jobs:
           from playwright.sync_api import sync_playwright
 
           print("=" * 60)
-          print("FLEXIFUNNELS LOGIN TEST - VERSION 11")
+          print("FLEXIFUNNELS NAVIGATION TEST - VERSION 12")
           print("=" * 60)
 
           email = os.environ.get(
@@ -164,8 +167,12 @@ jobs:
               "FLEXIFUNNELS_PROJECT_URL", ""
           ).strip()
 
-          sub_user = os.environ.get(
-              "FLEXIFUNNELS_SUB_USER", ""
+          landing_url = os.environ.get(
+              "FLEXIFUNNELS_LANDING_URL", ""
+          ).strip()
+
+          reg_url = os.environ.get(
+              "FLEXIFUNNELS_REG_URL", ""
           ).strip()
 
           if not email or not password:
@@ -173,21 +180,32 @@ jobs:
                   "FlexiFunnels credentials are missing."
               )
 
-          if sub_user != "Saurabh Bhatnagar":
+          expected_project = (
+              "https://app.flexifunnels.com/projects/kvapNzyj"
+          )
+
+          if project_url.rstrip("/") != expected_project:
               raise RuntimeError(
-                  "Unexpected sub-user configuration."
+                  "Unexpected FLEXIFUNNELS_PROJECT_URL."
               )
 
-          parsed_project = urlparse(project_url)
+          expected_urls = {
+              "FUNNEL AGENT": (
+                  "https://sb.flexifunnels.com/funnel-agent"
+              ),
+              "FUNNEL AGENT REG": (
+                  "https://sb.flexifunnels.com/flexi-genie-regteam"
+              ),
+          }
 
-          if (
-              parsed_project.scheme != "https"
-              or parsed_project.hostname != "app.flexifunnels.com"
-              or parsed_project.path.rstrip("/")
-                 != "/projects/kvapNzyj"
-          ):
+          if landing_url.rstrip("/") != expected_urls["FUNNEL AGENT"]:
               raise RuntimeError(
-                  "Unexpected project URL configuration."
+                  "Unexpected FLEXIFUNNELS_LANDING_URL."
+              )
+
+          if reg_url.rstrip("/") != expected_urls["FUNNEL AGENT REG"]:
+              raise RuntimeError(
+                  "Unexpected FLEXIFUNNELS_REG_URL."
               )
 
           def safe_location(page):
@@ -195,6 +213,20 @@ jobs:
                   return "closed"
 
               parsed = urlparse(page.url)
+
+              # Do not print account-switch URLs,
+              # tokens, query strings, or fragments.
+              if (
+                  "login-as" in parsed.path
+                  or "switch" in parsed.path
+                  and parsed.path != "/switch-sub-users"
+              ):
+                  return (
+                      parsed.scheme
+                      + "://"
+                      + (parsed.hostname or "")
+                      + "/[authentication-path-redacted]"
+                  )
 
               return (
                   parsed.scheme
@@ -232,10 +264,8 @@ jobs:
               deadline = time.monotonic() + seconds
 
               while time.monotonic() < deadline:
-                  path = current_path(page)
-
-                  if path != original:
-                      return path
+                  if current_path(page) != original:
+                      return current_path(page)
 
                   time.sleep(1)
 
@@ -276,8 +306,8 @@ jobs:
                   "inside Saurabh's card"
               )
 
-              # Preserve the selector that worked
-              # in Versions 9 and 10.
+              # Preserve the selector confirmed working
+              # in Versions 9, 10, and 11.
 
               card = name_element.locator(
                   "xpath=ancestor::*["
@@ -331,12 +361,7 @@ jobs:
                       "Saurabh's Switch to user control is disabled."
                   )
 
-              tag = switch_control.evaluate(
-                  "(element) => element.tagName.toLowerCase()"
-              )
-
               print("Correct Switch to user control found.")
-              print("Control type:", tag)
 
               print("\nSTEP 9: Switching to Saurabh")
 
@@ -371,7 +396,8 @@ jobs:
 
                           if (
                               parsed.scheme != "https"
-                              or parsed.hostname != "app.flexifunnels.com"
+                              or parsed.hostname
+                                 != "app.flexifunnels.com"
                           ):
                               raise RuntimeError(
                                   "Unexpected sub-user destination."
@@ -393,7 +419,7 @@ jobs:
               return original_page
 
           def open_projects(page):
-              print("\nSTEP 11: Opening Projects")
+              print("\nOpening Projects page")
 
               page.goto(
                   "https://app.flexifunnels.com/projects",
@@ -401,7 +427,7 @@ jobs:
                   timeout=60000,
               )
 
-              page.wait_for_timeout(4000)
+              page.wait_for_timeout(3000)
 
               print(
                   "Projects page location:",
@@ -425,20 +451,20 @@ jobs:
                       "the search field is missing."
                   )
 
+              print("Projects page access verified.")
+
+          def select_published_url(page):
               print(
-                  "SUCCESS: PROJECTS PAGE ACCESS VERIFIED"
+                  "\nSelecting Published URL search filter"
               )
 
-          def choose_project_url_filter(page):
-              print(
-                  "\nSTEP 12: Selecting Project URL filter"
-              )
-
-              # The Projects screenshot shows a dropdown
-              # displaying Project Name by default.
+              # Screenshot confirms that the dropdown
+              # contains exactly these options:
               #
-              # Try native selects first, then custom
-              # dropdown controls.
+              # Project Name
+              # Published URL
+              #
+              # It does NOT contain "Project URL".
 
               native_selects = visible_items(
                   page.locator("select")
@@ -447,36 +473,24 @@ jobs:
               for select in native_selects:
                   options = select.locator("option")
 
-                  option_labels = [
+                  labels = [
                       options.nth(i).inner_text().strip()
                       for i in range(options.count())
                   ]
 
-                  if "Project URL" in option_labels:
+                  if "Published URL" in labels:
                       select.select_option(
-                          label="Project URL"
+                          label="Published URL"
                       )
 
                       print(
-                          "Project URL selected using "
-                          "native HTML dropdown."
+                          "Published URL selected "
+                          "using native dropdown."
                       )
 
                       return
 
-              print(
-                  "No matching native select. "
-                  "Checking custom dropdown."
-              )
-
               dropdown_candidates = [
-                  page.get_by_role(
-                      "combobox",
-                      name=re.compile(
-                          r"Project",
-                          re.IGNORECASE,
-                      ),
-                  ),
                   page.get_by_role(
                       "button",
                       name=re.compile(
@@ -484,8 +498,12 @@ jobs:
                           re.IGNORECASE,
                       ),
                   ),
-                  page.locator(
-                      '[role="combobox"]'
+                  page.get_by_role(
+                      "combobox",
+                      name=re.compile(
+                          r"Project",
+                          re.IGNORECASE,
+                      ),
                   ),
                   page.get_by_text(
                       "Project Name",
@@ -495,131 +513,66 @@ jobs:
 
               dropdown = None
 
-              for index, locator in enumerate(
-                  dropdown_candidates
-              ):
+              for locator in dropdown_candidates:
                   candidate = unique_visible(locator)
 
                   if candidate is not None:
                       dropdown = candidate
-
-                      print(
-                          "Custom dropdown found using "
-                          "method:",
-                          index + 1,
-                      )
-
                       break
 
               if dropdown is None:
-                  print(
-                      "Visible native selects:",
-                      len(native_selects),
-                  )
-
-                  print(
-                      "Visible comboboxes:",
-                      len(
-                          visible_items(
-                              page.locator(
-                                  '[role="combobox"]'
-                              )
-                          )
-                      ),
-                  )
-
-                  print(
-                      "Exact Project Name matches:",
-                      len(
-                          visible_items(
-                              page.get_by_text(
-                                  "Project Name",
-                                  exact=True,
-                              )
-                          )
-                      ),
-                  )
-
                   raise RuntimeError(
-                      "Project search dropdown "
-                      "could not be identified."
+                      "Project Name dropdown not found."
                   )
 
               dropdown.click(timeout=15000)
 
-              print("Custom dropdown clicked.")
+              print("Project Name dropdown opened.")
 
-              page.wait_for_timeout(1200)
+              page.wait_for_timeout(700)
 
               option_candidates = [
                   page.get_by_role(
                       "option",
                       name=re.compile(
-                          r"^\s*Project URL\s*$",
+                          r"^\s*Published URL\s*$",
                           re.IGNORECASE,
                       ),
                   ),
                   page.get_by_role(
                       "menuitem",
                       name=re.compile(
-                          r"^\s*Project URL\s*$",
+                          r"^\s*Published URL\s*$",
                           re.IGNORECASE,
                       ),
                   ),
                   page.get_by_text(
-                      "Project URL",
+                      "Published URL",
                       exact=True,
                   ),
               ]
 
               option = None
 
-              for index, locator in enumerate(
-                  option_candidates
-              ):
+              for locator in option_candidates:
                   candidate = unique_visible(locator)
 
                   if candidate is not None:
                       option = candidate
-
-                      print(
-                          "Project URL option found "
-                          "using method:",
-                          index + 1,
-                      )
-
                       break
 
               if option is None:
-                  print(
-                      "Visible Project URL text matches:",
-                      len(
-                          visible_items(
-                              page.get_by_text(
-                                  "Project URL",
-                                  exact=True,
-                              )
-                          )
-                      ),
-                  )
-
                   raise RuntimeError(
-                      "Dropdown opened, but the "
-                      "Project URL option was not found."
+                      "Published URL option not found "
+                      "after opening the dropdown."
                   )
 
               option.click(timeout=15000)
 
-              print("Project URL option clicked.")
+              print("Published URL selected.")
 
-              page.wait_for_timeout(700)
-
-              print(
-                  "SUCCESS: PROJECT URL FILTER SELECTED"
-              )
-
-          def search_project(page):
-              print("\nSTEP 13: Entering project URL")
+          def search_published_url(page, published_url):
+              print("\nEntering published page URL")
 
               search_field = unique_visible(
                   page.locator(
@@ -629,14 +582,16 @@ jobs:
 
               if search_field is None:
                   raise RuntimeError(
-                      "Project search field not found."
+                      "Published URL search field not found."
                   )
 
-              search_field.fill(project_url)
+              search_field.fill(published_url)
 
-              print("Project URL entered.")
+              print("Published URL entered.")
 
-              print("\nSTEP 14: Clicking Search")
+              # The Projects search may be reactive:
+              # typing the URL can automatically update
+              # results or open the matching project.
 
               search_button = unique_visible(
                   page.get_by_role(
@@ -648,23 +603,24 @@ jobs:
                   )
               )
 
-              if search_button is None:
-                  raise RuntimeError(
-                      "Project Search button not found."
+              if search_button is not None:
+                  print("Clicking Search button.")
+                  search_button.click(timeout=15000)
+              else:
+                  print(
+                      "No separate Search button found. "
+                      "Waiting for automatic search."
                   )
 
-              search_button.click(timeout=15000)
+              print("Published URL search submitted.")
 
-              print("Search submitted.")
-
-          def verify_project(page, context):
+          def verify_project_opened(page, context):
               print(
-                  "\nSTEP 15: Checking automatic project opening"
+                  "\nWaiting for project to open automatically"
               )
 
+              expected_path = "/projects/kvapNzyj"
               deadline = time.monotonic() + 40
-
-              expected_path = parsed_project.path.rstrip("/")
 
               while time.monotonic() < deadline:
                   pages = [
@@ -675,7 +631,7 @@ jobs:
                   for candidate in pages:
                       if current_path(candidate) == expected_path:
                           print(
-                              "Expected project URL reached."
+                              "Expected project opened."
                           )
 
                           return candidate
@@ -686,7 +642,7 @@ jobs:
                   ):
                       raise RuntimeError(
                           "Authentication was lost "
-                          "during project search."
+                          "during published URL search."
                       )
 
                   time.sleep(2)
@@ -696,22 +652,42 @@ jobs:
                   safe_location(page),
               )
 
-              print(
-                  "Visible Open Project controls:",
-                  len(
-                      visible_items(
-                          page.get_by_text(
-                              "Open Project",
-                              exact=True,
-                          )
-                      )
-                  ),
+              raise RuntimeError(
+                  "Published URL search did not "
+                  "automatically open project kvapNzyj."
               )
 
-              raise RuntimeError(
-                  "Project search did not automatically "
-                  "open the configured project."
+          def test_published_page(
+              page,
+              context,
+              label,
+              published_url,
+          ):
+              print("\n" + "=" * 60)
+              print("TESTING:", label)
+              print("=" * 60)
+
+              open_projects(page)
+
+              select_published_url(page)
+
+              search_published_url(
+                  page,
+                  published_url,
               )
+
+              opened_page = verify_project_opened(
+                  page,
+                  context,
+              )
+
+              print(
+                  "\nSUCCESS:",
+                  label,
+                  "published URL search opened the project."
+              )
+
+              return opened_page
 
           with sync_playwright() as p:
               browser = p.chromium.launch(
@@ -839,36 +815,54 @@ jobs:
 
                   switched_page.set_default_timeout(15000)
 
-                  open_projects(switched_page)
+                  # First search:
+                  # Funnel Agent published URL.
 
-                  choose_project_url_filter(switched_page)
+                  first_project_page = test_published_page(
+                      switched_page,
+                      context,
+                      "FUNNEL AGENT",
+                      landing_url,
+                  )
 
-                  search_project(switched_page)
+                  # Second search:
+                  # Funnel Agent Reg published URL.
+                  #
+                  # The Projects page is opened again
+                  # so the same UI sequence is repeated.
 
-                  verify_project(switched_page, context)
+                  second_project_page = test_published_page(
+                      first_project_page,
+                      context,
+                      "FUNNEL AGENT REG",
+                      reg_url,
+                  )
 
                   print("\n" + "=" * 60)
-                  print("SUCCESS: FLEXIFUNNELS LOGIN VERIFIED")
-                  print("SUCCESS: SAURABH SUB-USER SELECTED")
-                  print("SUCCESS: PROJECTS PAGE ACCESS VERIFIED")
-                  print("SUCCESS: PROJECT URL FILTER SELECTED")
-                  print("SUCCESS: PROJECT SEARCH COMPLETED")
-                  print("SUCCESS: TARGET PROJECT OPENED")
+                  print("FLEXIFUNNELS VERSION 12 TEST SUCCESSFUL")
+                  print("=" * 60)
+                  print("LOGIN: VERIFIED")
+                  print("SAURABH SWITCH CONTROL: CLICKED")
+                  print("PROJECTS PAGE: VERIFIED")
+                  print("PUBLISHED URL FILTER: VERIFIED")
+                  print("FUNNEL AGENT SEARCH: VERIFIED")
+                  print("FUNNEL AGENT REG SEARCH: VERIFIED")
+                  print("TARGET PROJECT: VERIFIED")
                   print("NO REPORTS DOWNLOADED")
                   print("NO GOOGLE SHEETS MODIFIED")
                   print("=" * 60)
 
               except Exception as exc:
                   print("\n" + "=" * 60)
-                  print("FLEXIFUNNELS TEST FAILED")
+                  print("FLEXIFUNNELS VERSION 12 TEST FAILED")
                   print("Error type:", type(exc).__name__)
+                  print("Failure detail:", str(exc)[:300])
                   print("Last location:", safe_location(page))
                   print("=" * 60)
 
                   raise RuntimeError(
-                      "FlexiFunnels login, sub-user switch, "
-                      "or project search failed. "
-                      "Review the numbered steps above."
+                      "FlexiFunnels navigation test failed. "
+                      "Review the numbered logs above."
                   ) from None
 
               finally:
