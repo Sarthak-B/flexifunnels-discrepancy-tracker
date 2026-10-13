@@ -160,7 +160,7 @@ jobs:
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
-          print('WORKFLOW REVISION: V14-R6 — applied range and sibling count verification')
+          print('WORKFLOW REVISION: V14-R7 — Downloads heading and empty-list verification')
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
           PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
           LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
@@ -1139,10 +1139,54 @@ jobs:
               return page.get_by_role('row').filter(has_text='Filter: Custom')
 
 
+          def downloads_view_ready(page):
+              # CSS can display "File Details" as "FILE DETAILS". Match the actual
+              # label without assuming its DOM capitalization or whitespace.
+              labels = ('File Details', 'Records', 'Status', 'Created', 'Action')
+              found = []
+              for label in labels:
+                  pattern = re.compile(r'^\s*' + r'\s+'.join(label.split()) + r'\s*$', re.IGNORECASE)
+                  found.append(bool(visible_items(page.get_by_text(pattern))))
+              export_visible = bool(visible_items(page.get_by_text('Export Data', exact=True)))
+              if export_visible:
+                  return False
+              if found[0] and sum(found) >= 3:
+                  return True
+              # Some empty lists hide the table headers. Accept only an explicit empty
+              # state after the report's Export Data control has disappeared.
+              empty = re.compile(r'^\s*(?:No (?:data|downloads|records|exports)(?: found| available| yet)?)[.!]?\s*$', re.IGNORECASE)
+              return bool(visible_items(page.get_by_text(empty)))
+
+
+          def wait_downloads_snapshot(page):
+              deadline = time.monotonic() + 45
+              previous, stable_since = None, None
+              while time.monotonic() < deadline:
+                  if downloads_view_ready(page):
+                      texts = download_rows(page).all_text_contents()
+                      if texts != previous:
+                          previous, stable_since = texts, time.monotonic()
+                      elif time.monotonic() - stable_since >= 3:
+                          print('Downloads view verified; existing custom exports:', len(texts))
+                          return texts
+                  else:
+                      previous, stable_since = None, None
+                  time.sleep(0.5)
+              labels = ('Downloads', 'File Details', 'Records', 'Status', 'Created', 'Action', 'Export Data')
+              known_counts = {}
+              for label in labels:
+                  pattern = re.compile(r'^\s*' + r'\s+'.join(label.split()) + r'\s*$', re.IGNORECASE)
+                  known_counts[label] = len(visible_items(page.get_by_text(pattern)))
+              print('Downloads view label counts:', known_counts)
+              Path('diagnostics').mkdir(exist_ok=True)
+              import json
+              Path('diagnostics/downloads-view.json').write_text(json.dumps(known_counts, indent=2))
+              raise RuntimeError('Downloads view not confirmed; see downloads-view diagnostics. No export was started.')
+
+
           def export_current_report(page, label, count):
               click_text(page, 'Downloads')
-              page.get_by_text('FILE DETAILS', exact=True).wait_for(timeout=30000)
-              before = download_rows(page).all_text_contents()
+              before = wait_downloads_snapshot(page)
               click_text(page, 'Reports')
               wait_unique(page.get_by_text('Export Data', exact=True), 'Export Data').click()
               click_text(page, 'Filtered Data')
