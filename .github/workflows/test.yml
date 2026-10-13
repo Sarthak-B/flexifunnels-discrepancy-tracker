@@ -200,7 +200,7 @@ jobs:
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
-          print('WORKFLOW REVISION: V14-R8 — automatic daily UTM tab discovery')
+          print('WORKFLOW REVISION: V15-R1 — read-only email and phone comparison')
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
           PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
           LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
@@ -1264,6 +1264,23 @@ jobs:
                                   total = sum(1 for row in reader if any(row))
                               if not header or total != count:
                                   raise RuntimeError('Downloaded CSV row count does not match report.')
+                              # Validate timestamps, then retain only the three requested
+                              # fields in the downloadable artifact. Dates are metadata.
+                              with path.open(encoding='utf-8-sig', newline='') as source:
+                                  reader = csv.DictReader(source)
+                                  required = ('first_name', 'email', 'phone', 'created_at')
+                                  if any(key not in (reader.fieldnames or []) for key in required):
+                                      raise RuntimeError('CSV is missing required identity/timestamp columns.')
+                                  identities = []
+                                  for record in reader:
+                                      timestamp = datetime.strptime(record['created_at'].strip(), '%b %d, %Y %I:%M %p (IST)')
+                                      if not yesterday <= timestamp.date() <= today:
+                                          raise RuntimeError('Export contains a record outside the requested date range.')
+                                      identities.append({'name': record['first_name'].strip(), 'email': record['email'].strip(), 'phone': record['phone'].strip()})
+                              with path.open('w', encoding='utf-8-sig', newline='') as output:
+                                  writer = csv.DictWriter(output, fieldnames=['name', 'email', 'phone'])
+                                  writer.writeheader()
+                                  writer.writerows(identities)
                               print(label + ': CSV verified; records=' + str(total))
                               return
                           if status not in ('Pending', 'Processing', 'Queued'):
@@ -1273,6 +1290,10 @@ jobs:
 
 
           Path('reports').mkdir(exist_ok=True)
+          import json
+          Path('reports/report-window.json').write_text(json.dumps({
+              'start_date': yesterday.isoformat(), 'end_date': today.isoformat(), 'timezone': TIMEZONE,
+          }))
           with sync_playwright() as playwright:
               browser = playwright.chromium.launch(headless=True)
               context = browser.new_context(viewport={'width': 1440, 'height': 900}, accept_downloads=True, timezone_id=TIMEZONE)
@@ -1312,6 +1333,171 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: flexifunnels-reports-${{ github.run_id }}
-          path: reports/*.csv
+          path: reports/*
+          if-no-files-found: error
+          retention-days: 7
+
+  compare-reports:
+    name: Compare email and phone with daily UTM tabs (read-only)
+    needs: [test-google-sheets, test-flexifunnels]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Download this run's verified reports
+        uses: actions/download-artifact@v4
+        with:
+          name: flexifunnels-reports-${{ github.run_id }}
+          path: reports
+      - name: Install read-only Sheets dependencies
+        run: python -m pip install gspread google-auth
+      - name: Compare name, email and phone
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          UTM_SHEET_ID: ${{ vars.UTM_SHEET_ID }}
+          SELECTED_UTM_BUSINESS_TAB: ${{ needs.test-google-sheets.outputs.utm_landing_tab }}
+          SELECTED_UTM_REG_TAB: ${{ needs.test-google-sheets.outputs.utm_reg_tab }}
+          UTM_TAB_DATE: ${{ needs.test-google-sheets.outputs.utm_tab_date }}
+        run: |
+          python -u - <<'PY'
+          import csv
+          import json
+          import os
+          import re
+          from collections import defaultdict, deque
+          from datetime import date, datetime, timedelta
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+
+          def match_key(row):
+              email = row['email'].strip().casefold()
+              phone = re.sub(r'[\s()+.\-]', '', row['phone'].strip())
+              if phone.startswith('00'):
+                  phone = phone[2:]
+              # Do not guess country codes or match incomplete identifiers.
+              if not email or not phone or not phone.isascii() or not phone.isdigit():
+                  return None
+              return email, phone
+
+
+          def compare_rows(ff_rows, utm_rows):
+              available = defaultdict(deque)
+              for index, row in enumerate(utm_rows):
+                  key = match_key(row)
+                  if key is not None:
+                      available[key].append(index)
+              matched, ff_only, used = [], [], set()
+              for row in ff_rows:
+                  key = match_key(row)
+                  if key is not None and available[key]:
+                      used.add(available[key].popleft())
+                      matched.append(row)
+                  else:
+                      ff_only.append(row)
+              utm_only = [row for index, row in enumerate(utm_rows) if index not in used]
+              return matched, ff_only, utm_only
+
+
+          def parse_utm_timestamp(value, timezone):
+              value = value.strip()
+              for fmt in ('%d/%m/%Y %H:%M:%S', '%d/%m/%Y %H:%M', '%d/%m/%Y %I:%M:%S %p', '%d/%m/%Y %I:%M %p'):
+                  try:
+                      return datetime.strptime(value, fmt).replace(tzinfo=timezone)
+                  except ValueError:
+                      pass
+              try:
+                  parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                  return parsed.replace(tzinfo=timezone) if parsed.tzinfo is None else parsed.astimezone(timezone)
+              except ValueError:
+                  raise RuntimeError('Unrecognized UTM timestamp format. No comparison was produced.') from None
+
+
+          def read_utm_rows(worksheet, start, end, timezone):
+              values = worksheet.get_all_values()
+              if not values:
+                  raise RuntimeError('Selected UTM tab has no header row.')
+              headers = [value.strip().casefold() for value in values[0]]
+              required = ('timestamp_incoming_webhook', 'first_name', 'email', 'phone')
+              if any(headers.count(key) != 1 for key in required):
+                  raise RuntimeError('UTM tab must have unique timestamp_incoming_webhook, first_name, email and phone columns.')
+              indexes = {key: headers.index(key) for key in required}
+              result = []
+              excluded = 0
+              for cells in values[1:]:
+                  get = lambda key: cells[indexes[key]].strip() if indexes[key] < len(cells) else ''
+                  if not any(get(key) for key in required):
+                      continue
+                  timestamp = parse_utm_timestamp(get('timestamp_incoming_webhook'), timezone)
+                  if start <= timestamp.date() <= end:
+                      result.append({'name': get('first_name'), 'email': get('email'), 'phone': get('phone')})
+                  else:
+                      excluded += 1
+              print('UTM timestamp-filtered rows:', len(result), '; outside range:', excluded)
+              return result
+
+
+          def write_rows(path, rows):
+              with path.open('w', encoding='utf-8-sig', newline='') as output:
+                  writer = csv.DictWriter(output, fieldnames=['name', 'email', 'phone'])
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+
+          def run():
+              import gspread
+              from google.oauth2.service_account import Credentials
+              window = json.loads(Path('reports/report-window.json').read_text())
+              start, end = date.fromisoformat(window['start_date']), date.fromisoformat(window['end_date'])
+              timezone = ZoneInfo(window['timezone'])
+              event_date = end + timedelta(days=1)
+              if os.environ.get('UTM_TAB_DATE') != event_date.isoformat():
+                  raise RuntimeError('Sheets discovery and exported report dates differ. Rerun the workflow.')
+              credentials = Credentials.from_service_account_info(
+                  json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT_JSON']),
+                  scopes=['https://www.googleapis.com/auth/spreadsheets.readonly'],
+              )
+              spreadsheet = gspread.authorize(credentials).open_by_key(os.environ['UTM_SHEET_ID'])
+              selections = [('funnel-agent', os.environ['SELECTED_UTM_BUSINESS_TAB']),
+                            ('flexi-genie-regteam', os.environ['SELECTED_UTM_REG_TAB'])]
+              summaries = {}
+              outdir = Path('comparison')
+              outdir.mkdir(exist_ok=True)
+              for label, tab_name in selections:
+                  with (Path('reports') / (label + '.csv')).open(encoding='utf-8-sig', newline='') as source:
+                      reader = csv.DictReader(source)
+                      if reader.fieldnames != ['name', 'email', 'phone']:
+                          raise RuntimeError('Report artifact must contain only name, email, phone.')
+                      ff_rows = list(reader)
+                  utm_rows = read_utm_rows(spreadsheet.worksheet(tab_name), start, end, timezone)
+                  matched, ff_only, utm_only = compare_rows(ff_rows, utm_rows)
+                  for suffix, rows in [('matched', matched), ('missing-from-utm', ff_only), ('missing-from-flexifunnels', utm_only)]:
+                      write_rows(outdir / (label + '-' + suffix + '.csv'), rows)
+                  summaries[label] = {'flexifunnels_rows': len(ff_rows), 'utm_rows': len(utm_rows),
+                                      'matched_rows': len(matched), 'missing_from_utm': len(ff_only),
+                                      'missing_from_flexifunnels': len(utm_only),
+                                      'incomplete_or_invalid_identifiers_ff': sum(match_key(r) is None for r in ff_rows),
+                                      'incomplete_or_invalid_identifiers_utm': sum(match_key(r) is None for r in utm_rows)}
+                  print(label + ':', summaries[label])
+              (outdir / 'summary.json').write_text(json.dumps({
+                  'start_date': start.isoformat(), 'end_date': end.isoformat(), 'timezone': window['timezone'],
+                  'utm_event_date': event_date.isoformat(), 'matching_rule': 'email AND phone; occurrences preserved',
+                  'reports': summaries,
+              }, indent=2))
+              print('READ-ONLY COMPARISON COMPLETE — no Google Sheets modified.')
+
+
+          if __name__ == '__main__':
+              run()
+
+          PY
+      - name: Upload read-only comparison results
+        uses: actions/upload-artifact@v4
+        with:
+          name: flexifunnels-comparison-${{ github.run_id }}
+          path: comparison/*
           if-no-files-found: error
           retention-days: 7
