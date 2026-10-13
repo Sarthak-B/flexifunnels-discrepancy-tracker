@@ -926,6 +926,107 @@ jobs:
               raise RuntimeError('Recorded All Time date control is missing or ambiguous.')
 
 
+          def recorded_calendar(page):
+              ok = wait_unique(page.get_by_text(re.compile(r'^\s*OK\s*$', re.IGNORECASE)), 'Calendar OK')
+              # The recording shows Monday-first weekday labels Mo ... Su.
+              calendar = ok.locator("xpath=ancestor::*[.//*[normalize-space(.)='Mo'] and .//*[normalize-space(.)='Su']][1]")
+              if calendar.count() != 1 or not calendar.is_visible():
+                  raise RuntimeError('Calendar with the recorded Mo–Su weekday header not uniquely identified.')
+              return calendar
+
+
+          def calendar_month(calendar):
+              names = 'January February March April May June July August September October November December'.split()
+              pattern = r'\b(' + '|'.join(name[:3] + '(?:' + name[3:] + ')?' for name in names) + r')\s+(\d{4})\b'
+              matches = re.findall(pattern, calendar.inner_text(), re.IGNORECASE)
+              values = {(int(year), next(i + 1 for i, name in enumerate(names) if name[:3].lower() == month[:3].lower()))
+                        for month, year in matches}
+              if len(values) != 1:
+                  raise RuntimeError('Calendar month/year header is missing or ambiguous.')
+              return next(iter(values))
+
+
+          def click_calendar_date(page, target):
+              calendar = recorded_calendar(page)
+              expected_month = (target.year, target.month)
+              for _ in range(24):
+                  shown = calendar_month(calendar)
+                  if shown == expected_month:
+                      break
+                  previous = shown > expected_month
+                  direction = re.compile(r'previous|prev|back', re.IGNORECASE) if previous else re.compile(r'next|forward', re.IGNORECASE)
+                  navigation = first_unique_visible([
+                      calendar.get_by_role('button', name=direction),
+                      calendar.locator('[title]').filter(has_text=direction),
+                  ])
+                  if navigation is None:
+                      # Inspect only semantic labels on calendar controls, not global UI.
+                      labeled = []
+                      for control in visible_items(calendar.locator('button, [role="button"], [aria-label], [title]')):
+                          label = ' '.join(control.get_attribute(attr) or '' for attr in ('aria-label', 'title'))
+                          if direction.search(label):
+                              labeled.append(control)
+                      if len(labeled) == 1:
+                          navigation = labeled[0]
+                  if navigation is None:
+                      raise RuntimeError('Calendar month arrow lacks a unique directional label; stopping.')
+                  navigation.click()
+                  deadline = time.monotonic() + 5
+                  while time.monotonic() < deadline:
+                      calendar = recorded_calendar(page)
+                      if calendar_month(calendar) != shown:
+                          break
+                      time.sleep(0.1)
+                  else:
+                      raise RuntimeError('Calendar month did not change after navigation.')
+              else:
+                  raise RuntimeError('Requested calendar month was not reached.')
+
+              # Match the actual visible day number within the confirmed month. Exclude
+              # explicitly disabled cells and fail if adjacent-month cells are ambiguous.
+              day = re.compile(r'^\s*' + str(target.day) + r'\s*$')
+              candidates = visible_items(calendar.get_by_text(day))
+              candidates = [item for item in candidates if item.is_enabled() and not item.evaluate(
+                  "el => !!el.closest('[aria-disabled=\"true\"], [disabled]')")]
+              if len(candidates) != 1:
+                  raise RuntimeError('Calendar day ' + target.isoformat() + ' is missing or ambiguous.')
+              candidates[0].click()
+              print('Calendar date clicked:', target.isoformat())
+
+
+          def verify_calendar_preview(page):
+              calendar = recorded_calendar(page)
+              deadline = time.monotonic() + 10
+              while time.monotonic() < deadline:
+                  values = [field.input_value() for field in visible_items(calendar.locator('input'))]
+                  preview = calendar.inner_text() + ' ' + ' '.join(values)
+                  selected = re.findall(r'\b\d{4}-\d{2}-\d{2}\b', preview)
+                  if selected == [yesterday.isoformat(), today.isoformat()]:
+                      print('Calendar start/end preview verified.')
+                      return
+                  time.sleep(0.25)
+              raise RuntimeError('Calendar preview does not confirm yesterday through today.')
+
+
+          def save_calendar_diagnostic(page):
+              # Capture only the calendar, excluding report rows and customer information.
+              try:
+                  calendar = recorded_calendar(page)
+                  Path('diagnostics').mkdir(exist_ok=True)
+                  calendar.screenshot(path='diagnostics/calendar.png')
+                  data = calendar.locator('input, button, [role="button"], [role="gridcell"], [aria-label], [title]').evaluate_all('''xs => xs.map(el => ({
+                      tag: el.tagName, role: el.getAttribute('role'),
+                      ariaLabel: el.getAttribute('aria-label'), title: el.getAttribute('title'),
+                      disabled: el.getAttribute('aria-disabled'), readonly: el.hasAttribute('readonly'),
+                      text: (el.innerText || '').trim().slice(0, 100)
+                  }))''')
+                  import json
+                  Path('diagnostics/calendar-controls.json').write_text(json.dumps(data, indent=2))
+                  print('Calendar-only diagnostics saved.')
+              except Exception:
+                  print('Calendar-only diagnostics unavailable.')
+
+
           def set_recorded_date_range(page):
               # At 14–15 seconds in the recording, clicking Filters reveals All Time.
               # Each published URL is opened afresh before this function is called.
@@ -948,25 +1049,14 @@ jobs:
                   raise RuntimeError('Custom range selected, but Select Date Range did not appear.')
               picker.click()
 
-              # The calendar visibly contains start/end ISO date fields. Fill only those
-              # editable fields. If this UI uses read-only fields, fail instead of guessing
-              # calendar classes, month arrows or day positions.
-              fields = []
-              deadline = time.monotonic() + 15
-              while time.monotonic() < deadline:
-                  fields = [field for field in visible_items(page.locator('input'))
-                            if re.fullmatch(r'\d{4}-\d{2}-\d{2}', field.input_value().strip())]
-                  if len(fields) == 2:
-                      break
-                  time.sleep(0.25)
-              if len(fields) != 2 or not all(f.is_editable() for f in fields):
-                  raise RuntimeError('Calendar start/end fields are not two editable ISO dates; need DOM verification.')
-              for field, value in zip(fields, [yesterday.isoformat(), today.isoformat()]):
-                  field.fill(value)
-                  field.press('Tab')
-                  if field.input_value() != value:
-                      raise RuntimeError('Calendar did not accept the requested date.')
-              click_text(page, 'OK')
+              try:
+                  click_calendar_date(page, yesterday)
+                  click_calendar_date(page, today)
+                  verify_calendar_preview(page)
+                  wait_unique(page.get_by_text(re.compile(r'^\s*OK\s*$', re.IGNORECASE)), 'Calendar OK').click()
+              except Exception:
+                  save_calendar_diagnostic(page)
+                  raise
               expected = yesterday.isoformat() + ' to ' + today.isoformat()
               deadline = time.monotonic() + 45
               while time.monotonic() < deadline:
@@ -1063,6 +1153,14 @@ jobs:
                   browser.close()
 
           PY
+      - name: Upload calendar diagnostics if selection fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flexifunnels-calendar-diagnostics-${{ github.run_id }}
+          path: diagnostics/*
+          if-no-files-found: ignore
+          retention-days: 3
       - name: Upload verified CSV reports
         if: success()
         uses: actions/upload-artifact@v4
