@@ -137,11 +137,11 @@ jobs:
                       )
               return matches['business'][0], matches['registration'][0]
 
-          # These are next-day event tabs: on 13 Oct the user creates tabs named 14 Oct.
-          # The report range remains yesterday through today; tab dates are event dates.
+          # Select the current day's pair; the same tab date ends the report window.
+          # 14 Oct tabs -> 13–14 Oct reports; 15 Oct tabs -> 14–15 Oct reports.
           timezone_name = os.environ.get('TIMEZONE', '').strip() or 'Asia/Kolkata'
           run_date = datetime.now(ZoneInfo(timezone_name)).date()
-          target_tab_date = run_date + timedelta(days=1)
+          target_tab_date = run_date
           landing_tab, reg_tab = discover_daily_utm_tabs(opened['UTM'].worksheets(), target_tab_date)
           print('UTM target event date:', target_tab_date.isoformat())
           print('Business tab selected:', landing_tab.title)
@@ -168,6 +168,7 @@ jobs:
 
   test-flexifunnels:
     name: Download both filtered FlexiFunnels reports (Version 14)
+    needs: test-google-sheets
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -187,6 +188,7 @@ jobs:
           FLEXIFUNNELS_LANDING_URL: ${{ vars.FLEXIFUNNELS_LANDING_URL }}
           FLEXIFUNNELS_REG_URL: ${{ vars.FLEXIFUNNELS_REG_URL }}
           TIMEZONE: ${{ vars.TIMEZONE }}
+          UTM_TAB_DATE: ${{ needs.test-google-sheets.outputs.utm_tab_date }}
         run: |
           python -u - <<'PY'
           import os
@@ -200,7 +202,7 @@ jobs:
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
-          print('WORKFLOW REVISION: V15-R1 — read-only email and phone comparison')
+          print('WORKFLOW REVISION: V15-R2 — UTM tab date determines report range')
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
           PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
           LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
@@ -247,9 +249,7 @@ jobs:
               )
 
 
-          today = datetime.now(
-              ZoneInfo(TIMEZONE)
-          ).date()
+          today = datetime.strptime(os.environ['UTM_TAB_DATE'], '%Y-%m-%d').date()
 
           yesterday = today - timedelta(days=1)
 
@@ -1453,7 +1453,7 @@ jobs:
               window = json.loads(Path('reports/report-window.json').read_text())
               start, end = date.fromisoformat(window['start_date']), date.fromisoformat(window['end_date'])
               timezone = ZoneInfo(window['timezone'])
-              event_date = end + timedelta(days=1)
+              event_date = end
               if os.environ.get('UTM_TAB_DATE') != event_date.isoformat():
                   raise RuntimeError('Sheets discovery and exported report dates differ. Rerun the workflow.')
               credentials = Credentials.from_service_account_info(
