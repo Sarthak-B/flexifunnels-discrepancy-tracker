@@ -1,1 +1,80 @@
+name: FlexiFunnels Discrepancy Tracker
 
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-google-sheets:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install gspread google-auth
+
+      - name: Test Google Sheets connections
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          RAW_DATA_SHEET_ID: ${{ vars.RAW_DATA_SHEET_ID }}
+          UTM_SHEET_ID: ${{ vars.UTM_SHEET_ID }}
+          DISCREPANCY_SHEET_ID: ${{ vars.DISCREPANCY_SHEET_ID }}
+
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import gspread
+          from google.oauth2.service_account import Credentials
+
+          required = [
+              "GOOGLE_SERVICE_ACCOUNT_JSON",
+              "RAW_DATA_SHEET_ID",
+              "UTM_SHEET_ID",
+              "DISCREPANCY_SHEET_ID",
+          ]
+
+          missing = [
+              name for name in required
+              if not os.environ.get(name, "").strip()
+          ]
+
+          if missing:
+              raise RuntimeError(
+                  "Missing configuration: " + ", ".join(missing)
+              )
+
+          credentials = Credentials.from_service_account_info(
+              json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
+              scopes=[
+                  "https://www.googleapis.com/auth/spreadsheets.readonly"
+              ],
+          )
+
+          client = gspread.authorize(credentials)
+
+          spreadsheets = {
+              "RAW DATA": os.environ["RAW_DATA_SHEET_ID"],
+              "UTM": os.environ["UTM_SHEET_ID"],
+              "DISCREPANCY STATS": os.environ["DISCREPANCY_SHEET_ID"],
+          }
+
+          for label, sheet_id in spreadsheets.items():
+              spreadsheet = client.open_by_key(sheet_id)
+
+              print(f"\n{label}: CONNECTED")
+              print(f"Spreadsheet: {spreadsheet.title}")
+
+              for worksheet in spreadsheet.worksheets():
+                  print(f"  Tab: {worksheet.title}")
+
+          print("\nALL GOOGLE SHEETS CONNECTIONS SUCCESSFUL")
+          print("READ-ONLY TEST: NO DATA WAS MODIFIED")
+          PY
