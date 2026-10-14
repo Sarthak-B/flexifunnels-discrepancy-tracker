@@ -13,7 +13,7 @@ permissions:
 jobs:
 
   test-google-sheets:
-    name: Find today’s UTM tabs and verify Sheets
+    name: Find latest paired UTM tabs and verify Sheets
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -922,6 +922,50 @@ jobs:
               return ' '.join(value.split())
 
 
+          def zoom_phone_candidate(value):
+              """Recognize phone-shaped text without treating ordinary surnames as numbers."""
+              value = value.strip()
+              if not re.fullmatch(r'\+?[0-9][0-9\s().-]*', value):
+                  return None
+              digits = re.sub(r'[^0-9]', '', value)
+              if digits.startswith('00'):
+                  digits = digits[2:]
+              if not 10 <= len(digits) <= 15:
+                  return None
+              # Compare Indian country-code variants without changing other phone data.
+              if len(digits) == 12 and digits.startswith('91'):
+                  digits = digits[2:]
+              return digits
+
+
+          def clean_zoom_identity(record, csv_row):
+              first = record['First Name'].strip()
+              last = record['Last Name'].strip()
+              phone = record['Phone'].strip()
+              candidates = []
+              if zoom_phone_candidate(last):
+                  candidates = [(last, 0, len(last))]
+              else:
+                  for match in re.finditer(r'(?<!\w)\+?[0-9][0-9\s().-]*[0-9](?!\w)', last):
+                      value = match.group().strip()
+                      if zoom_phone_candidate(value):
+                          candidates.append((value, match.start(), match.end()))
+              repaired = False
+              if candidates:
+                  if len(candidates) != 1:
+                      raise RuntimeError('Zoom CSV row ' + str(csv_row) + ' has multiple phone numbers in Last Name; review this row.')
+                  misplaced, begin, end = candidates[0]
+                  empty_phone = phone.casefold() in ('', '-', 'n/a', 'na', 'none', 'null')
+                  if not empty_phone and zoom_phone_candidate(phone) != zoom_phone_candidate(misplaced):
+                      raise RuntimeError('Zoom CSV row ' + str(csv_row) + ' has conflicting Last Name and Phone values; review this row before Sheets writes.')
+                  if empty_phone:
+                      phone = misplaced
+                  last = (last[:begin] + ' ' + last[end:]).strip(' ,;|-/')
+                  repaired = True
+              return {'name': zoom_text(' '.join(filter(None, [first, last]))),
+                      'email': record['Email'].strip(), 'phone': phone}, repaired
+
+
           def read_zoom_export(path, event_date, expected_id=None):
               with path.open(encoding='utf-8-sig', newline='') as source:
                   rows = [[cell.strip() for cell in row] for row in csv.reader(source)]
@@ -930,11 +974,15 @@ jobs:
               metadata_headers = ['Topic', 'ID', 'Scheduled Time', 'Duration (minutes)', '# Registrants',
                                   '# Cancelled registrants', '# Approved registrants', '# Denied registrants']
               meta_indices = [i for i, row in enumerate(rows) if row == metadata_headers]
-              contact_headers = ['First Name', 'Last Name', 'Email', 'Registration Time', 'Approval Status', 'Phone']
-              contact_indices = [i for i, row in enumerate(rows) if row == contact_headers]
+              required_contact_headers = ['First Name', 'Last Name', 'Email', 'Phone']
+              contact_indices = [i for i, row in enumerate(rows)
+                                 if all(header in row for header in required_contact_headers)]
               if len(meta_indices) != 1 or len(contact_indices) != 1:
                   raise RuntimeError('Zoom CSV metadata/contact headers are missing or ambiguous.')
               m, h = meta_indices[0], contact_indices[0]
+              contact_headers = rows[h]
+              if any(contact_headers.count(header) != 1 for header in required_contact_headers):
+                  raise RuntimeError('Zoom contact headers are duplicated or ambiguous.')
               if m + 1 >= len(rows) or len(rows[m + 1]) != len(metadata_headers) or h <= m + 1:
                   raise RuntimeError('Zoom CSV report structure is incomplete.')
               meta = dict(zip(metadata_headers, rows[m + 1]))
@@ -949,25 +997,31 @@ jobs:
               if expected_id is not None and webinar_id != re.sub(r'\s+', '', expected_id):
                   raise RuntimeError('Downloaded Zoom CSV does not match the selected webinar ID.')
               contacts = []
-              for row in rows[h + 1:]:
+              repaired_last_names = 0
+              for csv_row, row in enumerate(rows[h + 1:], start=h + 2):
                   if not row or not any(row):
                       continue
                   if len(row) != len(contact_headers):
                       raise RuntimeError('Zoom CSV has an incomplete registrant row.')
                   record = dict(zip(contact_headers, row))
-                  contacts.append({'name': ' '.join(filter(None, [record['First Name'], record['Last Name']])),
-                                   'email': record['Email'], 'phone': record['Phone']})
+                  contact, repaired = clean_zoom_identity(record, csv_row)
+                  contacts.append(contact)
+                  repaired_last_names += int(repaired)
               # Reconcile the downloaded report's own total, never the changing website count.
               count = int(meta['# Registrants'].replace(',', ''))
               if count != len(contacts):
                   raise RuntimeError('Zoom CSV rows do not reconcile with its own report total.')
+              contacts.sort(key=lambda row: (row['name'].casefold(), row['email'].casefold(), row['phone']))
               return contacts, {'topic': ZOOM_TOPIC, 'webinar_id': webinar_id,
                                 'scheduled_time': meta['Scheduled Time'], 'event_date': event_date.isoformat(),
-                                'report_type': 'All registrants', 'downloaded_count': len(contacts)}
+                                'report_type': 'All registrants', 'downloaded_count': len(contacts),
+                                'last_name_phone_rows_repaired': repaired_last_names}
 
 
           def save_zoom_contacts(raw_path, outdir, event_date, expected_id):
               contacts, meta = read_zoom_export(raw_path, event_date, expected_id)
+              print('Zoom cleanup: kept name/email/phone only; Last Name phone rows repaired:',
+                    meta['last_name_phone_rows_repaired'])
               outdir.mkdir(exist_ok=True)
               path = outdir / 'registrants.csv'
               with path.open('w', encoding='utf-8-sig', newline='') as output:
@@ -1209,12 +1263,11 @@ jobs:
 
 
           def discover_daily_utm_tabs(worksheets, target_date=None):
-              """Return (event_date, business_tab, registration_tab) for the latest date.
+              """Select the newest calendar date with both matching UTM tab types.
 
-              A date is eligible only when its titles match the user's two 7:30 PM,
-              10 Min/Mins event-tab naming patterns. The latest matching date drives the
-              run, even when that date is in the future. If that date is incomplete or
-              ambiguous, fail rather than silently use an older complete pair.
+              Ignore incomplete newer dates until both tabs exist. Duplicate tabs on the
+              selected date remain an error. An explicit target_date is supported for
+              callers that require a particular date, but the daily workflow omits it.
               """
               # Match the event-tab names supplied by the user, not unrelated daily tabs.
               pattern = re.compile(
@@ -1246,7 +1299,15 @@ jobs:
                       'No daily UTM tabs match the 7:30 PM Flexi Genie 10 Min/Mins '
                       'Business/Busines or Reg team naming patterns.'
                   )
-              target_date = target_date or max(matches_by_date)
+              if target_date is None:
+                  complete_dates = [day for day, kinds in matches_by_date.items()
+                                    if kinds['business'] and kinds['registration']]
+                  if not complete_dates:
+                      raise RuntimeError('No complete daily UTM pair found: business and registration tabs must share the same date.')
+                  target_date = max(complete_dates)
+                  skipped = sorted(day.isoformat() for day in matches_by_date if day > target_date)
+                  if skipped:
+                      print('Newer UTM dates awaiting both tabs:', ', '.join(skipped))
               if target_date not in matches_by_date:
                   raise RuntimeError('No UTM tab pair found for the required date ' + target_date.isoformat() + '. No other date substituted.')
               matches = matches_by_date[target_date]
@@ -1259,11 +1320,10 @@ jobs:
                       )
               return target_date, matches['business'][0], matches['registration'][0]
 
-          # Inspect UTM first for the current date in India. Do not substitute future tabs.
+          # Inspect UTM first and select the newest date with both matching event tabs.
           # 14 Oct tabs -> 13–14 Oct reports; 15 Oct tabs -> 14–15 Oct reports.
           timezone_name = os.environ.get('TIMEZONE', '').strip() or 'Asia/Kolkata'
-          run_date = datetime.now(ZoneInfo(timezone_name)).date()
-          target_tab_date, landing_tab, reg_tab = discover_daily_utm_tabs(opened['UTM'].worksheets(), target_date=run_date)
+          target_tab_date, landing_tab, reg_tab = discover_daily_utm_tabs(opened['UTM'].worksheets())
           print('UTM target event date:', target_tab_date.isoformat())
           print('Business tab selected:', landing_tab.title)
           print('Registration tab selected:', reg_tab.title)
@@ -1354,7 +1414,7 @@ jobs:
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
-          print('WORKFLOW REVISION: V17-R2 — current India date drives the complete workflow')
+          print('WORKFLOW REVISION: V17-R5 — latest complete UTM date drives the complete workflow')
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
           PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
           LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
@@ -2423,7 +2483,10 @@ jobs:
                   if any(key not in (reader.fieldnames or []) for key in required):
                       raise RuntimeError('CSV is missing required identity/timestamp columns.')
                   identities = []
-                  cutoff = datetime.combine(start_date, datetime.min.time()).replace(hour=18)
+                  # The selected UTM event date determines Sunday, not the runner clock.
+                  # Sunday keeps Saturday after 09:00 IST; all other days use 18:00.
+                  cutoff_hour = 9 if end_date.weekday() == 6 else 18
+                  cutoff = datetime.combine(start_date, datetime.min.time()).replace(hour=cutoff_hour)
                   downloaded = 0
                   excluded = 0
                   for record in reader:
@@ -2527,9 +2590,9 @@ jobs:
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 17-R2: both CSVs verified; Google Sheets remain read-only.')
+                  print('VERSION 17-R5: both CSVs verified; Google Sheets remain read-only.')
               except Exception as error:
-                  print('VERSION 17-R2 stopped:', type(error).__name__, str(error))
+                  print('VERSION 17-R5 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
@@ -2745,6 +2808,50 @@ jobs:
               return ' '.join(value.split())
 
 
+          def zoom_phone_candidate(value):
+              """Recognize phone-shaped text without treating ordinary surnames as numbers."""
+              value = value.strip()
+              if not re.fullmatch(r'\+?[0-9][0-9\s().-]*', value):
+                  return None
+              digits = re.sub(r'[^0-9]', '', value)
+              if digits.startswith('00'):
+                  digits = digits[2:]
+              if not 10 <= len(digits) <= 15:
+                  return None
+              # Compare Indian country-code variants without changing other phone data.
+              if len(digits) == 12 and digits.startswith('91'):
+                  digits = digits[2:]
+              return digits
+
+
+          def clean_zoom_identity(record, csv_row):
+              first = record['First Name'].strip()
+              last = record['Last Name'].strip()
+              phone = record['Phone'].strip()
+              candidates = []
+              if zoom_phone_candidate(last):
+                  candidates = [(last, 0, len(last))]
+              else:
+                  for match in re.finditer(r'(?<!\w)\+?[0-9][0-9\s().-]*[0-9](?!\w)', last):
+                      value = match.group().strip()
+                      if zoom_phone_candidate(value):
+                          candidates.append((value, match.start(), match.end()))
+              repaired = False
+              if candidates:
+                  if len(candidates) != 1:
+                      raise RuntimeError('Zoom CSV row ' + str(csv_row) + ' has multiple phone numbers in Last Name; review this row.')
+                  misplaced, begin, end = candidates[0]
+                  empty_phone = phone.casefold() in ('', '-', 'n/a', 'na', 'none', 'null')
+                  if not empty_phone and zoom_phone_candidate(phone) != zoom_phone_candidate(misplaced):
+                      raise RuntimeError('Zoom CSV row ' + str(csv_row) + ' has conflicting Last Name and Phone values; review this row before Sheets writes.')
+                  if empty_phone:
+                      phone = misplaced
+                  last = (last[:begin] + ' ' + last[end:]).strip(' ,;|-/')
+                  repaired = True
+              return {'name': zoom_text(' '.join(filter(None, [first, last]))),
+                      'email': record['Email'].strip(), 'phone': phone}, repaired
+
+
           def read_zoom_export(path, event_date, expected_id=None):
               with path.open(encoding='utf-8-sig', newline='') as source:
                   rows = [[cell.strip() for cell in row] for row in csv.reader(source)]
@@ -2753,11 +2860,15 @@ jobs:
               metadata_headers = ['Topic', 'ID', 'Scheduled Time', 'Duration (minutes)', '# Registrants',
                                   '# Cancelled registrants', '# Approved registrants', '# Denied registrants']
               meta_indices = [i for i, row in enumerate(rows) if row == metadata_headers]
-              contact_headers = ['First Name', 'Last Name', 'Email', 'Registration Time', 'Approval Status', 'Phone']
-              contact_indices = [i for i, row in enumerate(rows) if row == contact_headers]
+              required_contact_headers = ['First Name', 'Last Name', 'Email', 'Phone']
+              contact_indices = [i for i, row in enumerate(rows)
+                                 if all(header in row for header in required_contact_headers)]
               if len(meta_indices) != 1 or len(contact_indices) != 1:
                   raise RuntimeError('Zoom CSV metadata/contact headers are missing or ambiguous.')
               m, h = meta_indices[0], contact_indices[0]
+              contact_headers = rows[h]
+              if any(contact_headers.count(header) != 1 for header in required_contact_headers):
+                  raise RuntimeError('Zoom contact headers are duplicated or ambiguous.')
               if m + 1 >= len(rows) or len(rows[m + 1]) != len(metadata_headers) or h <= m + 1:
                   raise RuntimeError('Zoom CSV report structure is incomplete.')
               meta = dict(zip(metadata_headers, rows[m + 1]))
@@ -2772,25 +2883,31 @@ jobs:
               if expected_id is not None and webinar_id != re.sub(r'\s+', '', expected_id):
                   raise RuntimeError('Downloaded Zoom CSV does not match the selected webinar ID.')
               contacts = []
-              for row in rows[h + 1:]:
+              repaired_last_names = 0
+              for csv_row, row in enumerate(rows[h + 1:], start=h + 2):
                   if not row or not any(row):
                       continue
                   if len(row) != len(contact_headers):
                       raise RuntimeError('Zoom CSV has an incomplete registrant row.')
                   record = dict(zip(contact_headers, row))
-                  contacts.append({'name': ' '.join(filter(None, [record['First Name'], record['Last Name']])),
-                                   'email': record['Email'], 'phone': record['Phone']})
+                  contact, repaired = clean_zoom_identity(record, csv_row)
+                  contacts.append(contact)
+                  repaired_last_names += int(repaired)
               # Reconcile the downloaded report's own total, never the changing website count.
               count = int(meta['# Registrants'].replace(',', ''))
               if count != len(contacts):
                   raise RuntimeError('Zoom CSV rows do not reconcile with its own report total.')
+              contacts.sort(key=lambda row: (row['name'].casefold(), row['email'].casefold(), row['phone']))
               return contacts, {'topic': ZOOM_TOPIC, 'webinar_id': webinar_id,
                                 'scheduled_time': meta['Scheduled Time'], 'event_date': event_date.isoformat(),
-                                'report_type': 'All registrants', 'downloaded_count': len(contacts)}
+                                'report_type': 'All registrants', 'downloaded_count': len(contacts),
+                                'last_name_phone_rows_repaired': repaired_last_names}
 
 
           def save_zoom_contacts(raw_path, outdir, event_date, expected_id):
               contacts, meta = read_zoom_export(raw_path, event_date, expected_id)
+              print('Zoom cleanup: kept name/email/phone only; Last Name phone rows repaired:',
+                    meta['last_name_phone_rows_repaired'])
               outdir.mkdir(exist_ok=True)
               path = outdir / 'registrants.csv'
               with path.open('w', encoding='utf-8-sig', newline='') as output:
@@ -3753,6 +3870,50 @@ jobs:
               return ' '.join(value.split())
 
 
+          def zoom_phone_candidate(value):
+              """Recognize phone-shaped text without treating ordinary surnames as numbers."""
+              value = value.strip()
+              if not re.fullmatch(r'\+?[0-9][0-9\s().-]*', value):
+                  return None
+              digits = re.sub(r'[^0-9]', '', value)
+              if digits.startswith('00'):
+                  digits = digits[2:]
+              if not 10 <= len(digits) <= 15:
+                  return None
+              # Compare Indian country-code variants without changing other phone data.
+              if len(digits) == 12 and digits.startswith('91'):
+                  digits = digits[2:]
+              return digits
+
+
+          def clean_zoom_identity(record, csv_row):
+              first = record['First Name'].strip()
+              last = record['Last Name'].strip()
+              phone = record['Phone'].strip()
+              candidates = []
+              if zoom_phone_candidate(last):
+                  candidates = [(last, 0, len(last))]
+              else:
+                  for match in re.finditer(r'(?<!\w)\+?[0-9][0-9\s().-]*[0-9](?!\w)', last):
+                      value = match.group().strip()
+                      if zoom_phone_candidate(value):
+                          candidates.append((value, match.start(), match.end()))
+              repaired = False
+              if candidates:
+                  if len(candidates) != 1:
+                      raise RuntimeError('Zoom CSV row ' + str(csv_row) + ' has multiple phone numbers in Last Name; review this row.')
+                  misplaced, begin, end = candidates[0]
+                  empty_phone = phone.casefold() in ('', '-', 'n/a', 'na', 'none', 'null')
+                  if not empty_phone and zoom_phone_candidate(phone) != zoom_phone_candidate(misplaced):
+                      raise RuntimeError('Zoom CSV row ' + str(csv_row) + ' has conflicting Last Name and Phone values; review this row before Sheets writes.')
+                  if empty_phone:
+                      phone = misplaced
+                  last = (last[:begin] + ' ' + last[end:]).strip(' ,;|-/')
+                  repaired = True
+              return {'name': zoom_text(' '.join(filter(None, [first, last]))),
+                      'email': record['Email'].strip(), 'phone': phone}, repaired
+
+
           def read_zoom_export(path, event_date, expected_id=None):
               with path.open(encoding='utf-8-sig', newline='') as source:
                   rows = [[cell.strip() for cell in row] for row in csv.reader(source)]
@@ -3761,11 +3922,15 @@ jobs:
               metadata_headers = ['Topic', 'ID', 'Scheduled Time', 'Duration (minutes)', '# Registrants',
                                   '# Cancelled registrants', '# Approved registrants', '# Denied registrants']
               meta_indices = [i for i, row in enumerate(rows) if row == metadata_headers]
-              contact_headers = ['First Name', 'Last Name', 'Email', 'Registration Time', 'Approval Status', 'Phone']
-              contact_indices = [i for i, row in enumerate(rows) if row == contact_headers]
+              required_contact_headers = ['First Name', 'Last Name', 'Email', 'Phone']
+              contact_indices = [i for i, row in enumerate(rows)
+                                 if all(header in row for header in required_contact_headers)]
               if len(meta_indices) != 1 or len(contact_indices) != 1:
                   raise RuntimeError('Zoom CSV metadata/contact headers are missing or ambiguous.')
               m, h = meta_indices[0], contact_indices[0]
+              contact_headers = rows[h]
+              if any(contact_headers.count(header) != 1 for header in required_contact_headers):
+                  raise RuntimeError('Zoom contact headers are duplicated or ambiguous.')
               if m + 1 >= len(rows) or len(rows[m + 1]) != len(metadata_headers) or h <= m + 1:
                   raise RuntimeError('Zoom CSV report structure is incomplete.')
               meta = dict(zip(metadata_headers, rows[m + 1]))
@@ -3780,25 +3945,31 @@ jobs:
               if expected_id is not None and webinar_id != re.sub(r'\s+', '', expected_id):
                   raise RuntimeError('Downloaded Zoom CSV does not match the selected webinar ID.')
               contacts = []
-              for row in rows[h + 1:]:
+              repaired_last_names = 0
+              for csv_row, row in enumerate(rows[h + 1:], start=h + 2):
                   if not row or not any(row):
                       continue
                   if len(row) != len(contact_headers):
                       raise RuntimeError('Zoom CSV has an incomplete registrant row.')
                   record = dict(zip(contact_headers, row))
-                  contacts.append({'name': ' '.join(filter(None, [record['First Name'], record['Last Name']])),
-                                   'email': record['Email'], 'phone': record['Phone']})
+                  contact, repaired = clean_zoom_identity(record, csv_row)
+                  contacts.append(contact)
+                  repaired_last_names += int(repaired)
               # Reconcile the downloaded report's own total, never the changing website count.
               count = int(meta['# Registrants'].replace(',', ''))
               if count != len(contacts):
                   raise RuntimeError('Zoom CSV rows do not reconcile with its own report total.')
+              contacts.sort(key=lambda row: (row['name'].casefold(), row['email'].casefold(), row['phone']))
               return contacts, {'topic': ZOOM_TOPIC, 'webinar_id': webinar_id,
                                 'scheduled_time': meta['Scheduled Time'], 'event_date': event_date.isoformat(),
-                                'report_type': 'All registrants', 'downloaded_count': len(contacts)}
+                                'report_type': 'All registrants', 'downloaded_count': len(contacts),
+                                'last_name_phone_rows_repaired': repaired_last_names}
 
 
           def save_zoom_contacts(raw_path, outdir, event_date, expected_id):
               contacts, meta = read_zoom_export(raw_path, event_date, expected_id)
+              print('Zoom cleanup: kept name/email/phone only; Last Name phone rows repaired:',
+                    meta['last_name_phone_rows_repaired'])
               outdir.mkdir(exist_ok=True)
               path = outdir / 'registrants.csv'
               with path.open('w', encoding='utf-8-sig', newline='') as output:
