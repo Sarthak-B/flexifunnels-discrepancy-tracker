@@ -2,6 +2,11 @@ name: FlexiFunnels Discrepancy Tracker
 
 on:
   workflow_dispatch:
+    inputs:
+      event_date:
+        description: "Webinar date to process (YYYY-MM-DD). Clear it to auto-pick the latest non-future date."
+        required: false
+        default: "2026-10-14"
 
 concurrency:
   group: flexifunnels-discrepancy-sheets
@@ -45,6 +50,7 @@ jobs:
           ACTIVECAMPAIGN_API_URL: ${{ secrets.ACTIVECAMPAIGN_API_URL }}
           ACTIVECAMPAIGN_API_KEY: ${{ secrets.ACTIVECAMPAIGN_API_KEY }}
           ZOOM_STORAGE_STATE_B64: ${{ secrets.ZOOM_STORAGE_STATE_B64 }}
+          TARGET_EVENT_DATE: ${{ inputs.event_date }}
 
         run: |
           python -u - <<'PY'
@@ -58,7 +64,7 @@ jobs:
           from google.oauth2.service_account import Credentials
 
           print("=" * 60)
-          print("GOOGLE SHEETS TEST - VERSION 17")
+          print("GOOGLE SHEETS TEST - VERSION 18")
           print("=" * 60)
 
           required = [
@@ -1262,12 +1268,13 @@ jobs:
           from datetime import date
 
 
-          def discover_daily_utm_tabs(worksheets, target_date=None):
+          def discover_daily_utm_tabs(worksheets, target_date=None, today=None):
               """Select the newest calendar date with both matching UTM tab types.
 
-              Ignore incomplete newer dates until both tabs exist. Duplicate tabs on the
-              selected date remain an error. An explicit target_date is supported for
-              callers that require a particular date, but the daily workflow omits it.
+              Ignore incomplete newer dates until both tabs exist, and never auto-select a
+              date in the future (tabs are created ahead of upcoming webinars). Duplicate
+              tabs on the selected date remain an error. An explicit target_date selects
+              exactly that date.
               """
               # Match the event-tab names supplied by the user, not unrelated daily tabs.
               pattern = re.compile(
@@ -1299,15 +1306,19 @@ jobs:
                       'No daily UTM tabs match the 7:30 PM Flexi Genie 10 Min/Mins '
                       'Business/Busines or Reg team naming patterns.'
                   )
+              if target_date is not None and today is not None and target_date > today:
+                  raise RuntimeError('Requested event date ' + target_date.isoformat() + ' is in the future.')
               if target_date is None:
+                  # Tabs are created ahead of time for upcoming webinars; never pick a future date.
                   complete_dates = [day for day, kinds in matches_by_date.items()
-                                    if kinds['business'] and kinds['registration']]
+                                    if kinds['business'] and kinds['registration']
+                                    and (today is None or day <= today)]
                   if not complete_dates:
                       raise RuntimeError('No complete daily UTM pair found: business and registration tabs must share the same date.')
                   target_date = max(complete_dates)
                   skipped = sorted(day.isoformat() for day in matches_by_date if day > target_date)
                   if skipped:
-                      print('Newer UTM dates awaiting both tabs:', ', '.join(skipped))
+                      print('Newer UTM dates skipped (future or incomplete):', ', '.join(skipped))
               if target_date not in matches_by_date:
                   raise RuntimeError('No UTM tab pair found for the required date ' + target_date.isoformat() + '. No other date substituted.')
               matches = matches_by_date[target_date]
@@ -1320,10 +1331,16 @@ jobs:
                       )
               return target_date, matches['business'][0], matches['registration'][0]
 
-          # Inspect UTM first and select the newest date with both matching event tabs.
+          # Inspect UTM first and select the event date.
           # 14 Oct tabs -> 13–14 Oct reports; 15 Oct tabs -> 14–15 Oct reports.
           timezone_name = os.environ.get('TIMEZONE', '').strip() or 'Asia/Kolkata'
-          target_tab_date, landing_tab, reg_tab = discover_daily_utm_tabs(opened['UTM'].worksheets())
+          today_local = datetime.now(ZoneInfo(timezone_name)).date()
+          override = os.environ.get('TARGET_EVENT_DATE', '').strip()
+          requested_date = date.fromisoformat(override) if override else None
+          if requested_date is not None:
+              print('Event date requested for this run:', requested_date.isoformat())
+          target_tab_date, landing_tab, reg_tab = discover_daily_utm_tabs(
+              opened['UTM'].worksheets(), target_date=requested_date, today=today_local)
           print('UTM target event date:', target_tab_date.isoformat())
           print('Business tab selected:', landing_tab.title)
           print('Registration tab selected:', reg_tab.title)
@@ -1414,7 +1431,7 @@ jobs:
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
-          print('WORKFLOW REVISION: V17-R6 — latest complete UTM date drives the complete workflow')
+          print('WORKFLOW REVISION: V18 — selected event date drives the complete workflow')
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
           PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
           LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
@@ -2235,15 +2252,36 @@ jobs:
               else:
                   raise RuntimeError('Requested calendar month was not reached.')
 
-              # Match the actual visible day number within the confirmed month. Exclude
-              # explicitly disabled cells and fail if adjacent-month cells are ambiguous.
+              # Match the visible day number in the confirmed month. A day can match on
+              # both a cell and its inner span, so group by the owning cell, and skip
+              # adjacent-month or disabled cells.
               day = re.compile(r'^\s*' + str(target.day) + r'\s*$')
-              candidates = visible_items(calendar.get_by_text(day))
-              candidates = [item for item in candidates if item.is_enabled() and not item.evaluate(
-                  "el => !!el.closest('[aria-disabled=\"true\"], [disabled]')")]
-              if len(candidates) != 1:
+              cells = {}
+              for item in visible_items(calendar.get_by_text(day)):
+                  info = item.evaluate('''el => {
+                      const cell = el.closest('td, [role="gridcell"], button, [role="button"]') || el;
+                      const flags = [];
+                      for (let n = el; n && n !== cell.parentElement; n = n.parentElement) {
+                          const raw = n.className && n.className.baseVal !== undefined ? n.className.baseVal : (n.className || '');
+                          const cls = ' ' + raw + ' ';
+                          if (n.getAttribute('aria-disabled') === 'true' || n.hasAttribute('disabled')
+                              || /[\\s_-](disabled|is-disabled|unavailable)[\\s_-]/i.test(cls)) flags.push('disabled');
+                          if (/[\\s_-](off|old|new|prev-month|next-month|other-month|outside|not-current|out-of-month|adjacent)[\\s_-]/i.test(cls)) flags.push('outside');
+                      }
+                      return {key: Array.from(document.querySelectorAll('*')).indexOf(cell),
+                              disabled: flags.includes('disabled'), outside: flags.includes('outside')};
+                  }''')
+                  entry = cells.setdefault(info['key'], {'item': item, 'disabled': False, 'outside': False})
+                  entry['disabled'] = entry['disabled'] or info['disabled']
+                  entry['outside'] = entry['outside'] or info['outside']
+              usable = [e for e in cells.values() if not e['disabled'] and not e['outside']]
+              if len(usable) != 1:
+                  disabled = sum(1 for e in cells.values() if e['disabled'] and not e['outside'])
+                  print('Calendar day', target.isoformat(), '- cells:', len(cells), 'disabled:', disabled, 'usable:', len(usable))
+                  if not usable and disabled:
+                      raise RuntimeError('Calendar day ' + target.isoformat() + ' is disabled in FlexiFunnels (future or unavailable date).')
                   raise RuntimeError('Calendar day ' + target.isoformat() + ' is missing or ambiguous.')
-              candidates[0].click()
+              usable[0]['item'].click()
               print('Calendar date clicked:', target.isoformat())
 
 
@@ -2590,9 +2628,9 @@ jobs:
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 17-R6: both CSVs verified; Google Sheets remain read-only.')
+                  print('VERSION 18: both CSVs verified; Google Sheets remain read-only.')
               except Exception as error:
-                  print('VERSION 17-R6 stopped:', type(error).__name__, str(error))
+                  print('VERSION 18 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
@@ -2993,58 +3031,106 @@ jobs:
 
 
           def zoom_date_value(value):
-              for pattern in ('%m/%d/%Y', '%Y-%m-%d'):
+              value = ' '.join(str(value).split())
+              for pattern in ('%m/%d/%Y', '%Y-%m-%d', '%Y/%m/%d', '%m-%d-%Y',
+                              '%b %d, %Y', '%B %d, %Y', '%d %b %Y', '%d %B %Y'):
                   try:
-                      return datetime.strptime(value.strip(), pattern).date()
+                      return datetime.strptime(value, pattern).date()
                   except ValueError:
                       pass
               return None
 
 
+          def zoom_all_inputs(page):
+              # Zoom sometimes renders report filters inside an iframe.
+              found = []
+              for frame in page.frames:
+                  try:
+                      found.extend(zoom_visible(frame.locator('input')))
+                  except Exception:
+                      pass
+              return found
+
+
           def zoom_date_fields(page, seconds=30):
+              """Return (From, To) inputs, or None when Zoom does not expose them as inputs."""
+              date_hint = re.compile(r'date|from|start|end|mm|yyyy', re.IGNORECASE)
               deadline = time.monotonic() + seconds
               while time.monotonic() < deadline:
-                  # Prefer real label associations when Zoom exposes them.
-                  starts = zoom_visible(page.get_by_label('From', exact=True))
-                  ends = zoom_visible(page.get_by_label('To', exact=True))
-                  if len(starts) == len(ends) == 1:
-                      return starts[0], ends[0]
+                  for frame in page.frames:
+                      try:
+                          starts = zoom_visible(frame.get_by_label(re.compile(r'^\s*(From|Start date)\s*:?\s*$', re.I)))
+                          ends = zoom_visible(frame.get_by_label(re.compile(r'^\s*(To|End date)\s*:?\s*$', re.I)))
+                      except Exception:
+                          continue
+                      if len(starts) == len(ends) == 1:
+                          return starts[0], ends[0]
                   candidates = []
-                  for element in zoom_visible(page.locator('input')):
-                      value = element.input_value().strip()
-                      placeholder = (element.get_attribute('placeholder') or '').strip().upper()
+                  for element in zoom_all_inputs(page):
+                      try:
+                          value = element.input_value().strip()
+                      except Exception:
+                          continue
+                      hints = ' '.join(element.get_attribute(a) or '' for a in ('placeholder', 'aria-label', 'name', 'id', 'class'))
                       if (zoom_date_value(value) is not None or element.get_attribute('type') == 'date'
-                              or placeholder in ('MM/DD/YYYY', 'YYYY-MM-DD')):
+                              or (not value and date_hint.search(hints))):
                           candidates.append(element)
-                  if len(candidates) == 2:
-                      # The recording has From on the left and To on the right. Use their
-                      # rendered position rather than their order in the document.
-                      boxes = [(element.bounding_box(), element) for element in candidates]
-                      if all(box for box, _ in boxes):
-                          boxes.sort(key=lambda entry: (entry[0]['y'], entry[0]['x']))
-                          return boxes[0][1], boxes[1][1]
+                  dated = [e for e in candidates if zoom_date_value(e.input_value()) is not None]
+                  for group in (dated, candidates):
+                      if len(group) == 2:
+                          boxes = [(e.bounding_box(), e) for e in group]
+                          if all(box for box, _ in boxes):
+                              boxes.sort(key=lambda entry: (entry[0]['y'], entry[0]['x']))
+                              return boxes[0][1], boxes[1][1]
                   time.sleep(0.3)
-              raise RuntimeError('Zoom From/To inputs are missing or ambiguous; see report diagnostics.')
+              return None
+
+
+          def zoom_url_range_ok(page, event_date):
+              fragment = urlparse(page.url).fragment
+              previous = (event_date - timedelta(days=1)).isoformat()
+              return ('dateFrom=' + previous in fragment and 'dateTo=' + event_date.isoformat() in fragment
+                      and 'meetingScope=webinar' in fragment)
 
 
           def zoom_filter_diagnostic(page, event_date):
               Path('zoom-diagnostics').mkdir(exist_ok=True)
               controls = []
-              for element in zoom_visible(page.locator('input')):
-                  value = element.input_value().strip()
+              for element in zoom_all_inputs(page):
+                  try:
+                      value = element.input_value().strip()
+                  except Exception:
+                      value = ''
                   controls.append({'type': element.get_attribute('type'),
                                    'placeholder': element.get_attribute('placeholder'),
                                    'aria_label': element.get_attribute('aria-label'),
+                                   'name': element.get_attribute('name'),
+                                   'class': element.get_attribute('class'),
                                    'readonly': element.get_attribute('readonly') is not None,
                                    'date_value': value if zoom_date_value(value) else None})
+              frames = [urlparse(f.url)._replace(query='', fragment='').geturl() for f in page.frames]
               (Path('zoom-diagnostics') / 'filters.json').write_text(json.dumps({
                   'expected_from': (event_date - timedelta(days=1)).isoformat(),
-                  'expected_to': event_date.isoformat(), 'visible_input_controls': controls}, indent=2))
+                  'expected_to': event_date.isoformat(), 'frames': frames,
+                  'visible_input_controls': controls}, indent=2))
+              try:
+                  page.screenshot(path='zoom-diagnostics/filters.png', full_page=True)
+              except Exception:
+                  pass
 
 
           def set_zoom_filters(page, event_date):
               zoom_one(page.get_by_text('Meeting and webinar registrations', exact=True), 'registration report')
-              start, end = zoom_date_fields(page)
+              fields = zoom_date_fields(page)
+              if fields is None:
+                  zoom_filter_diagnostic(page, event_date)
+                  if not zoom_url_range_ok(page, event_date):
+                      raise RuntimeError('Zoom date inputs not found and the report URL does not carry the '
+                                         'required range. See filters.json and filters.png.')
+                  print('Zoom: date inputs not exposed as text fields; using the range in the report URL. '
+                        'The webinar row and CSV are still checked against the event date.')
+                  return 'url'
+              start, end = fields
               expected = (event_date - timedelta(days=1), event_date)
               for description, element, day in [('From', start, expected[0]), ('To', end, expected[1])]:
                   old = element.input_value().strip()
@@ -3053,7 +3139,7 @@ jobs:
                       continue
                   if not element.is_editable():
                       zoom_filter_diagnostic(page, event_date)
-                      raise RuntimeError('Zoom ' + description + ' date input is read-only; calendar DOM verification is needed. See filters.json and report.png.')
+                      raise RuntimeError('Zoom ' + description + ' date input is read-only and shows a different date. See filters.json and filters.png.')
                   pattern = '%Y-%m-%d' if (element.get_attribute('type') == 'date'
                                             or re.fullmatch(r'\d{4}-\d{2}-\d{2}', old)) else '%m/%d/%Y'
                   element.fill(day.strftime(pattern))
@@ -3071,16 +3157,27 @@ jobs:
               elif not zoom_visible(page.get_by_text('Webinars', exact=True)):
                   zoom_click(page, 'Meetings')
                   zoom_click(page, 'Webinars')
-              verify_zoom_filters(page, event_date)
+              verify_zoom_filters(page, event_date, 'inputs')
+              return 'inputs'
 
 
-          def verify_zoom_filters(page, event_date):
+          def verify_zoom_filters(page, event_date, mode='inputs'):
               expected = (event_date - timedelta(days=1), event_date)
+              if mode == 'url':
+                  if zoom_url_range_ok(page, event_date):
+                      print('Zoom search range (from URL):', expected[0].isoformat(), 'through', expected[1].isoformat())
+                  else:
+                      print('Zoom: URL range changed after Search; relying on the webinar row and CSV date checks.')
+                  return
               deadline = time.monotonic() + 15
               matched_since = None
               observed = ('', '')
               while time.monotonic() < deadline:
-                  start, end = zoom_date_fields(page, seconds=2)
+                  fields = zoom_date_fields(page, seconds=2)
+                  if fields is None:
+                      time.sleep(0.25)
+                      continue
+                  start, end = fields
                   observed = (start.input_value().strip(), end.input_value().strip())
                   if tuple(zoom_date_value(value) for value in observed) == expected:
                       if matched_since is None:
@@ -3145,7 +3242,7 @@ jobs:
           def export_zoom(page, event_date, outdir):
               print('Zoom: opening the recorded registrants report with dynamic date filters.')
               page.goto(zoom_report_url(event_date), wait_until='domcontentloaded')
-              set_zoom_filters(page, event_date)
+              mode = set_zoom_filters(page, event_date)
               zoom_one(page.get_by_role('button', name='Search', exact=True), 'Search').click()
               # Wait for the result total to settle. Require all results to be visible so a
               # second matching webinar on an unseen page cannot be silently ignored.
@@ -3177,7 +3274,7 @@ jobs:
                   time.sleep(0.5)
               else:
                   raise RuntimeError('Zoom search did not produce a stable results table.')
-              verify_zoom_filters(page, event_date)
+              verify_zoom_filters(page, event_date, mode)
               chosen = select_zoom_row(records, event_date)
               print('Zoom webinar selected:', ZOOM_TOPIC, '| scheduled:', zoom_text(chosen['scheduled']),
                     '| ID:', zoom_text(chosen['id']))
@@ -3196,6 +3293,7 @@ jobs:
 
           def run_zoom_export():
               event_date = date.fromisoformat(os.environ['UTM_TAB_DATE'])
+              print('Zoom: event date for this run:', event_date.isoformat())
               stage = 'saved-session'
               seed = zoom_seed_value()
               cache_file = Path(os.environ['RUNNER_TEMP']) / 'zoom-session-cache' / 'state.enc'
