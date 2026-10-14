@@ -3056,19 +3056,39 @@ jobs:
               return 'meetingRegistration' in urlparse(page.url).fragment
 
 
-          def zoom_displayed_range(page):
-              """Read the From/To dates shown on the report, whatever the input styling."""
+          def zoom_url_params(page):
+              query = urlparse(page.url).fragment.partition('?')[2]
+              return dict(parse_qsl(query, keep_blank_values=True))
+
+
+          def zoom_url_range(page):
+              # Zoom writes the applied filter into the address (seen in the recording).
+              params = zoom_url_params(page)
+              try:
+                  return (date.fromisoformat(params['dateFrom']), date.fromisoformat(params['dateTo']))
+              except (KeyError, ValueError):
+                  return None
+
+
+          def zoom_input_range(page):
               try:
                   values = page.evaluate('''() => Array.from(document.querySelectorAll('input'))
-                      .filter(el => el.offsetParent !== null)
+                      .filter(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
                       .map(el => el.value || '')''')
               except Exception:
                   return None
               dates = [zoom_date_value(value) for value in values]
               dates = [day for day in dates if day is not None]
-              if len(dates) != 2:
-                  return None
-              return dates[0], dates[1]
+              return (dates[0], dates[1]) if len(dates) == 2 else None
+
+
+          def zoom_displayed_range(page):
+              """The report's From/To dates: from the date boxes, else from the page address."""
+              boxes = zoom_input_range(page)
+              address = zoom_url_range(page)
+              if boxes and address and boxes != address:
+                  print('Zoom: note - date boxes show', boxes, 'but the address says', address, '; using the boxes.')
+              return boxes or address
 
 
           def zoom_wait_range(page, seconds=30):
@@ -3118,7 +3138,10 @@ jobs:
                   raise RuntimeError('Could not open the Meeting and webinar registrations report.')
               shown = zoom_wait_range(page, 45)
               if shown is None:
-                  raise RuntimeError('Registration report opened, but its From/To dates could not be read.')
+                  zoom_filter_diagnostic(page, date.today())
+                  print('Zoom: route reached:', zoom_route(page))
+                  raise RuntimeError('Registration report opened, but its From/To dates could not be read '
+                                     '(not in the date boxes or the page address). See filters.png.')
               print('Zoom: report opened; range shown:', shown[0].isoformat(), 'to', shown[1].isoformat())
               return shown
 
@@ -3172,6 +3195,8 @@ jobs:
           def zoom_select_webinars(page):
               # Recorded control: a dropdown showing "Meetings" with a "Webinars" option.
               for _ in range(4):
+                  if zoom_url_params(page).get('meetingScope') == 'webinar':
+                      return
                   meetings = zoom_visible(page.get_by_text('Meetings', exact=True))
                   webinars = zoom_visible(page.get_by_text('Webinars', exact=True))
                   if webinars and not meetings:
