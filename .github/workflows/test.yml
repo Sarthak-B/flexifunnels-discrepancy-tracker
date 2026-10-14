@@ -3248,47 +3248,63 @@ jobs:
                   return None
 
 
-          ZOOM_CALENDAR_JS = '''() => {
+          ZOOM_JS_HELPERS = '''
+              const allElements = (root, out = []) => {
+                  for (const el of root.querySelectorAll('*')) {
+                      out.push(el);
+                      if (el.shadowRoot) allElements(el.shadowRoot, out);
+                  }
+                  return out;
+              };
+              const visible = el => {
+                  const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+                  return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'
+                         && Number(s.opacity || 1) > 0.05;
+              };
+              const ownText = el => el.tagName === 'INPUT' ? (el.value || '')
+                                   : (el.children.length ? '' : (el.textContent || ''));
+          '''
+
+          ZOOM_CALENDAR_JS = '''() => {''' + ZOOM_JS_HELPERS + '''
               const months = ['January','February','March','April','May','June','July','August',
                               'September','October','November','December'];
               const shortMonths = months.map(m => m.slice(0, 3));
-              const visible = el => {
-                  const r = el.getBoundingClientRect(), s = getComputedStyle(el);
-                  return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
-              };
               const monthRe = new RegExp('\\\\b(' + months.join('|') + '|' + shortMonths.join('|') + ')\\\\b');
-              document.querySelectorAll('[data-ff-cal],[data-ff-prev],[data-ff-next]').forEach(el => {
-                  el.removeAttribute('data-ff-cal'); el.removeAttribute('data-ff-prev'); el.removeAttribute('data-ff-next');
-              });
-              // Smallest visible block that shows a month name, a year and one month of day numbers.
-              let best = null;
-              for (const el of document.querySelectorAll('body *')) {
-                  if (!visible(el)) continue;
-                  const text = el.innerText || '';
-                  if (!monthRe.test(text) || !/\\b20\\d\\d\\b/.test(text)) continue;
-                  const days = Array.from(el.querySelectorAll('*')).filter(c => !c.children.length && visible(c)
-                                    && /^\\d{1,2}$/.test((c.textContent || '').trim()));
-                  const nums = new Set(days.map(c => c.textContent.trim()));
-                  if (!nums.has('1') || !nums.has('15') || !nums.has('28') || days.length > 50) continue;
-                  if (!best || best.contains(el)) best = el;
+              const everything = allElements(document);
+              everything.forEach(el => ['data-ff-cal', 'data-ff-prev', 'data-ff-next'].forEach(a => el.removeAttribute(a)));
+              // Start at visible month-name text and walk up to the smallest block that also
+              // shows a year and one month of day numbers (crossing component boundaries).
+              let best = null, bestSize = Infinity;
+              const heads0 = everything.filter(el => visible(el) && monthRe.test(ownText(el)));
+              for (const head of heads0) {
+                  let node = head;
+                  for (let depth = 0; depth < 12 && node; depth++) {
+                      const inner = allElements(node);
+                      const texts = [node, ...inner].filter(c => visible(c)).map(c => ownText(c).trim()).filter(Boolean);
+                      const days = texts.filter(t => /^\\d{1,2}$/.test(t));
+                      const nums = new Set(days);
+                      if (/\\b20\\d\\d\\b/.test(texts.join(' ')) && nums.has('1') && nums.has('15') && nums.has('28')) {
+                          if (days.length <= 50 && inner.length < bestSize) { best = node; bestSize = inner.length; }
+                          break;
+                      }
+                      node = node.parentElement || (node.getRootNode && node.getRootNode().host) || null;
+                  }
               }
               if (!best) return null;
               best.setAttribute('data-ff-cal', '1');
-              const text = best.innerText;
-              const monthMatch = text.match(monthRe);
-              const year = (text.match(/\\b(20\\d\\d)\\b/) || [])[1];
-              const label = monthMatch[1];
+              const inner = allElements(best).filter(c => visible(c));
+              const joined = inner.map(c => ownText(c).trim()).filter(Boolean).join(' ');
+              const label = joined.match(monthRe)[1];
+              const year = Number((joined.match(/\\b(20\\d\\d)\\b/) || [])[1]);
               const month = (months.indexOf(label) >= 0 ? months.indexOf(label) : shortMonths.indexOf(label)) + 1;
-              // Header = leaf elements holding the month name or the year.
-              const heads = Array.from(best.querySelectorAll('*')).filter(c => !c.children.length && visible(c)
-                                && (monthRe.test(c.textContent || '') || /^\\s*20\\d\\d\\s*$/.test(c.textContent || '')));
+              const heads = inner.filter(c => monthRe.test(ownText(c)) || /^\\s*20\\d\\d\\s*$/.test(ownText(c)));
               if (heads.length) {
                   const boxes = heads.map(h => h.getBoundingClientRect());
                   const left = Math.min(...boxes.map(b => b.left)), right = Math.max(...boxes.map(b => b.right));
                   const middle = (Math.min(...boxes.map(b => b.top)) + Math.max(...boxes.map(b => b.bottom))) / 2;
                   let prev = null, next = null;
-                  for (const c of best.querySelectorAll('button, [role="button"], a, i, svg, span')) {
-                      if (!visible(c) || heads.includes(c)) continue;
+                  for (const c of inner) {
+                      if (heads.includes(c) || !/^(BUTTON|A|I|SVG|SPAN)$/i.test(c.tagName) && c.getAttribute('role') !== 'button') continue;
                       const r = c.getBoundingClientRect();
                       const t = (c.innerText || '').trim();
                       if (r.width > 40 || Math.abs((r.top + r.bottom) / 2 - middle) > 15) continue;
@@ -3300,12 +3316,12 @@ jobs:
                   if (prev) prev[1].setAttribute('data-ff-prev', '1');
                   if (next) next[1].setAttribute('data-ff-next', '1');
               }
-              return {year: Number(year), month: month};
+              return {year: year, month: month};
           }'''
 
 
           def zoom_calendar(page, seconds=6):
-              """The open calendar popup and the (year, month) it shows."""
+              """The open calendar popup and the (year, month) it shows, or (None, None)."""
               deadline = time.monotonic() + seconds
               while time.monotonic() < deadline:
                   found = page.evaluate(ZOOM_CALENDAR_JS)
@@ -3315,28 +3331,34 @@ jobs:
               return None, None
 
 
-          def zoom_open_calendar(page, box, label):
+          def zoom_save_popup_diagnostic(page, label):
+              Path('zoom-diagnostics').mkdir(exist_ok=True)
+              try:
+                  page.screenshot(path='zoom-diagnostics/calendar-' + label.lower() + '.png', full_page=True)
+                  # Elements added at the end of the page (where popups usually live); no registrant data here.
+                  html = page.evaluate('''() => Array.from(document.body.children).slice(-6)
+                                              .map(el => el.outerHTML.slice(0, 15000)).join('\\n<!-- next -->\\n')''')
+                  (Path('zoom-diagnostics') / ('calendar-' + label.lower() + '.html')).write_text(html)
+              except Exception:
+                  pass
+
+
+          def zoom_try_open_calendar(page, box, label):
+              """Click the date box (then its icon); return the popup or None. Leaves nothing open on failure."""
               box.click()
               popup, shown = zoom_calendar(page)
               if popup is not None:
                   return popup, shown
-              # Try the calendar icon beside the box.
-              icons = zoom_visible(box.locator('xpath=ancestor::*[2]').locator('svg, i, [class*="icon"]'))
-              for icon in icons[:2]:
+              zoom_save_popup_diagnostic(page, label)
+              icons = zoom_visible(box.locator('xpath=ancestor-or-self::*[2]').locator('svg, i, [class*="icon"]'))
+              for icon in icons[:1]:
                   icon.click()
-                  popup, shown = zoom_calendar(page)
+                  popup, shown = zoom_calendar(page, seconds=4)
                   if popup is not None:
                       return popup, shown
-              Path('zoom-diagnostics').mkdir(exist_ok=True)
-              try:
-                  page.screenshot(path='zoom-diagnostics/calendar-' + label.lower() + '.png', full_page=True)
-                  # The filter row only (dates, dropdown, buttons); no registrant data.
-                  html = box.evaluate('''el => { let n = el; for (let i = 0; i < 4 && n.parentElement; i++) n = n.parentElement;
-                                                 return n.outerHTML.slice(0, 30000); }''')
-                  (Path('zoom-diagnostics') / ('filter-row-' + label.lower() + '.html')).write_text(html)
-              except Exception:
-                  pass
-              raise RuntimeError('Zoom ' + label + ' calendar did not open (see calendar-' + label.lower() + '.png).')
+              page.keyboard.press('Escape')
+              page.wait_for_timeout(300)
+              return None, None
 
 
           def zoom_close_calendar(page):
@@ -3351,11 +3373,7 @@ jobs:
               page.wait_for_timeout(500)
 
 
-          def zoom_pick_date(page, label, target):
-              """Open the From/To calendar and click the target day, as in the recording."""
-              zoom_close_calendar(page)
-              box = zoom_date_box(page, label)
-              popup, shown = zoom_open_calendar(page, box, label)
+          def zoom_click_calendar_day(page, popup, shown, target):
               wanted = (target.year, target.month)
               for _ in range(24):
                   if shown == wanted:
@@ -3394,33 +3412,130 @@ jobs:
               cells.nth(index).click()
               page.wait_for_timeout(800)
               zoom_close_calendar(page)
+
+
+          def zoom_type_date(page, box, target):
+              """Type the date into the box's text field (works for typeable date pickers)."""
+              field = box if box.evaluate("el => el.tagName === 'INPUT'") else box.locator('input').first
+              if field.count() != 1:
+                  return False
+              text = target.strftime('%m/%d/%Y')
+              field.evaluate('el => el.removeAttribute("readonly")')
+              field.click()
+              page.keyboard.press('Control+A')
+              page.keyboard.press('Backspace')
+              page.keyboard.type(text, delay=40)
+              page.keyboard.press('Enter')
+              page.wait_for_timeout(800)
+              zoom_close_calendar(page)
+              page.keyboard.press('Tab')
+              page.wait_for_timeout(500)
+              return True
+
+
+          def zoom_pick_date(page, label, target):
+              """Set From/To: pick it in the calendar, or type it if no calendar can be found."""
+              zoom_close_calendar(page)
+              box = zoom_date_box(page, label)
+              before = zoom_box_value(box)
+              if before == target:
+                  print('Zoom: ' + label + ' already', target.isoformat())
+                  return True
+              popup, shown = zoom_try_open_calendar(page, box, label)
+              method = 'calendar'
+              if popup is not None:
+                  zoom_click_calendar_day(page, popup, shown, target)
+              else:
+                  method = 'typing'
+                  if not zoom_type_date(page, zoom_date_box(page, label), target):
+                      return False
               value = zoom_box_value(zoom_date_box(page, label, seconds=5))
-              if value is not None and value != target:
-                  raise RuntimeError('Zoom ' + label + ' shows ' + value.isoformat() + ' after picking '
-                                     + target.isoformat() + '.')
-              print('Zoom: ' + label + ' set to', target.isoformat(),
-                    '(confirmed in box)' if value == target else '(box value not readable; checked after Search)')
+              print('Zoom: ' + label + ' ->', value.isoformat() if value else 'unreadable', 'via', method,
+                    '(wanted ' + target.isoformat() + ')')
+              return value == target
+
+
+          def zoom_set_dates_by_address(page, start, end):
+              route, _, query = urlparse(page.url).fragment.partition('?')
+              params = dict(parse_qsl(query, keep_blank_values=True))
+              params.update({'dateFrom': start.isoformat(), 'dateTo': end.isoformat(), 'page': '1'})
+              page.evaluate('h => { window.location.hash = h; }', route + '?' + urlencode(params))
+              page.reload(wait_until='domcontentloaded')
+              page.wait_for_timeout(4000)
+
+
+          def zoom_set_dates(page, start, end, event_date):
+              """From = previous day, To = event day; verified from the boxes on screen."""
+              for attempt in range(2):
+                  ok_from = zoom_pick_date(page, 'From', start)
+                  ok_to = zoom_pick_date(page, 'To', end)
+                  shown = zoom_input_range(page)
+                  if shown == (start, end):
+                      print('Zoom: date range set to', start.isoformat(), 'to', end.isoformat())
+                      return
+                  print('Zoom: date range now', shown, '(From ok:', ok_from, ', To ok:', ok_to, ')')
+              print('Zoom: trying the page address to set the dates.')
+              zoom_set_dates_by_address(page, start, end)
+              if not zoom_on_registration_report(page):
+                  open_registration_report(page)
+              shown = zoom_input_range(page)
+              if shown == (start, end):
+                  print('Zoom: date range set (via page address) to', start.isoformat(), 'to', end.isoformat())
+                  return
+              zoom_filter_diagnostic(page, event_date)
+              raise RuntimeError('Zoom From/To could not be set to ' + start.isoformat() + ' / ' + end.isoformat()
+                                 + ' (showing ' + str(shown) + '). See calendar-from.png and calendar-from.html.')
+
+
+          ZOOM_SCOPE_JS = '''() => {''' + ZOOM_JS_HELPERS + '''
+              const everything = allElements(document);
+              everything.forEach(el => el.removeAttribute('data-ff-scope'));
+              const to = everything.find(el => el.getAttribute('data-ff-box') === 'To');
+              const anchor = to ? to.getBoundingClientRect() : null;
+              let best = null;
+              for (const el of everything) {
+                  if (!visible(el)) continue;
+                  const text = ownText(el).trim();
+                  if (text !== 'Meetings' && text !== 'Webinars') continue;
+                  const r = el.getBoundingClientRect();
+                  if (anchor && (Math.abs((r.top + r.bottom) / 2 - (anchor.top + anchor.bottom) / 2) > 25 || r.left < anchor.right - 2)) continue;
+                  if (!best || r.left < best[0]) best = [r.left, el, text];
+              }
+              if (!best) return null;
+              best[1].setAttribute('data-ff-scope', '1');
+              return best[2];
+          }'''
+
+
+          def zoom_scope(page):
+              try:
+                  zoom_date_box(page, 'To', seconds=2)
+              except RuntimeError:
+                  pass
+              return page.evaluate(ZOOM_SCOPE_JS)
 
 
           def zoom_select_webinars(page):
-              # Recorded control: a dropdown showing "Meetings" with a "Webinars" option.
+              # Recorded control: the dropdown beside the To date showing "Meetings"; pick "Webinars".
               for _ in range(4):
-                  if zoom_url_params(page).get('meetingScope') == 'webinar':
+                  current = zoom_scope(page)
+                  if current == 'Webinars':
+                      print('Zoom: report type is Webinars.')
                       return
-                  meetings = zoom_visible(page.get_by_text('Meetings', exact=True))
-                  webinars = zoom_visible(page.get_by_text('Webinars', exact=True))
-                  if webinars and not meetings:
-                      return
-                  if len(meetings) == 1:
-                      meetings[0].click()
+                  if current == 'Meetings':
+                      page.locator('[data-ff-scope="1"]').click()
                       page.wait_for_timeout(800)
-                      options = zoom_visible(page.get_by_text('Webinars', exact=True))
-                      if len(options) == 1:
-                          options[0].click()
+                      options = [item for item in zoom_visible(page.get_by_text('Webinars', exact=True))]
+                      options += [item for item in zoom_visible(page.get_by_role('option', name='Webinars'))
+                                  if item not in options]
+                      if options:
+                          options[-1].click()
                           page.wait_for_timeout(800)
                   else:
                       time.sleep(1)
-              raise RuntimeError('Could not switch the Zoom report from Meetings to Webinars.')
+              zoom_filter_diagnostic(page, date.today())
+              raise RuntimeError('Could not switch the Zoom report from Meetings to Webinars (now: '
+                                 + str(zoom_scope(page)) + ').')
 
 
           ZOOM_DATETIME = re.compile(r'\b(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}:\d{2}:\d{2})\s*([AP]M)\b')
@@ -3464,8 +3579,7 @@ jobs:
               start, end = event_date - timedelta(days=1), event_date
               open_registration_report(page)
               # Recorded order: From = previous day, To = event day, Meetings -> Webinars, Search.
-              zoom_pick_date(page, 'From', start)
-              zoom_pick_date(page, 'To', end)
+              zoom_set_dates(page, start, end, event_date)
               zoom_select_webinars(page)
               buttons = (zoom_visible(page.get_by_role('button', name='Search', exact=True))
                          or zoom_visible(page.get_by_text('Search', exact=True)))
