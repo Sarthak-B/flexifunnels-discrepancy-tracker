@@ -708,6 +708,31 @@ jobs:
                   return list(reader)
 
 
+          def sheet_matrices(event_date, datasets):
+              return {event_date.isoformat() + ' ' + label:
+                      [[row['name'], row['email'], row['phone']] for row in rows]
+                      for label, rows in datasets.items()}
+
+
+          def read_verified_snapshot(book, title_map, expected):
+              """Read the committed tabs back; calculations use these verified records."""
+              result = {}
+              for base_title, expected_rows in expected.items():
+                  sheet = book.worksheet(title_map[base_title])
+                  values = sheet.get_all_values(value_render_option='FORMULA')
+                  if not values or values[0] != ['name', 'email', 'phone']:
+                      raise RuntimeError('Imported tab headers could not be verified: ' + sheet.title)
+                  rows = []
+                  for row in values[1:]:
+                      if len(row) > 3 or not all(isinstance(cell, str) for cell in row):
+                          raise RuntimeError('Unexpected cells in imported tab: ' + sheet.title)
+                      rows.append(row + [''] * (3 - len(row)))
+                  if rows != expected_rows:
+                      raise RuntimeError('Saved tab differs from this run data: ' + sheet.title + '. Stats not updated.')
+                  result[base_title] = [dict(zip(('name', 'email', 'phone'), row)) for row in rows]
+              return result
+
+
           def run_complete_workflow():
               import gspread
               from google.oauth2.service_account import Credentials
@@ -726,17 +751,16 @@ jobs:
               if (len(utm_business) != snapshot['business_count']
                       or len(utm_reg) != snapshot['registration_count']):
                   raise RuntimeError('UTM snapshot counts do not match the saved records.')
-              ff_business = sorted_records(load_identity_csv(Path('reports/funnel-agent.csv')))
-              ff_reg = sorted_records(load_identity_csv(Path('reports/flexi-genie-regteam.csv')))
-              merged_utm = merge_utm_records(utm_business, utm_reg)
+              ff_business = load_identity_csv(Path('reports/funnel-agent.csv'))
+              ff_reg = load_identity_csv(Path('reports/flexi-genie-regteam.csv'))
 
               ac = ActiveCampaignReader(os.environ['ACTIVECAMPAIGN_API_URL'], os.environ['ACTIVECAMPAIGN_API_KEY'])
               contacts, selected_list = ac.event_contacts(event_date)
-              ac_rows = sorted_records(contacts)
+              ac_rows = contacts
               zoom_rows = [dict(row) for row in ac_rows]
               outdir = Path('comparison')
               outdir.mkdir(exist_ok=True)
-              invalid_utm = [row for row in merged_utm if match_key(row) is None]
+              invalid_utm = [row for row in utm_business + utm_reg if match_key(row) is None]
               invalid_zoom = [row for row in zoom_rows if match_key(row) is None]
               if invalid_utm or invalid_zoom:
                   write_rows(outdir / 'utm-identifiers-needing-review.csv', invalid_utm)
@@ -745,6 +769,39 @@ jobs:
                                      + ' UTM and ' + str(len(invalid_zoom))
                                      + ' Zoom records have incomplete/invalid identifiers. '
                                      + 'Review the comparison artifact; no Sheets data was written.')
+              # Validate destinations before importing; Stats is written only at the end.
+              credentials = Credentials.from_service_account_info(
+                  json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT_JSON']),
+                  scopes=['https://www.googleapis.com/auth/spreadsheets'],
+              )
+              client = gspread.authorize(credentials)
+              raw_book = client.open_by_key(os.environ['RAW_DATA_SHEET_ID'])
+              stats_book = client.open_by_key(os.environ['DISCREPANCY_SHEET_ID'])
+              if os.environ['UTM_SHEET_ID'] in (raw_book.id, stats_book.id):
+                  raise RuntimeError('Destination spreadsheet IDs must not point to the UTM source.')
+              stats_sheet = stats_book.worksheet(os.environ['DISCREPANCY_TAB_NAME'])
+              headers = [column['header'] for column in layout]
+              validate_stats_layout(stats_sheet, headers)
+              print('STAGE 1: Import source records into Descrepancy workbook:', raw_book.title)
+              source_datasets = {'IMPORT LANDING PAGE': ff_business, 'IMPORT LANDING PAGE REG': ff_reg,
+                                 'IMPORT UTM BUSINESS': utm_business, 'IMPORT UTM REG': utm_reg,
+                                 'IMPORT ACTIVE CAMPAIGN': ac_rows}
+              imported_matrices = sheet_matrices(event_date, source_datasets)
+              imported = publish_snapshot(raw_book, imported_matrices, os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT'])
+              publication = {'stage': 'sources_imported', 'raw_spreadsheet_id': raw_book.id,
+                             'source_tabs': imported['titles'], 'stats_status': 'not_written'}
+              (outdir / 'publication.json').write_text(json.dumps(publication, indent=2))
+              print('Imported tabs:', imported['titles'])
+              stored = read_verified_snapshot(raw_book, imported['titles'], imported_matrices)
+              key = lambda label: event_date.isoformat() + ' ' + label
+              ff_business = sorted_records(stored[key('IMPORT LANDING PAGE')])
+              ff_reg = sorted_records(stored[key('IMPORT LANDING PAGE REG')])
+              utm_business = stored[key('IMPORT UTM BUSINESS')]
+              utm_reg = stored[key('IMPORT UTM REG')]
+              ac_rows = sorted_records(stored[key('IMPORT ACTIVE CAMPAIGN')])
+              zoom_rows = [dict(row) for row in ac_rows]
+              print('STAGE 2: Merge, sort and compare the imported records.')
+              merged_utm = merge_utm_records(utm_business, utm_reg)
               zoom_keys = {match_key(row) for row in zoom_rows if match_key(row) is not None}
               discrepancy = [row for row in merged_utm if match_key(row) not in zoom_keys]
 
@@ -761,19 +818,16 @@ jobs:
               for label, rows in datasets.items():
                   write_rows(outdir / (label.lower().replace(' ', '-') + '.csv'), rows)
 
-              # All fetching and calculation completes before the first Sheets write.
-              credentials = Credentials.from_service_account_info(
-                  json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT_JSON']),
-                  scopes=['https://www.googleapis.com/auth/spreadsheets'],
-              )
-              client = gspread.authorize(credentials)
-              raw_book = client.open_by_key(os.environ['RAW_DATA_SHEET_ID'])
-              stats_book = client.open_by_key(os.environ['DISCREPANCY_SHEET_ID'])
-              if os.environ['UTM_SHEET_ID'] in (raw_book.id, stats_book.id):
-                  raise RuntimeError('Destination spreadsheet IDs must not point to the UTM source.')
-              stats_sheet = stats_book.worksheet(os.environ['DISCREPANCY_TAB_NAME'])
-              headers = [column['header'] for column in layout]
-              validate_stats_layout(stats_sheet, headers)
+              print('STAGE 3: Save and verify completed result tabs in Descrepancy.')
+              dated = sheet_matrices(event_date, datasets)
+              published = publish_snapshot(raw_book, dated, os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT'])
+              publication.update({'stage': 'results_saved', 'result_tabs': published['titles']})
+              (outdir / 'publication.json').write_text(json.dumps(publication, indent=2))
+              saved = read_verified_snapshot(raw_book, published['titles'], dated)
+              ff_business, ff_reg = saved[key('LANDING PAGE')], saved[key('LANDING PAGE REG')]
+              merged_utm, ac_rows = saved[key('UTM')], saved[key('ACTIVE CAMPAIGN')]
+              zoom_rows, discrepancy = saved[key('ZOOM')], saved[key('DESCREPANCY')]
+              print('STAGE 4: Append totals from verified result tabs to Discrepancy Stats.')
               run_key = os.environ['GITHUB_RUN_ID'] + '.' + os.environ['GITHUB_RUN_ATTEMPT']
               counts = {'event_date': event_date.isoformat(), 'range_start': expected_start.isoformat(),
                         'range_end': event_date.isoformat(), 'run_time': snapshot['captured_at'], 'run_key': run_key,
@@ -785,14 +839,14 @@ jobs:
                              'webinar_date': event_date.strftime('%d/%m/%Y'),
                              'webinar_type': '10 minute business'})
               stats_row = [counts[column['key']] for column in layout]
-              dated = {event_date.isoformat() + ' ' + label: [[row['name'], row['email'], row['phone']] for row in rows]
-                       for label, rows in datasets.items()}
-              published = publish_snapshot(raw_book, dated, os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT'])
               stats_status = append_summary_with_metadata(stats_book, stats_sheet, headers, stats_row, run_key, prefix_headers=True)
+              publication.update({'stage': 'complete', 'stats_status': stats_status})
+              (outdir / 'publication.json').write_text(json.dumps(publication, indent=2))
               (outdir / 'summary.json').write_text(json.dumps({
                   'start_date': expected_start.isoformat(), 'end_date': event_date.isoformat(),
                   'utm_event_date': event_date.isoformat(), 'timezone': snapshot['timezone'],
                   'matching_rule': 'email AND phone; FF comparison occurrences preserved; merged UTM deduplicated',
+                  'source_tabs': imported['titles'],
                   'reports': summary, 'totals': counts, 'published_tabs': published['titles'], 'stats_status': stats_status,
                   'activecampaign_list': selected_list,
                   'zoom_source': 'Exact copy of selected ActiveCampaign active contacts, as requested',
@@ -949,7 +1003,7 @@ jobs:
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
-          print('WORKFLOW REVISION: V16-R5 — latest UTM date drives the complete workflow')
+          print('WORKFLOW REVISION: V16-R6 — latest UTM date drives the complete workflow')
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
           PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
           LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
@@ -2112,9 +2166,9 @@ jobs:
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 16-R5: both CSVs verified; Google Sheets remain read-only.')
+                  print('VERSION 16-R6: both CSVs verified; Google Sheets remain read-only.')
               except Exception as error:
-                  print('VERSION 16-R5 stopped:', type(error).__name__, str(error))
+                  print('VERSION 16-R6 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
@@ -2138,7 +2192,7 @@ jobs:
           retention-days: 7
 
   compare-reports:
-    name: Merge, compare ActiveCampaign and publish to Sheets
+    name: Import to Descrepancy, process data and update Stats
     needs: [test-google-sheets, test-flexifunnels]
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -2774,6 +2828,31 @@ jobs:
                   return list(reader)
 
 
+          def sheet_matrices(event_date, datasets):
+              return {event_date.isoformat() + ' ' + label:
+                      [[row['name'], row['email'], row['phone']] for row in rows]
+                      for label, rows in datasets.items()}
+
+
+          def read_verified_snapshot(book, title_map, expected):
+              """Read the committed tabs back; calculations use these verified records."""
+              result = {}
+              for base_title, expected_rows in expected.items():
+                  sheet = book.worksheet(title_map[base_title])
+                  values = sheet.get_all_values(value_render_option='FORMULA')
+                  if not values or values[0] != ['name', 'email', 'phone']:
+                      raise RuntimeError('Imported tab headers could not be verified: ' + sheet.title)
+                  rows = []
+                  for row in values[1:]:
+                      if len(row) > 3 or not all(isinstance(cell, str) for cell in row):
+                          raise RuntimeError('Unexpected cells in imported tab: ' + sheet.title)
+                      rows.append(row + [''] * (3 - len(row)))
+                  if rows != expected_rows:
+                      raise RuntimeError('Saved tab differs from this run data: ' + sheet.title + '. Stats not updated.')
+                  result[base_title] = [dict(zip(('name', 'email', 'phone'), row)) for row in rows]
+              return result
+
+
           def run_complete_workflow():
               import gspread
               from google.oauth2.service_account import Credentials
@@ -2792,17 +2871,16 @@ jobs:
               if (len(utm_business) != snapshot['business_count']
                       or len(utm_reg) != snapshot['registration_count']):
                   raise RuntimeError('UTM snapshot counts do not match the saved records.')
-              ff_business = sorted_records(load_identity_csv(Path('reports/funnel-agent.csv')))
-              ff_reg = sorted_records(load_identity_csv(Path('reports/flexi-genie-regteam.csv')))
-              merged_utm = merge_utm_records(utm_business, utm_reg)
+              ff_business = load_identity_csv(Path('reports/funnel-agent.csv'))
+              ff_reg = load_identity_csv(Path('reports/flexi-genie-regteam.csv'))
 
               ac = ActiveCampaignReader(os.environ['ACTIVECAMPAIGN_API_URL'], os.environ['ACTIVECAMPAIGN_API_KEY'])
               contacts, selected_list = ac.event_contacts(event_date)
-              ac_rows = sorted_records(contacts)
+              ac_rows = contacts
               zoom_rows = [dict(row) for row in ac_rows]
               outdir = Path('comparison')
               outdir.mkdir(exist_ok=True)
-              invalid_utm = [row for row in merged_utm if match_key(row) is None]
+              invalid_utm = [row for row in utm_business + utm_reg if match_key(row) is None]
               invalid_zoom = [row for row in zoom_rows if match_key(row) is None]
               if invalid_utm or invalid_zoom:
                   write_rows(outdir / 'utm-identifiers-needing-review.csv', invalid_utm)
@@ -2811,6 +2889,39 @@ jobs:
                                      + ' UTM and ' + str(len(invalid_zoom))
                                      + ' Zoom records have incomplete/invalid identifiers. '
                                      + 'Review the comparison artifact; no Sheets data was written.')
+              # Validate destinations before importing; Stats is written only at the end.
+              credentials = Credentials.from_service_account_info(
+                  json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT_JSON']),
+                  scopes=['https://www.googleapis.com/auth/spreadsheets'],
+              )
+              client = gspread.authorize(credentials)
+              raw_book = client.open_by_key(os.environ['RAW_DATA_SHEET_ID'])
+              stats_book = client.open_by_key(os.environ['DISCREPANCY_SHEET_ID'])
+              if os.environ['UTM_SHEET_ID'] in (raw_book.id, stats_book.id):
+                  raise RuntimeError('Destination spreadsheet IDs must not point to the UTM source.')
+              stats_sheet = stats_book.worksheet(os.environ['DISCREPANCY_TAB_NAME'])
+              headers = [column['header'] for column in layout]
+              validate_stats_layout(stats_sheet, headers)
+              print('STAGE 1: Import source records into Descrepancy workbook:', raw_book.title)
+              source_datasets = {'IMPORT LANDING PAGE': ff_business, 'IMPORT LANDING PAGE REG': ff_reg,
+                                 'IMPORT UTM BUSINESS': utm_business, 'IMPORT UTM REG': utm_reg,
+                                 'IMPORT ACTIVE CAMPAIGN': ac_rows}
+              imported_matrices = sheet_matrices(event_date, source_datasets)
+              imported = publish_snapshot(raw_book, imported_matrices, os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT'])
+              publication = {'stage': 'sources_imported', 'raw_spreadsheet_id': raw_book.id,
+                             'source_tabs': imported['titles'], 'stats_status': 'not_written'}
+              (outdir / 'publication.json').write_text(json.dumps(publication, indent=2))
+              print('Imported tabs:', imported['titles'])
+              stored = read_verified_snapshot(raw_book, imported['titles'], imported_matrices)
+              key = lambda label: event_date.isoformat() + ' ' + label
+              ff_business = sorted_records(stored[key('IMPORT LANDING PAGE')])
+              ff_reg = sorted_records(stored[key('IMPORT LANDING PAGE REG')])
+              utm_business = stored[key('IMPORT UTM BUSINESS')]
+              utm_reg = stored[key('IMPORT UTM REG')]
+              ac_rows = sorted_records(stored[key('IMPORT ACTIVE CAMPAIGN')])
+              zoom_rows = [dict(row) for row in ac_rows]
+              print('STAGE 2: Merge, sort and compare the imported records.')
+              merged_utm = merge_utm_records(utm_business, utm_reg)
               zoom_keys = {match_key(row) for row in zoom_rows if match_key(row) is not None}
               discrepancy = [row for row in merged_utm if match_key(row) not in zoom_keys]
 
@@ -2827,19 +2938,16 @@ jobs:
               for label, rows in datasets.items():
                   write_rows(outdir / (label.lower().replace(' ', '-') + '.csv'), rows)
 
-              # All fetching and calculation completes before the first Sheets write.
-              credentials = Credentials.from_service_account_info(
-                  json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT_JSON']),
-                  scopes=['https://www.googleapis.com/auth/spreadsheets'],
-              )
-              client = gspread.authorize(credentials)
-              raw_book = client.open_by_key(os.environ['RAW_DATA_SHEET_ID'])
-              stats_book = client.open_by_key(os.environ['DISCREPANCY_SHEET_ID'])
-              if os.environ['UTM_SHEET_ID'] in (raw_book.id, stats_book.id):
-                  raise RuntimeError('Destination spreadsheet IDs must not point to the UTM source.')
-              stats_sheet = stats_book.worksheet(os.environ['DISCREPANCY_TAB_NAME'])
-              headers = [column['header'] for column in layout]
-              validate_stats_layout(stats_sheet, headers)
+              print('STAGE 3: Save and verify completed result tabs in Descrepancy.')
+              dated = sheet_matrices(event_date, datasets)
+              published = publish_snapshot(raw_book, dated, os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT'])
+              publication.update({'stage': 'results_saved', 'result_tabs': published['titles']})
+              (outdir / 'publication.json').write_text(json.dumps(publication, indent=2))
+              saved = read_verified_snapshot(raw_book, published['titles'], dated)
+              ff_business, ff_reg = saved[key('LANDING PAGE')], saved[key('LANDING PAGE REG')]
+              merged_utm, ac_rows = saved[key('UTM')], saved[key('ACTIVE CAMPAIGN')]
+              zoom_rows, discrepancy = saved[key('ZOOM')], saved[key('DESCREPANCY')]
+              print('STAGE 4: Append totals from verified result tabs to Discrepancy Stats.')
               run_key = os.environ['GITHUB_RUN_ID'] + '.' + os.environ['GITHUB_RUN_ATTEMPT']
               counts = {'event_date': event_date.isoformat(), 'range_start': expected_start.isoformat(),
                         'range_end': event_date.isoformat(), 'run_time': snapshot['captured_at'], 'run_key': run_key,
@@ -2851,14 +2959,14 @@ jobs:
                              'webinar_date': event_date.strftime('%d/%m/%Y'),
                              'webinar_type': '10 minute business'})
               stats_row = [counts[column['key']] for column in layout]
-              dated = {event_date.isoformat() + ' ' + label: [[row['name'], row['email'], row['phone']] for row in rows]
-                       for label, rows in datasets.items()}
-              published = publish_snapshot(raw_book, dated, os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT'])
               stats_status = append_summary_with_metadata(stats_book, stats_sheet, headers, stats_row, run_key, prefix_headers=True)
+              publication.update({'stage': 'complete', 'stats_status': stats_status})
+              (outdir / 'publication.json').write_text(json.dumps(publication, indent=2))
               (outdir / 'summary.json').write_text(json.dumps({
                   'start_date': expected_start.isoformat(), 'end_date': event_date.isoformat(),
                   'utm_event_date': event_date.isoformat(), 'timezone': snapshot['timezone'],
                   'matching_rule': 'email AND phone; FF comparison occurrences preserved; merged UTM deduplicated',
+                  'source_tabs': imported['titles'],
                   'reports': summary, 'totals': counts, 'published_tabs': published['titles'], 'stats_status': stats_status,
                   'activecampaign_list': selected_list,
                   'zoom_source': 'Exact copy of selected ActiveCampaign active contacts, as requested',
