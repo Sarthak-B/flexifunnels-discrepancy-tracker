@@ -3119,77 +3119,148 @@ jobs:
                   pass
 
 
+          def zoom_click_first(page, texts, description, seconds=30):
+              """Click the first visible element whose exact text is one of `texts`."""
+              deadline = time.monotonic() + seconds
+              while time.monotonic() < deadline:
+                  for text in texts:
+                      found = (zoom_visible(page.get_by_role('link', name=text, exact=True))
+                               or zoom_visible(page.get_by_text(text, exact=True)))
+                      if found:
+                          found[0].click()
+                          return text
+                  time.sleep(0.5)
+              raise RuntimeError('Zoom ' + description + ' was not found.')
+
+
           def open_registration_report(page):
-              # Recorded flow: a direct link lands on Usage reports; click through to the report.
-              print('Zoom: opening Usage reports, then Meeting and webinar registrations.')
-              page.goto('https://us06web.zoom.us/account/report?isPersonal=true#/usageReports',
-                        wait_until='domcontentloaded')
+              # The user's recorded path: Profile -> Reports -> Meetings & Webinars -> registrations report.
+              print('Zoom: Profile -> Reports -> Meetings & Webinars -> Meeting and webinar registrations.')
+              if urlparse(page.url).path.rstrip('/') != '/profile':
+                  page.goto('https://us06web.zoom.us/profile', wait_until='domcontentloaded')
+              if not zoom_visible(page.get_by_text('Meetings & Webinars', exact=True)):
+                  zoom_click_first(page, ['Reports'], 'Reports menu')
+                  page.wait_for_timeout(1500)
+              zoom_click_first(page, ['Meetings & Webinars', 'Meetings and Webinars'], 'Meetings & Webinars menu')
+              page.wait_for_timeout(2500)
               deadline = time.monotonic() + 60
               while time.monotonic() < deadline and not zoom_on_registration_report(page):
                   links = (zoom_visible(page.get_by_role('link', name='Meeting and webinar registrations', exact=True))
-                           or zoom_visible(page.get_by_text('Meeting and webinar registrations', exact=True)))
+                           or zoom_visible(page.get_by_text('Meeting and webinar registrations', exact=True))
+                           or zoom_visible(page.get_by_text(re.compile(r'^\s*Meeting and webinar registrations?\s*$', re.I))))
                   if links:
                       links[0].click()
-                      page.wait_for_timeout(2000)
+                      page.wait_for_timeout(2500)
                   else:
                       time.sleep(0.5)
               if not zoom_on_registration_report(page):
-                  print('Zoom: route reached:', zoom_route(page))
-                  raise RuntimeError('Could not open the Meeting and webinar registrations report.')
-              shown = zoom_wait_range(page, 45)
-              if shown is None:
                   zoom_filter_diagnostic(page, date.today())
                   print('Zoom: route reached:', zoom_route(page))
-                  raise RuntimeError('Registration report opened, but its From/To dates could not be read '
-                                     '(not in the date boxes or the page address). See filters.png.')
-              print('Zoom: report opened; range shown:', shown[0].isoformat(), 'to', shown[1].isoformat())
-              return shown
+                  raise RuntimeError('Could not open the Meeting and webinar registrations report. See filters.png.')
+              # Wait for the From/To controls to render.
+              zoom_one(page.get_by_text('From', exact=True), 'From label', seconds=45)
+              zoom_one(page.get_by_text('To', exact=True), 'To label', seconds=15)
+              print('Zoom: registrations report opened.')
 
 
-          def zoom_apply_range_in_url(page, start, end):
-              route, _, query = urlparse(page.url).fragment.partition('?')
-              params = dict(parse_qsl(query, keep_blank_values=True))
-              params.update({'dateFrom': start.isoformat(), 'dateTo': end.isoformat(),
-                             'meetingScope': 'webinar', 'page': '1'})
-              page.evaluate('h => { window.location.hash = h; }', route + '?' + urlencode(params))
-              page.wait_for_timeout(3000)
+          ZOOM_MONTHS = 'January February March April May June July August September October November December'.split()
 
 
-          def zoom_set_range(page, event_date, shown):
-              """Make sure the report's date range includes the event date."""
-              if shown[0] <= event_date <= shown[1]:
-                  print('Zoom: the shown range already includes', event_date.isoformat())
-                  return shown
-              today_ist = datetime.now(ZoneInfo('Asia/Kolkata')).date()
-              start, end = event_date, max(event_date, min(event_date + timedelta(days=1), today_ist))
-              print('Zoom: changing the report range to', start.isoformat(), 'to', end.isoformat())
-              zoom_apply_range_in_url(page, start, end)
-              shown = zoom_wait_range(page, 15)
-              if shown and shown[0] <= event_date <= shown[1]:
-                  return shown
-              page.reload(wait_until='domcontentloaded')
-              page.wait_for_timeout(3000)
-              if not zoom_on_registration_report(page):
-                  open_registration_report(page)
-              shown = zoom_wait_range(page, 30)
-              if shown and shown[0] <= event_date <= shown[1]:
-                  return shown
-              # Last resort: type into the date boxes when Zoom allows it.
-              boxes = [el for el in zoom_visible(page.locator('input')) if zoom_date_value(el.input_value())]
-              if shown and len(boxes) == 2 and all(box.is_editable() for box in boxes):
-                  order = [(1, end), (0, start)] if start > shown[1] else [(0, start), (1, end)]
-                  for index, day in order:
-                      boxes[index].click()
-                      boxes[index].fill(day.strftime('%m/%d/%Y'))
-                      boxes[index].press('Enter')
-                      page.keyboard.press('Escape')
-                      page.wait_for_timeout(700)
-                  shown = zoom_wait_range(page, 10)
-                  if shown and shown[0] <= event_date <= shown[1]:
-                      return shown
-              zoom_filter_diagnostic(page, event_date)
-              raise RuntimeError('Zoom report range could not be set to include ' + event_date.isoformat()
-                                 + ' (shown: ' + str(shown) + '). See filters.png.')
+          def zoom_date_box(page, label):
+              """The date box that follows the visible 'From' or 'To' label."""
+              caption = zoom_one(page.get_by_text(label, exact=True), label + ' label', seconds=15)
+              box = caption.locator('xpath=following::input[1]')
+              if box.count() == 1 and box.is_visible():
+                  return box
+              raise RuntimeError('Zoom ' + label + ' date box was not found next to its label.')
+
+
+          def zoom_calendar(page):
+              """The open calendar popup: the block around a 'Month YYYY' header that holds day numbers."""
+              header_pattern = re.compile(r'^\s*(' + '|'.join(ZOOM_MONTHS) + r')\s+(\d{4})\s*$')
+              deadline = time.monotonic() + 10
+              while time.monotonic() < deadline:
+                  headers = zoom_visible(page.get_by_text(header_pattern))
+                  if headers:
+                      header = headers[-1]
+                      popup = header.locator("xpath=ancestor::*[.//*[normalize-space(.)='28'] "
+                                             "and .//*[normalize-space(.)='14']][1]")
+                      if popup.count() == 1 and popup.is_visible():
+                          month, year = header_pattern.match(header.inner_text()).groups()
+                          return popup, header, (int(year), ZOOM_MONTHS.index(month) + 1)
+                  time.sleep(0.25)
+              raise RuntimeError('Zoom calendar did not open.')
+
+
+          def zoom_calendar_arrows(popup, header):
+              """Return (previous-month, next-month) controls: the arrows nearest the month header."""
+              head = header.bounding_box()
+              middle = head['y'] + head['height'] / 2
+              left, right = [], []
+              for item in zoom_visible(popup.locator('button, [role="button"], a, i, svg, span')):
+                  box = item.bounding_box()
+                  if not box or box['width'] > 40 or abs(box['y'] + box['height'] / 2 - middle) > 15:
+                      continue
+                  if (item.inner_text() or '').strip() and not re.fullmatch(r'[<>‹›«»]+', item.inner_text().strip()):
+                      continue
+                  centre = box['x'] + box['width'] / 2
+                  if centre < head['x']:
+                      left.append((centre, item))
+                  elif centre > head['x'] + head['width']:
+                      right.append((centre, item))
+              previous = max(left, key=lambda entry: entry[0])[1] if left else None
+              following = min(right, key=lambda entry: entry[0])[1] if right else None
+              return previous, following
+
+
+          def zoom_pick_date(page, label, target):
+              """Open the From/To calendar and click the target day, as in the recording."""
+              box = zoom_date_box(page, label)
+              box.click()
+              page.wait_for_timeout(700)
+              popup, header, shown = zoom_calendar(page)
+              for _ in range(24):
+                  wanted = (target.year, target.month)
+                  if shown == wanted:
+                      break
+                  previous, following = zoom_calendar_arrows(popup, header)
+                  arrow = previous if shown > wanted else following
+                  if arrow is None:
+                      raise RuntimeError('Zoom calendar month arrows were not found.')
+                  arrow.click()
+                  page.wait_for_timeout(500)
+                  popup, header, shown = zoom_calendar(page)
+              else:
+                  raise RuntimeError('Zoom calendar could not reach ' + target.strftime('%B %Y') + '.')
+              # Day cells in grid order. Leading cells from the previous month are always >= 22,
+              # so the first "1" is the 1st of the shown month and the target follows from it.
+              cells = popup.locator("xpath=.//*[not(*) and string-length(normalize-space(.)) >= 1 "
+                                    "and string-length(normalize-space(.)) <= 2]")
+              info = cells.evaluate_all('''els => els.map(el => {
+                  const owner = el.closest('td, [role="gridcell"], button') || el.parentElement || el;
+                  const cls = String(el.className && el.className.baseVal !== undefined ? el.className.baseVal : (el.className || ''))
+                            + ' ' + String(owner.className || '');
+                  const r = el.getBoundingClientRect();
+                  return {text: (el.textContent || '').trim(), visible: r.width > 0 && r.height > 0,
+                          disabled: !!el.closest('[aria-disabled="true"], [disabled]') || /disabled/i.test(cls)};
+              })''')
+              days = [index for index, cell in enumerate(info) if cell['visible'] and cell['text'].isdigit()]
+              first = next((position for position, index in enumerate(days) if info[index]['text'] == '1'), None)
+              if first is None or first + target.day - 1 >= len(days):
+                  raise RuntimeError('Zoom calendar day grid could not be read.')
+              index = days[first + target.day - 1]
+              if info[index]['text'] != str(target.day):
+                  raise RuntimeError('Zoom calendar day grid is out of order; ' + target.isoformat() + ' not clicked.')
+              if info[index]['disabled']:
+                  raise RuntimeError('Zoom calendar day ' + target.isoformat() + ' is greyed out (not selectable).')
+              cells.nth(index).click()
+              page.wait_for_timeout(800)
+              value = zoom_date_value(box.input_value()) if box.count() == 1 else None
+              if value is not None and value != target:
+                  raise RuntimeError('Zoom ' + label + ' shows ' + value.isoformat() + ' after picking '
+                                     + target.isoformat() + '.')
+              print('Zoom: ' + label + ' set to', target.isoformat(),
+                    '(confirmed in box)' if value == target else '(box value not readable; checked after Search)')
 
 
           def zoom_select_webinars(page):
@@ -3251,9 +3322,11 @@ jobs:
 
 
           def export_zoom(page, event_date, outdir):
-              shown = open_registration_report(page)
-              zoom_select_webinars(page)
-              zoom_set_range(page, event_date, shown)
+              start, end = event_date - timedelta(days=1), event_date
+              open_registration_report(page)
+              # Recorded order: From = previous day, To = event day, Meetings -> Webinars, Search.
+              zoom_pick_date(page, 'From', start)
+              zoom_pick_date(page, 'To', end)
               zoom_select_webinars(page)
               buttons = (zoom_visible(page.get_by_role('button', name='Search', exact=True))
                          or zoom_visible(page.get_by_text('Search', exact=True)))
@@ -3282,7 +3355,11 @@ jobs:
                   raise RuntimeError('Zoom search did not produce a stable results table.')
               shown = zoom_displayed_range(page)
               print('Zoom: results =', total, '| rows read =', len(records), '| range =',
-                    (shown[0].isoformat() + ' to ' + shown[1].isoformat()) if shown else 'unknown')
+                    (shown[0].isoformat() + ' to ' + shown[1].isoformat()) if shown else 'not readable')
+              if shown is not None and shown != (start, end):
+                  zoom_filter_diagnostic(page, event_date)
+                  raise RuntimeError('Zoom range after Search is ' + str(shown) + ', expected '
+                                     + str((start, end)) + '. No export requested.')
               if total != len(records):
                   zoom_filter_diagnostic(page, event_date)
                   raise RuntimeError('Zoom shows ' + str(total) + ' results but ' + str(len(records))
