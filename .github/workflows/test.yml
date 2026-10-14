@@ -3030,6 +3030,11 @@ jobs:
                       + '&dateTo=' + event_date.isoformat() + '&meetingScope=webinar&page=1')
 
 
+          import re
+          from urllib.parse import parse_qsl, urlencode
+          from zoneinfo import ZoneInfo
+
+
           def zoom_date_value(value):
               value = ' '.join(str(value).split())
               for pattern in ('%m/%d/%Y', '%Y-%m-%d', '%Y/%m/%d', '%m-%d-%Y',
@@ -3041,253 +3046,239 @@ jobs:
               return None
 
 
-          def zoom_all_inputs(page):
-              # Zoom sometimes renders report filters inside an iframe.
-              found = []
-              for frame in page.frames:
-                  try:
-                      found.extend(zoom_visible(frame.locator('input')))
-                  except Exception:
-                      pass
-              return found
+          def zoom_route(page):
+              # Report route and filter parameters only; no cookies or tokens live here.
+              parsed = urlparse(page.url)
+              return parsed.path + ('#' + parsed.fragment if parsed.fragment else '')
 
 
-          def zoom_date_fields(page, seconds=30):
-              """Return (From, To) inputs, or None when Zoom does not expose them as inputs."""
-              date_hint = re.compile(r'date|from|start|end|mm|yyyy', re.IGNORECASE)
+          def zoom_on_registration_report(page):
+              return 'meetingRegistration' in urlparse(page.url).fragment
+
+
+          def zoom_displayed_range(page):
+              """Read the From/To dates shown on the report, whatever the input styling."""
+              try:
+                  values = page.evaluate('''() => Array.from(document.querySelectorAll('input'))
+                      .filter(el => el.offsetParent !== null)
+                      .map(el => el.value || '')''')
+              except Exception:
+                  return None
+              dates = [zoom_date_value(value) for value in values]
+              dates = [day for day in dates if day is not None]
+              if len(dates) != 2:
+                  return None
+              return dates[0], dates[1]
+
+
+          def zoom_wait_range(page, seconds=30):
               deadline = time.monotonic() + seconds
               while time.monotonic() < deadline:
-                  for frame in page.frames:
-                      try:
-                          starts = zoom_visible(frame.get_by_label(re.compile(r'^\s*(From|Start date)\s*:?\s*$', re.I)))
-                          ends = zoom_visible(frame.get_by_label(re.compile(r'^\s*(To|End date)\s*:?\s*$', re.I)))
-                      except Exception:
-                          continue
-                      if len(starts) == len(ends) == 1:
-                          return starts[0], ends[0]
-                  candidates = []
-                  for element in zoom_all_inputs(page):
-                      try:
-                          value = element.input_value().strip()
-                      except Exception:
-                          continue
-                      hints = ' '.join(element.get_attribute(a) or '' for a in ('placeholder', 'aria-label', 'name', 'id', 'class'))
-                      if (zoom_date_value(value) is not None or element.get_attribute('type') == 'date'
-                              or (not value and date_hint.search(hints))):
-                          candidates.append(element)
-                  dated = [e for e in candidates if zoom_date_value(e.input_value()) is not None]
-                  for group in (dated, candidates):
-                      if len(group) == 2:
-                          boxes = [(e.bounding_box(), e) for e in group]
-                          if all(box for box, _ in boxes):
-                              boxes.sort(key=lambda entry: (entry[0]['y'], entry[0]['x']))
-                              return boxes[0][1], boxes[1][1]
-                  time.sleep(0.3)
+                  shown = zoom_displayed_range(page)
+                  if shown:
+                      return shown
+                  time.sleep(0.5)
               return None
-
-
-          def zoom_url_range_ok(page, event_date):
-              fragment = urlparse(page.url).fragment
-              previous = (event_date - timedelta(days=1)).isoformat()
-              return ('dateFrom=' + previous in fragment and 'dateTo=' + event_date.isoformat() in fragment
-                      and 'meetingScope=webinar' in fragment)
 
 
           def zoom_filter_diagnostic(page, event_date):
               Path('zoom-diagnostics').mkdir(exist_ok=True)
-              controls = []
-              for element in zoom_all_inputs(page):
-                  try:
-                      value = element.input_value().strip()
-                  except Exception:
-                      value = ''
-                  controls.append({'type': element.get_attribute('type'),
-                                   'placeholder': element.get_attribute('placeholder'),
-                                   'aria_label': element.get_attribute('aria-label'),
-                                   'name': element.get_attribute('name'),
-                                   'class': element.get_attribute('class'),
-                                   'readonly': element.get_attribute('readonly') is not None,
-                                   'date_value': value if zoom_date_value(value) else None})
-              frames = [urlparse(f.url)._replace(query='', fragment='').geturl() for f in page.frames]
+              try:
+                  inputs = page.evaluate('''() => Array.from(document.querySelectorAll('input')).map(el => ({
+                      type: el.type, placeholder: el.placeholder, readonly: el.readOnly,
+                      visible: el.offsetParent !== null, cls: String(el.className || ''),
+                      value: /^\\d{1,4}[\\/-]\\d{1,2}[\\/-]\\d{1,4}$/.test(el.value || '') ? el.value : (el.value ? '[text]' : '')
+                  }))''')
+              except Exception:
+                  inputs = []
               (Path('zoom-diagnostics') / 'filters.json').write_text(json.dumps({
-                  'expected_from': (event_date - timedelta(days=1)).isoformat(),
-                  'expected_to': event_date.isoformat(), 'frames': frames,
-                  'visible_input_controls': controls}, indent=2))
+                  'event_date': event_date.isoformat(), 'route': zoom_route(page), 'inputs': inputs}, indent=2))
               try:
                   page.screenshot(path='zoom-diagnostics/filters.png', full_page=True)
               except Exception:
                   pass
 
 
-          def set_zoom_filters(page, event_date):
-              zoom_one(page.get_by_text('Meeting and webinar registrations', exact=True), 'registration report')
-              fields = zoom_date_fields(page)
-              if fields is None:
-                  zoom_filter_diagnostic(page, event_date)
-                  if not zoom_url_range_ok(page, event_date):
-                      raise RuntimeError('Zoom date inputs not found and the report URL does not carry the '
-                                         'required range. See filters.json and filters.png.')
-                  print('Zoom: date inputs not exposed as text fields; using the range in the report URL. '
-                        'The webinar row and CSV are still checked against the event date.')
-                  return 'url'
-              start, end = fields
-              expected = (event_date - timedelta(days=1), event_date)
-              for description, element, day in [('From', start, expected[0]), ('To', end, expected[1])]:
-                  old = element.input_value().strip()
-                  print('Zoom ' + description + ': observed=' + old + '; required=' + day.isoformat())
-                  if zoom_date_value(old) == day:
-                      continue
-                  if not element.is_editable():
-                      zoom_filter_diagnostic(page, event_date)
-                      raise RuntimeError('Zoom ' + description + ' date input is read-only and shows a different date. See filters.json and filters.png.')
-                  pattern = '%Y-%m-%d' if (element.get_attribute('type') == 'date'
-                                            or re.fullmatch(r'\d{4}-\d{2}-\d{2}', old)) else '%m/%d/%Y'
-                  element.fill(day.strftime(pattern))
-                  element.press('Tab')  # Commit Zoom's controlled date input on blur.
-              # Set the recorded Meetings/Webinars dropdown explicitly too.
-              native = []
-              for select in zoom_visible(page.locator('select')):
-                  labels = select.locator('option').all_text_contents()
-                  if 'Webinars' in [label.strip() for label in labels]:
-                      native.append(select)
-              if len(native) == 1:
-                  native[0].select_option(label='Webinars')
-              elif len(native) > 1:
-                  raise RuntimeError('Zoom webinar-scope dropdown is ambiguous.')
-              elif not zoom_visible(page.get_by_text('Webinars', exact=True)):
-                  zoom_click(page, 'Meetings')
-                  zoom_click(page, 'Webinars')
-              verify_zoom_filters(page, event_date, 'inputs')
-              return 'inputs'
+          def open_registration_report(page):
+              # Recorded flow: a direct link lands on Usage reports; click through to the report.
+              print('Zoom: opening Usage reports, then Meeting and webinar registrations.')
+              page.goto('https://us06web.zoom.us/account/report?isPersonal=true#/usageReports',
+                        wait_until='domcontentloaded')
+              deadline = time.monotonic() + 60
+              while time.monotonic() < deadline and not zoom_on_registration_report(page):
+                  links = (zoom_visible(page.get_by_role('link', name='Meeting and webinar registrations', exact=True))
+                           or zoom_visible(page.get_by_text('Meeting and webinar registrations', exact=True)))
+                  if links:
+                      links[0].click()
+                      page.wait_for_timeout(2000)
+                  else:
+                      time.sleep(0.5)
+              if not zoom_on_registration_report(page):
+                  print('Zoom: route reached:', zoom_route(page))
+                  raise RuntimeError('Could not open the Meeting and webinar registrations report.')
+              shown = zoom_wait_range(page, 45)
+              if shown is None:
+                  raise RuntimeError('Registration report opened, but its From/To dates could not be read.')
+              print('Zoom: report opened; range shown:', shown[0].isoformat(), 'to', shown[1].isoformat())
+              return shown
 
 
-          def verify_zoom_filters(page, event_date, mode='inputs'):
-              expected = (event_date - timedelta(days=1), event_date)
-              if mode == 'url':
-                  if zoom_url_range_ok(page, event_date):
-                      print('Zoom search range (from URL):', expected[0].isoformat(), 'through', expected[1].isoformat())
-                  else:
-                      print('Zoom: URL range changed after Search; relying on the webinar row and CSV date checks.')
-                  return
-              deadline = time.monotonic() + 15
-              matched_since = None
-              observed = ('', '')
-              while time.monotonic() < deadline:
-                  fields = zoom_date_fields(page, seconds=2)
-                  if fields is None:
-                      time.sleep(0.25)
-                      continue
-                  start, end = fields
-                  observed = (start.input_value().strip(), end.input_value().strip())
-                  if tuple(zoom_date_value(value) for value in observed) == expected:
-                      if matched_since is None:
-                          matched_since = time.monotonic()
-                      if time.monotonic() - matched_since >= 1:
-                          selected_native = [select for select in zoom_visible(page.locator('select'))
-                                             if select.locator('option:checked').count() == 1
-                                             and select.locator('option:checked').inner_text().strip() == 'Webinars']
-                          if len(selected_native) > 1:
-                              raise RuntimeError('Zoom selected Webinars scope is ambiguous.')
-                          if not selected_native:
-                              zoom_one(page.get_by_text('Webinars', exact=True), 'selected Webinars scope')
-                          print('Zoom search range verified:', expected[0].isoformat(), 'through', expected[1].isoformat())
-                          return
-                  else:
-                      matched_since = None
-                  time.sleep(0.25)
+          def zoom_apply_range_in_url(page, start, end):
+              route, _, query = urlparse(page.url).fragment.partition('?')
+              params = dict(parse_qsl(query, keep_blank_values=True))
+              params.update({'dateFrom': start.isoformat(), 'dateTo': end.isoformat(),
+                             'meetingScope': 'webinar', 'page': '1'})
+              page.evaluate('h => { window.location.hash = h; }', route + '?' + urlencode(params))
+              page.wait_for_timeout(3000)
+
+
+          def zoom_set_range(page, event_date, shown):
+              """Make sure the report's date range includes the event date."""
+              if shown[0] <= event_date <= shown[1]:
+                  print('Zoom: the shown range already includes', event_date.isoformat())
+                  return shown
+              today_ist = datetime.now(ZoneInfo('Asia/Kolkata')).date()
+              start, end = event_date, max(event_date, min(event_date + timedelta(days=1), today_ist))
+              print('Zoom: changing the report range to', start.isoformat(), 'to', end.isoformat())
+              zoom_apply_range_in_url(page, start, end)
+              shown = zoom_wait_range(page, 15)
+              if shown and shown[0] <= event_date <= shown[1]:
+                  return shown
+              page.reload(wait_until='domcontentloaded')
+              page.wait_for_timeout(3000)
+              if not zoom_on_registration_report(page):
+                  open_registration_report(page)
+              shown = zoom_wait_range(page, 30)
+              if shown and shown[0] <= event_date <= shown[1]:
+                  return shown
+              # Last resort: type into the date boxes when Zoom allows it.
+              boxes = [el for el in zoom_visible(page.locator('input')) if zoom_date_value(el.input_value())]
+              if shown and len(boxes) == 2 and all(box.is_editable() for box in boxes):
+                  order = [(1, end), (0, start)] if start > shown[1] else [(0, start), (1, end)]
+                  for index, day in order:
+                      boxes[index].click()
+                      boxes[index].fill(day.strftime('%m/%d/%Y'))
+                      boxes[index].press('Enter')
+                      page.keyboard.press('Escape')
+                      page.wait_for_timeout(700)
+                  shown = zoom_wait_range(page, 10)
+                  if shown and shown[0] <= event_date <= shown[1]:
+                      return shown
               zoom_filter_diagnostic(page, event_date)
-              raise RuntimeError('Zoom From/To fields did not retain the selected dates: observed '
-                                 + str(observed) + '; expected ' + str(tuple(day.isoformat() for day in expected))
-                                 + '. No export requested; see filters.json.')
+              raise RuntimeError('Zoom report range could not be set to include ' + event_date.isoformat()
+                                 + ' (shown: ' + str(shown) + '). See filters.png.')
+
+
+          def zoom_select_webinars(page):
+              # Recorded control: a dropdown showing "Meetings" with a "Webinars" option.
+              for _ in range(4):
+                  meetings = zoom_visible(page.get_by_text('Meetings', exact=True))
+                  webinars = zoom_visible(page.get_by_text('Webinars', exact=True))
+                  if webinars and not meetings:
+                      return
+                  if len(meetings) == 1:
+                      meetings[0].click()
+                      page.wait_for_timeout(800)
+                      options = zoom_visible(page.get_by_text('Webinars', exact=True))
+                      if len(options) == 1:
+                          options[0].click()
+                          page.wait_for_timeout(800)
+                  else:
+                      time.sleep(1)
+              raise RuntimeError('Could not switch the Zoom report from Meetings to Webinars.')
+
+
+          ZOOM_DATETIME = re.compile(r'\b(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}:\d{2}:\d{2})\s*([AP]M)\b')
+
+
+          def zoom_rows(page):
+              # Each result row has its own Generate button; read the row around it.
+              result = []
+              for button in zoom_visible(page.get_by_text('Generate', exact=True)):
+                  row = button.locator("xpath=ancestor::*[self::tr or @role='row'][1]")
+                  if row.count() != 1:
+                      row = button.locator("xpath=ancestor::*[.//text()[contains(., '/20')]][1]")
+                  if row.count() != 1:
+                      continue
+                  text = zoom_text(row.inner_text())
+                  stamp = ZOOM_DATETIME.search(text)
+                  meeting_id = re.search(r'\b\d{3}\s?\d{3,4}\s?\d{4}\b', text)
+                  result.append({'topic_ok': zoom_text(ZOOM_TOPIC) in text,
+                                 'type': 'Webinar' if re.search(r'\bWebinar\b', text) else '',
+                                 'scheduled': ' '.join(stamp.groups()) if stamp else '',
+                                 'id': meeting_id.group() if meeting_id else '',
+                                 'generate': button})
+              return result
 
 
           def select_zoom_row(records, event_date):
               candidates = []
               for record in records:
-                  if (zoom_text(record['topic']) == zoom_text(ZOOM_TOPIC)
-                          and record['type'].strip() == 'Webinar'):
-                      scheduled = datetime.strptime(zoom_text(record['scheduled']), '%m/%d/%Y %I:%M:%S %p')
+                  if record['topic_ok'] and record['type'] == 'Webinar' and record['scheduled']:
+                      scheduled = datetime.strptime(record['scheduled'], '%m/%d/%Y %I:%M:%S %p')
                       if scheduled.date() == event_date:
                           candidates.append(record)
               if len(candidates) != 1:
-                  raise RuntimeError('Expected exactly one Zoom webinar matching the topic and UTM event date '
+                  raise RuntimeError('Expected exactly one Zoom webinar matching the topic and event date '
                                      + event_date.isoformat() + '; found ' + str(len(candidates))
-                                     + '. A previous-day webinar will not be substituted.')
+                                     + '. A different day\'s webinar will not be substituted.')
               return candidates[0]
 
 
-          def zoom_rows(page):
-              # Map columns from the observed table headings; no positional page-wide clicks.
-              tables = page.get_by_role('table')
-              selected = []
-              required = ['Topic', 'Type', 'ID', 'Host', 'Scheduled time', 'Registrants']
-              for table in zoom_visible(tables):
-                  headers = [zoom_text(x.inner_text()) for x in zoom_visible(table.get_by_role('columnheader'))]
-                  if all(header in headers for header in required):
-                      selected.append((table, headers))
-              if len(selected) != 1:
-                  raise RuntimeError('Zoom registrations table cannot be identified uniquely.')
-              table, headers = selected[0]
-              result = []
-              for row in zoom_visible(table.get_by_role('row')):
-                  cells = row.get_by_role('cell')
-                  if cells.count() < len(required):
-                      continue
-                  get = lambda header: cells.nth(headers.index(header)).inner_text()
-                  result.append({'topic': get('Topic'), 'type': get('Type'), 'id': get('ID'),
-                                 'scheduled': get('Scheduled time'), 'row': row})
-              return result
-
-
           def export_zoom(page, event_date, outdir):
-              print('Zoom: opening the recorded registrants report with dynamic date filters.')
-              page.goto(zoom_report_url(event_date), wait_until='domcontentloaded')
-              mode = set_zoom_filters(page, event_date)
-              zoom_one(page.get_by_role('button', name='Search', exact=True), 'Search').click()
-              # Wait for the result total to settle. Require all results to be visible so a
-              # second matching webinar on an unseen page cannot be silently ignored.
+              shown = open_registration_report(page)
+              zoom_select_webinars(page)
+              zoom_set_range(page, event_date, shown)
+              zoom_select_webinars(page)
+              buttons = (zoom_visible(page.get_by_role('button', name='Search', exact=True))
+                         or zoom_visible(page.get_by_text('Search', exact=True)))
+              if len(buttons) != 1:
+                  zoom_filter_diagnostic(page, event_date)
+                  raise RuntimeError('Zoom Search button is missing or ambiguous.')
+              buttons[0].click()
+              # Wait for the result count and rows to settle.
               deadline = time.monotonic() + 60
-              records = []
-              stable = None
-              since = time.monotonic()
+              records, total, stable, since = [], None, None, time.monotonic()
               while time.monotonic() < deadline:
                   totals = zoom_visible(page.get_by_text(re.compile(r'^\s*\d+\s+result\(s\)\s*$')))
                   if len(totals) != 1:
                       time.sleep(0.5)
                       continue
                   total = int(re.search(r'\d+', totals[0].inner_text()).group())
-                  if total:
-                      try:
-                          records = zoom_rows(page)
-                      except RuntimeError:
-                          time.sleep(0.5)
-                          continue
-                  else:
-                      records = []
-                  signature = (total, tuple((r['topic'], r['id'], r['scheduled']) for r in records))
+                  records = zoom_rows(page) if total else []
+                  signature = (total, tuple((r['scheduled'], r['id']) for r in records))
                   if signature != stable:
                       stable, since = signature, time.monotonic()
-                  if time.monotonic() - since >= 3:
-                      if total != len(records):
-                          raise RuntimeError('Zoom search has additional or incomplete result pages; no ambiguous export attempted.')
+                  elif time.monotonic() - since >= 3:
                       break
                   time.sleep(0.5)
               else:
+                  zoom_filter_diagnostic(page, event_date)
                   raise RuntimeError('Zoom search did not produce a stable results table.')
-              verify_zoom_filters(page, event_date, mode)
+              shown = zoom_displayed_range(page)
+              print('Zoom: results =', total, '| rows read =', len(records), '| range =',
+                    (shown[0].isoformat() + ' to ' + shown[1].isoformat()) if shown else 'unknown')
+              if total != len(records):
+                  zoom_filter_diagnostic(page, event_date)
+                  raise RuntimeError('Zoom shows ' + str(total) + ' results but ' + str(len(records))
+                                     + ' rows could be read; no ambiguous export attempted.')
               chosen = select_zoom_row(records, event_date)
-              print('Zoom webinar selected:', ZOOM_TOPIC, '| scheduled:', zoom_text(chosen['scheduled']),
-                    '| ID:', zoom_text(chosen['id']))
-              zoom_one(chosen['row'].get_by_text('Generate', exact=True), 'selected webinar Generate').click()
-              with page.expect_download(timeout=600000) as pending:
-                  zoom_click(page, 'All registrants')
+              print('Zoom webinar selected:', ZOOM_TOPIC, '| scheduled:', chosen['scheduled'], '| ID:', chosen['id'])
+              chosen['generate'].click()
+              page.wait_for_timeout(800)
+              try:
+                  with page.expect_download(timeout=180000) as pending:
+                      zoom_click(page, 'All registrants')
+              except ZoomTimeout:
+                  raise RuntimeError('Zoom did not start the All registrants download within 3 minutes '
+                                     '(it may have gone to Report queue).') from None
               download = pending.value
               if download.failure():
                   raise RuntimeError('Zoom registrants download failed.')
               with tempfile.TemporaryDirectory() as folder:
                   raw_path = Path(folder) / 'zoom-registration.csv'
                   download.save_as(str(raw_path))
-                  meta = save_zoom_contacts(raw_path, outdir, event_date, chosen['id'])
+                  meta = save_zoom_contacts(raw_path, outdir, event_date, chosen['id'] or None)
               print('Zoom CSV verified: event=' + meta['event_date'] + '; registrants=' + str(meta['downloaded_count']))
 
 
