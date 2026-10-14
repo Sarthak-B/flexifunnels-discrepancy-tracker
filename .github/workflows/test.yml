@@ -44,6 +44,7 @@ jobs:
           TIMEZONE: ${{ vars.TIMEZONE }}
           ACTIVECAMPAIGN_API_URL: ${{ secrets.ACTIVECAMPAIGN_API_URL }}
           ACTIVECAMPAIGN_API_KEY: ${{ secrets.ACTIVECAMPAIGN_API_KEY }}
+          ZOOM_STORAGE_STATE_B64: ${{ secrets.ZOOM_STORAGE_STATE_B64 }}
 
         run: |
           python -u - <<'PY'
@@ -57,7 +58,7 @@ jobs:
           from google.oauth2.service_account import Credentials
 
           print("=" * 60)
-          print("GOOGLE SHEETS TEST - VERSION 16")
+          print("GOOGLE SHEETS TEST - VERSION 17")
           print("=" * 60)
 
           required = [
@@ -106,6 +107,143 @@ jobs:
               print(label + ": CONNECTED")
               print("Spreadsheet:", spreadsheet.title)
               print("Tabs:", len(spreadsheet.worksheets()))
+
+          """Reuse an explicitly saved Zoom session. Only encrypted state is cached in CI."""
+          import base64
+          import hashlib
+          import json
+          import os
+          import zlib
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          ZOOM_SESSION_SECRET = 'ZOOM_STORAGE_STATE_B64'
+          ZOOM_STATE_LIMIT = 4 * 1024 * 1024
+
+
+          def zoom_session_host(host):
+              return bool(host) and (host == 'zoom.us' or host.endswith('.zoom.us'))
+
+
+          def validate_zoom_bundle(bundle):
+              if not isinstance(bundle, dict) or bundle.get('version') != 1:
+                  raise RuntimeError('Saved Zoom session format is unsupported; run the session setup again.')
+              state = bundle.get('storage_state')
+              if not isinstance(state, dict) or not isinstance(state.get('cookies'), list) or not isinstance(state.get('origins'), list):
+                  raise RuntimeError('Saved Zoom session is incomplete; run the session setup again.')
+              if not state['cookies']:
+                  raise RuntimeError('Saved Zoom session contains no cookies; sign in during setup.')
+              for cookie in state['cookies']:
+                  if not isinstance(cookie, dict) or not zoom_session_host(cookie.get('domain', '').lstrip('.')):
+                      raise RuntimeError('Saved session contains a non-Zoom cookie.')
+              for origin in state['origins']:
+                  address = urlparse(origin.get('origin', ''))
+                  if address.scheme != 'https' or not zoom_session_host(address.hostname):
+                      raise RuntimeError('Saved session contains a non-Zoom origin.')
+              sessions = bundle.get('session_storage', {})
+              if not isinstance(sessions, dict):
+                  raise RuntimeError('Saved Zoom session storage is invalid.')
+              for origin, entries in sessions.items():
+                  address = urlparse(origin)
+                  if address.scheme != 'https' or not zoom_session_host(address.hostname):
+                      raise RuntimeError('Saved session contains a non-Zoom session origin.')
+                  if not isinstance(entries, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in entries.items()):
+                      raise RuntimeError('Saved Zoom session storage entries are invalid.')
+              return bundle
+
+
+          def decode_zoom_seed(encoded):
+              if not encoded or not encoded.strip():
+                  raise RuntimeError('Add ZOOM_STORAGE_STATE_B64 using the one-time Zoom session setup.')
+              try:
+                  compressed = base64.b64decode(encoded.strip(), validate=True)
+                  decoder = zlib.decompressobj()
+                  raw = decoder.decompress(compressed, ZOOM_STATE_LIMIT + 1)
+                  if len(raw) > ZOOM_STATE_LIMIT or not decoder.eof or decoder.unused_data:
+                      raise ValueError('invalid size')
+                  bundle = json.loads(raw)
+              except Exception:
+                  raise RuntimeError('Saved Zoom session cannot be read; run the session setup again.') from None
+              return validate_zoom_bundle(bundle)
+
+
+          def encode_zoom_bundle(bundle):
+              validate_zoom_bundle(bundle)
+              raw = json.dumps(bundle, separators=(',', ':')).encode()
+              if len(raw) > ZOOM_STATE_LIMIT:
+                  raise RuntimeError('Zoom session is too large to save.')
+              encoded = base64.b64encode(zlib.compress(raw, level=9)).decode('ascii')
+              if len(encoded.encode()) > 48 * 1024:
+                  raise RuntimeError('Zoom session exceeds the GitHub secret size limit; no session was uploaded.')
+              return encoded
+
+
+          def zoom_seed_value():
+              value = os.environ.get(ZOOM_SESSION_SECRET, '').strip()
+              decode_zoom_seed(value)
+              return value
+
+
+          def zoom_cipher(seed):
+              from cryptography.fernet import Fernet
+              digest = hashlib.sha256(b'flexifunnels-zoom-session-cache-v1\x00' + seed.encode()).digest()
+              return Fernet(base64.urlsafe_b64encode(digest))
+
+
+          def load_zoom_session(seed, cache_file):
+              initial = decode_zoom_seed(seed)
+              if cache_file.is_file():
+                  try:
+                      if cache_file.stat().st_size > ZOOM_STATE_LIMIT * 2:
+                          raise ValueError('cache too large')
+                      raw = zoom_cipher(seed).decrypt(cache_file.read_bytes())
+                      cached = validate_zoom_bundle(json.loads(raw))
+                      print('Zoom: restored the encrypted browser-session cache.')
+                      return cached
+                  except Exception:
+                      # Never print exceptions that might contain authentication values.
+                      print('Zoom: cache is unavailable or invalid; using the saved initial session.')
+              else:
+                  print('Zoom: loaded the saved initial browser session.')
+              return initial
+
+
+          def collect_zoom_session(context):
+              state = context.storage_state(indexed_db=True)
+              state['cookies'] = [c for c in state['cookies'] if zoom_session_host(c['domain'].lstrip('.'))]
+              state['origins'] = [o for o in state['origins'] if zoom_session_host(urlparse(o['origin']).hostname)]
+              sessions = {}
+              for page in context.pages:
+                  address = urlparse(page.url)
+                  if address.scheme == 'https' and zoom_session_host(address.hostname):
+                      origin = address.scheme + '://' + address.netloc
+                      sessions[origin] = page.evaluate('() => Object.fromEntries(Object.entries(sessionStorage))')
+              return validate_zoom_bundle({'version': 1, 'storage_state': state, 'session_storage': sessions})
+
+
+          def install_zoom_session_storage(context, bundle):
+              # Executed only on the exact Zoom origins included in the authenticated state.
+              serialized = json.dumps(bundle.get('session_storage', {}))
+              context.add_init_script(script='''(() => {
+                  const states = ''' + serialized + ''';
+                  const entries = states[window.location.origin];
+                  if (entries) for (const [key, value] of Object.entries(entries)) {
+                      if (window.sessionStorage.getItem(key) === null) window.sessionStorage.setItem(key, value);
+                  }
+              })();''')
+
+
+          def save_zoom_session_cache(context, seed, cache_file):
+              bundle = collect_zoom_session(context)
+              payload = zoom_cipher(seed).encrypt(json.dumps(bundle, separators=(',', ':')).encode())
+              cache_file.parent.mkdir(parents=True, exist_ok=True)
+              os.chmod(cache_file.parent, 0o700)
+              temporary = cache_file.with_suffix('.tmp')
+              fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+              with os.fdopen(fd, 'wb') as stream:
+                  stream.write(payload)
+              os.replace(temporary, cache_file)
+              print('Zoom: refreshed session saved to the encrypted cache.')
 
           import csv
           import json
@@ -769,6 +907,101 @@ jobs:
               return {'created': created, 'updated': updated, 'hidden_legacy_tabs': hidden,
                       'titles': {title: title for title in prepared}}
 
+          """Parse the observed Zoom Registration Report format, not attendance reports."""
+          import csv
+          import hashlib
+          import json
+          import re
+          from datetime import datetime, timedelta
+          from pathlib import Path
+
+          ZOOM_TOPIC = 'Launch Your Business Online in 10 Minutes — Directly From Your Phone | Live Build'
+
+
+          def zoom_text(value):
+              return ' '.join(value.split())
+
+
+          def read_zoom_export(path, event_date, expected_id=None):
+              with path.open(encoding='utf-8-sig', newline='') as source:
+                  rows = [[cell.strip() for cell in row] for row in csv.reader(source)]
+              if not rows or rows[0] != ['Registration Report']:
+                  raise RuntimeError('Zoom file is not the recorded Registration Report CSV.')
+              metadata_headers = ['Topic', 'ID', 'Scheduled Time', 'Duration (minutes)', '# Registrants',
+                                  '# Cancelled registrants', '# Approved registrants', '# Denied registrants']
+              meta_indices = [i for i, row in enumerate(rows) if row == metadata_headers]
+              contact_headers = ['First Name', 'Last Name', 'Email', 'Registration Time', 'Approval Status', 'Phone']
+              contact_indices = [i for i, row in enumerate(rows) if row == contact_headers]
+              if len(meta_indices) != 1 or len(contact_indices) != 1:
+                  raise RuntimeError('Zoom CSV metadata/contact headers are missing or ambiguous.')
+              m, h = meta_indices[0], contact_indices[0]
+              if m + 1 >= len(rows) or len(rows[m + 1]) != len(metadata_headers) or h <= m + 1:
+                  raise RuntimeError('Zoom CSV report structure is incomplete.')
+              meta = dict(zip(metadata_headers, rows[m + 1]))
+              if zoom_text(meta['Topic']) != zoom_text(ZOOM_TOPIC):
+                  raise RuntimeError('Zoom CSV is for a different webinar topic.')
+              scheduled = datetime.strptime(meta['Scheduled Time'], '%m/%d/%Y %I:%M:%S %p')
+              if scheduled.date() != event_date:
+                  raise RuntimeError('Zoom CSV webinar date does not match the selected UTM event date.')
+              webinar_id = re.sub(r'\s+', '', meta['ID'])
+              if not webinar_id.isascii() or not webinar_id.isdigit():
+                  raise RuntimeError('Zoom CSV webinar ID is invalid.')
+              if expected_id is not None and webinar_id != re.sub(r'\s+', '', expected_id):
+                  raise RuntimeError('Downloaded Zoom CSV does not match the selected webinar ID.')
+              contacts = []
+              for row in rows[h + 1:]:
+                  if not row or not any(row):
+                      continue
+                  if len(row) != len(contact_headers):
+                      raise RuntimeError('Zoom CSV has an incomplete registrant row.')
+                  record = dict(zip(contact_headers, row))
+                  contacts.append({'name': ' '.join(filter(None, [record['First Name'], record['Last Name']])),
+                                   'email': record['Email'], 'phone': record['Phone']})
+              # Reconcile the downloaded report's own total, never the changing website count.
+              count = int(meta['# Registrants'].replace(',', ''))
+              if count != len(contacts):
+                  raise RuntimeError('Zoom CSV rows do not reconcile with its own report total.')
+              return contacts, {'topic': ZOOM_TOPIC, 'webinar_id': webinar_id,
+                                'scheduled_time': meta['Scheduled Time'], 'event_date': event_date.isoformat(),
+                                'report_type': 'All registrants', 'downloaded_count': len(contacts)}
+
+
+          def save_zoom_contacts(raw_path, outdir, event_date, expected_id):
+              contacts, meta = read_zoom_export(raw_path, event_date, expected_id)
+              outdir.mkdir(exist_ok=True)
+              path = outdir / 'registrants.csv'
+              with path.open('w', encoding='utf-8-sig', newline='') as output:
+                  writer = csv.DictWriter(output, fieldnames=['name', 'email', 'phone'])
+                  writer.writeheader()
+                  writer.writerows(contacts)
+              meta.update({'search_from': (event_date - timedelta(days=1)).isoformat(),
+                           'search_to': event_date.isoformat(), 'timezone': 'Asia/Kolkata',
+                           'csv_sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+              (outdir / 'manifest.json').write_text(json.dumps(meta, indent=2))
+              return meta
+
+
+          def load_zoom_contacts(folder, event_date):
+              meta = json.loads((folder / 'manifest.json').read_text())
+              if (meta.get('event_date') != event_date.isoformat()
+                      or meta.get('search_from') != (event_date - timedelta(days=1)).isoformat()
+                      or meta.get('search_to') != event_date.isoformat()
+                      or meta.get('topic') != ZOOM_TOPIC or meta.get('report_type') != 'All registrants'
+                      or meta.get('timezone') != 'Asia/Kolkata'
+                      or datetime.strptime(meta['scheduled_time'], '%m/%d/%Y %I:%M:%S %p').date() != event_date):
+                  raise RuntimeError('Zoom report metadata does not match this UTM event.')
+              path = folder / 'registrants.csv'
+              if hashlib.sha256(path.read_bytes()).hexdigest() != meta.get('csv_sha256'):
+                  raise RuntimeError('Zoom CSV differs from the verified download.')
+              with path.open(encoding='utf-8-sig', newline='') as source:
+                  reader = csv.DictReader(source)
+                  if reader.fieldnames != ['name', 'email', 'phone']:
+                      raise RuntimeError('Zoom identity columns are invalid.')
+                  contacts = list(reader)
+              if len(contacts) != meta.get('downloaded_count'):
+                  raise RuntimeError('Zoom artifact count does not reconcile.')
+              return contacts, meta
+
           """Final stage; inlined after comparison, ActiveCampaign and Sheets helpers."""
 
           def sorted_records(rows):
@@ -803,7 +1036,7 @@ jobs:
                          'Reports', 'UTM', 'Active Campaign', 'Zoom']
               keys = ['checked_date', 'checked_time', 'webinar_date', 'webinar_type',
                       'reports', 'utm', 'activecampaign', 'zoom']
-              return {'mode': 'dated_business_list_most_active', 'zoom': 'copy_activecampaign'}, [
+              return {'mode': 'dated_business_list_most_active', 'zoom': 'zoom_all_registrants'}, [
                   {'header': header, 'key': key} for header, key in zip(headers, keys)]
 
 
@@ -864,7 +1097,7 @@ jobs:
               ac = ActiveCampaignReader(os.environ['ACTIVECAMPAIGN_API_URL'], os.environ['ACTIVECAMPAIGN_API_KEY'])
               contacts, selected_list = ac.event_contacts(event_date)
               ac_rows = contacts
-              zoom_rows = [dict(row) for row in ac_rows]
+              zoom_rows, zoom_report = load_zoom_contacts(Path('zoom'), event_date)
               outdir = Path('comparison')
               outdir.mkdir(exist_ok=True)
               invalid_utm = [row for row in utm_business + utm_reg if match_key(row) is None]
@@ -891,13 +1124,14 @@ jobs:
               validate_stats_layout(stats_sheet, headers)
               print('Clean all datasets: sort, deduplicate email+phone pairs, remove explicit +91 prefixes.')
               raw_counts = {'landing': len(ff_business), 'landing_reg': len(ff_reg),
-                            'utm_business': len(utm_business), 'utm_reg': len(utm_reg), 'activecampaign': len(ac_rows)}
+                            'utm_business': len(utm_business), 'utm_reg': len(utm_reg), 'activecampaign': len(ac_rows),
+                            'zoom': len(zoom_rows)}
               ff_business = prepare_contact_rows(ff_business)
               ff_reg = prepare_contact_rows(ff_reg)
               utm_business = prepare_contact_rows(utm_business)
               utm_reg = prepare_contact_rows(utm_reg)
               ac_rows = prepare_contact_rows(ac_rows)
-              zoom_rows = [dict(row) for row in ac_rows]
+              zoom_rows = prepare_contact_rows(zoom_rows)
               print('STAGE 1: Update the five daily data tabs in Descrepancy:', raw_book.title)
               merged_utm = merge_utm_records(utm_business, utm_reg)
               source_datasets = {'UTM': merged_utm, 'LANDING PAGE': sorted_records(ff_business),
@@ -964,7 +1198,8 @@ jobs:
                   'source_tabs': imported['titles'],
                   'reports': summary, 'totals': counts, 'published_tabs': published['titles'], 'stats_status': stats_status,
                   'activecampaign_list': selected_list,
-                  'zoom_source': 'Exact copy of selected ActiveCampaign active contacts, as requested',
+                  'zoom_source': 'Zoom Registration Report: All registrants for the UTM event date',
+                  'zoom_report': zoom_report,
               }, indent=2))
               print('COMPLETE: sorted datasets and UTM-minus-Zoom discrepancy written; Stats appended below existing rows.')
               print('Counts:', counts)
@@ -1042,6 +1277,7 @@ jobs:
           validate_stats_layout(stats_sheet, headers)
           if not os.environ.get('ACTIVECAMPAIGN_API_URL') or not os.environ.get('ACTIVECAMPAIGN_API_KEY'):
               raise RuntimeError('ActiveCampaign API URL/key secrets are required for the full workflow.')
+          zoom_seed_value()  # Check saved-session format before downloads or Sheets writes.
           if os.environ['UTM_SHEET_ID'] in (os.environ['RAW_DATA_SHEET_ID'], os.environ['DISCREPANCY_SHEET_ID']):
               raise RuntimeError('UTM source must be separate from the destination spreadsheets.')
           start_date = target_tab_date - timedelta(days=1)
@@ -1118,7 +1354,7 @@ jobs:
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
-          print('WORKFLOW REVISION: V16-R10 — current India date drives the complete workflow')
+          print('WORKFLOW REVISION: V17-R2 — current India date drives the complete workflow')
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
           PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
           LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
@@ -2291,9 +2527,9 @@ jobs:
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 16-R10: both CSVs verified; Google Sheets remain read-only.')
+                  print('VERSION 17-R2: both CSVs verified; Google Sheets remain read-only.')
               except Exception as error:
-                  print('VERSION 16-R10 stopped:', type(error).__name__, str(error))
+                  print('VERSION 17-R2 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
@@ -2316,9 +2552,492 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  download-zoom:
+    name: Download real Zoom registrants for the UTM event
+    needs: test-google-sheets
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install Playwright
+        run: |
+          python -m pip install "playwright>=1.51,<2" cryptography
+          python -m playwright install --with-deps chromium
+      - name: Prepare private session cache key
+        id: zoom-session-key
+        env:
+          ZOOM_STORAGE_STATE_B64: ${{ secrets.ZOOM_STORAGE_STATE_B64 }}
+        run: |
+          python - <<'PY'
+          import hashlib, os
+          seed = os.environ['ZOOM_STORAGE_STATE_B64'].strip()
+          if not seed:
+              raise SystemExit('Missing ZOOM_STORAGE_STATE_B64. Run the Zoom session setup first.')
+          fingerprint = hashlib.sha256(seed.encode()).hexdigest()[:24]
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('fingerprint=' + fingerprint + '\n')
+          PY
+      - name: Restore encrypted Zoom browser session
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/zoom-session-cache
+          key: zoom-session-v1-${{ runner.os }}-${{ steps.zoom-session-key.outputs.fingerprint }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            zoom-session-v1-${{ runner.os }}-${{ steps.zoom-session-key.outputs.fingerprint }}-
+      - name: Reuse Zoom session and download All registrants
+        env:
+          ZOOM_STORAGE_STATE_B64: ${{ secrets.ZOOM_STORAGE_STATE_B64 }}
+          UTM_TAB_DATE: ${{ needs.test-google-sheets.outputs.utm_tab_date }}
+        run: |
+          python -u - <<'PY'
+          """Reuse an explicitly saved Zoom session. Only encrypted state is cached in CI."""
+          import base64
+          import hashlib
+          import json
+          import os
+          import zlib
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          ZOOM_SESSION_SECRET = 'ZOOM_STORAGE_STATE_B64'
+          ZOOM_STATE_LIMIT = 4 * 1024 * 1024
+
+
+          def zoom_session_host(host):
+              return bool(host) and (host == 'zoom.us' or host.endswith('.zoom.us'))
+
+
+          def validate_zoom_bundle(bundle):
+              if not isinstance(bundle, dict) or bundle.get('version') != 1:
+                  raise RuntimeError('Saved Zoom session format is unsupported; run the session setup again.')
+              state = bundle.get('storage_state')
+              if not isinstance(state, dict) or not isinstance(state.get('cookies'), list) or not isinstance(state.get('origins'), list):
+                  raise RuntimeError('Saved Zoom session is incomplete; run the session setup again.')
+              if not state['cookies']:
+                  raise RuntimeError('Saved Zoom session contains no cookies; sign in during setup.')
+              for cookie in state['cookies']:
+                  if not isinstance(cookie, dict) or not zoom_session_host(cookie.get('domain', '').lstrip('.')):
+                      raise RuntimeError('Saved session contains a non-Zoom cookie.')
+              for origin in state['origins']:
+                  address = urlparse(origin.get('origin', ''))
+                  if address.scheme != 'https' or not zoom_session_host(address.hostname):
+                      raise RuntimeError('Saved session contains a non-Zoom origin.')
+              sessions = bundle.get('session_storage', {})
+              if not isinstance(sessions, dict):
+                  raise RuntimeError('Saved Zoom session storage is invalid.')
+              for origin, entries in sessions.items():
+                  address = urlparse(origin)
+                  if address.scheme != 'https' or not zoom_session_host(address.hostname):
+                      raise RuntimeError('Saved session contains a non-Zoom session origin.')
+                  if not isinstance(entries, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in entries.items()):
+                      raise RuntimeError('Saved Zoom session storage entries are invalid.')
+              return bundle
+
+
+          def decode_zoom_seed(encoded):
+              if not encoded or not encoded.strip():
+                  raise RuntimeError('Add ZOOM_STORAGE_STATE_B64 using the one-time Zoom session setup.')
+              try:
+                  compressed = base64.b64decode(encoded.strip(), validate=True)
+                  decoder = zlib.decompressobj()
+                  raw = decoder.decompress(compressed, ZOOM_STATE_LIMIT + 1)
+                  if len(raw) > ZOOM_STATE_LIMIT or not decoder.eof or decoder.unused_data:
+                      raise ValueError('invalid size')
+                  bundle = json.loads(raw)
+              except Exception:
+                  raise RuntimeError('Saved Zoom session cannot be read; run the session setup again.') from None
+              return validate_zoom_bundle(bundle)
+
+
+          def encode_zoom_bundle(bundle):
+              validate_zoom_bundle(bundle)
+              raw = json.dumps(bundle, separators=(',', ':')).encode()
+              if len(raw) > ZOOM_STATE_LIMIT:
+                  raise RuntimeError('Zoom session is too large to save.')
+              encoded = base64.b64encode(zlib.compress(raw, level=9)).decode('ascii')
+              if len(encoded.encode()) > 48 * 1024:
+                  raise RuntimeError('Zoom session exceeds the GitHub secret size limit; no session was uploaded.')
+              return encoded
+
+
+          def zoom_seed_value():
+              value = os.environ.get(ZOOM_SESSION_SECRET, '').strip()
+              decode_zoom_seed(value)
+              return value
+
+
+          def zoom_cipher(seed):
+              from cryptography.fernet import Fernet
+              digest = hashlib.sha256(b'flexifunnels-zoom-session-cache-v1\x00' + seed.encode()).digest()
+              return Fernet(base64.urlsafe_b64encode(digest))
+
+
+          def load_zoom_session(seed, cache_file):
+              initial = decode_zoom_seed(seed)
+              if cache_file.is_file():
+                  try:
+                      if cache_file.stat().st_size > ZOOM_STATE_LIMIT * 2:
+                          raise ValueError('cache too large')
+                      raw = zoom_cipher(seed).decrypt(cache_file.read_bytes())
+                      cached = validate_zoom_bundle(json.loads(raw))
+                      print('Zoom: restored the encrypted browser-session cache.')
+                      return cached
+                  except Exception:
+                      # Never print exceptions that might contain authentication values.
+                      print('Zoom: cache is unavailable or invalid; using the saved initial session.')
+              else:
+                  print('Zoom: loaded the saved initial browser session.')
+              return initial
+
+
+          def collect_zoom_session(context):
+              state = context.storage_state(indexed_db=True)
+              state['cookies'] = [c for c in state['cookies'] if zoom_session_host(c['domain'].lstrip('.'))]
+              state['origins'] = [o for o in state['origins'] if zoom_session_host(urlparse(o['origin']).hostname)]
+              sessions = {}
+              for page in context.pages:
+                  address = urlparse(page.url)
+                  if address.scheme == 'https' and zoom_session_host(address.hostname):
+                      origin = address.scheme + '://' + address.netloc
+                      sessions[origin] = page.evaluate('() => Object.fromEntries(Object.entries(sessionStorage))')
+              return validate_zoom_bundle({'version': 1, 'storage_state': state, 'session_storage': sessions})
+
+
+          def install_zoom_session_storage(context, bundle):
+              # Executed only on the exact Zoom origins included in the authenticated state.
+              serialized = json.dumps(bundle.get('session_storage', {}))
+              context.add_init_script(script='''(() => {
+                  const states = ''' + serialized + ''';
+                  const entries = states[window.location.origin];
+                  if (entries) for (const [key, value] of Object.entries(entries)) {
+                      if (window.sessionStorage.getItem(key) === null) window.sessionStorage.setItem(key, value);
+                  }
+              })();''')
+
+
+          def save_zoom_session_cache(context, seed, cache_file):
+              bundle = collect_zoom_session(context)
+              payload = zoom_cipher(seed).encrypt(json.dumps(bundle, separators=(',', ':')).encode())
+              cache_file.parent.mkdir(parents=True, exist_ok=True)
+              os.chmod(cache_file.parent, 0o700)
+              temporary = cache_file.with_suffix('.tmp')
+              fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+              with os.fdopen(fd, 'wb') as stream:
+                  stream.write(payload)
+              os.replace(temporary, cache_file)
+              print('Zoom: refreshed session saved to the encrypted cache.')
+
+          """Parse the observed Zoom Registration Report format, not attendance reports."""
+          import csv
+          import hashlib
+          import json
+          import re
+          from datetime import datetime, timedelta
+          from pathlib import Path
+
+          ZOOM_TOPIC = 'Launch Your Business Online in 10 Minutes — Directly From Your Phone | Live Build'
+
+
+          def zoom_text(value):
+              return ' '.join(value.split())
+
+
+          def read_zoom_export(path, event_date, expected_id=None):
+              with path.open(encoding='utf-8-sig', newline='') as source:
+                  rows = [[cell.strip() for cell in row] for row in csv.reader(source)]
+              if not rows or rows[0] != ['Registration Report']:
+                  raise RuntimeError('Zoom file is not the recorded Registration Report CSV.')
+              metadata_headers = ['Topic', 'ID', 'Scheduled Time', 'Duration (minutes)', '# Registrants',
+                                  '# Cancelled registrants', '# Approved registrants', '# Denied registrants']
+              meta_indices = [i for i, row in enumerate(rows) if row == metadata_headers]
+              contact_headers = ['First Name', 'Last Name', 'Email', 'Registration Time', 'Approval Status', 'Phone']
+              contact_indices = [i for i, row in enumerate(rows) if row == contact_headers]
+              if len(meta_indices) != 1 or len(contact_indices) != 1:
+                  raise RuntimeError('Zoom CSV metadata/contact headers are missing or ambiguous.')
+              m, h = meta_indices[0], contact_indices[0]
+              if m + 1 >= len(rows) or len(rows[m + 1]) != len(metadata_headers) or h <= m + 1:
+                  raise RuntimeError('Zoom CSV report structure is incomplete.')
+              meta = dict(zip(metadata_headers, rows[m + 1]))
+              if zoom_text(meta['Topic']) != zoom_text(ZOOM_TOPIC):
+                  raise RuntimeError('Zoom CSV is for a different webinar topic.')
+              scheduled = datetime.strptime(meta['Scheduled Time'], '%m/%d/%Y %I:%M:%S %p')
+              if scheduled.date() != event_date:
+                  raise RuntimeError('Zoom CSV webinar date does not match the selected UTM event date.')
+              webinar_id = re.sub(r'\s+', '', meta['ID'])
+              if not webinar_id.isascii() or not webinar_id.isdigit():
+                  raise RuntimeError('Zoom CSV webinar ID is invalid.')
+              if expected_id is not None and webinar_id != re.sub(r'\s+', '', expected_id):
+                  raise RuntimeError('Downloaded Zoom CSV does not match the selected webinar ID.')
+              contacts = []
+              for row in rows[h + 1:]:
+                  if not row or not any(row):
+                      continue
+                  if len(row) != len(contact_headers):
+                      raise RuntimeError('Zoom CSV has an incomplete registrant row.')
+                  record = dict(zip(contact_headers, row))
+                  contacts.append({'name': ' '.join(filter(None, [record['First Name'], record['Last Name']])),
+                                   'email': record['Email'], 'phone': record['Phone']})
+              # Reconcile the downloaded report's own total, never the changing website count.
+              count = int(meta['# Registrants'].replace(',', ''))
+              if count != len(contacts):
+                  raise RuntimeError('Zoom CSV rows do not reconcile with its own report total.')
+              return contacts, {'topic': ZOOM_TOPIC, 'webinar_id': webinar_id,
+                                'scheduled_time': meta['Scheduled Time'], 'event_date': event_date.isoformat(),
+                                'report_type': 'All registrants', 'downloaded_count': len(contacts)}
+
+
+          def save_zoom_contacts(raw_path, outdir, event_date, expected_id):
+              contacts, meta = read_zoom_export(raw_path, event_date, expected_id)
+              outdir.mkdir(exist_ok=True)
+              path = outdir / 'registrants.csv'
+              with path.open('w', encoding='utf-8-sig', newline='') as output:
+                  writer = csv.DictWriter(output, fieldnames=['name', 'email', 'phone'])
+                  writer.writeheader()
+                  writer.writerows(contacts)
+              meta.update({'search_from': (event_date - timedelta(days=1)).isoformat(),
+                           'search_to': event_date.isoformat(), 'timezone': 'Asia/Kolkata',
+                           'csv_sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+              (outdir / 'manifest.json').write_text(json.dumps(meta, indent=2))
+              return meta
+
+
+          def load_zoom_contacts(folder, event_date):
+              meta = json.loads((folder / 'manifest.json').read_text())
+              if (meta.get('event_date') != event_date.isoformat()
+                      or meta.get('search_from') != (event_date - timedelta(days=1)).isoformat()
+                      or meta.get('search_to') != event_date.isoformat()
+                      or meta.get('topic') != ZOOM_TOPIC or meta.get('report_type') != 'All registrants'
+                      or meta.get('timezone') != 'Asia/Kolkata'
+                      or datetime.strptime(meta['scheduled_time'], '%m/%d/%Y %I:%M:%S %p').date() != event_date):
+                  raise RuntimeError('Zoom report metadata does not match this UTM event.')
+              path = folder / 'registrants.csv'
+              if hashlib.sha256(path.read_bytes()).hexdigest() != meta.get('csv_sha256'):
+                  raise RuntimeError('Zoom CSV differs from the verified download.')
+              with path.open(encoding='utf-8-sig', newline='') as source:
+                  reader = csv.DictReader(source)
+                  if reader.fieldnames != ['name', 'email', 'phone']:
+                      raise RuntimeError('Zoom identity columns are invalid.')
+                  contacts = list(reader)
+              if len(contacts) != meta.get('downloaded_count'):
+                  raise RuntimeError('Zoom artifact count does not reconcile.')
+              return contacts, meta
+
+          """Zoom portal export based on the supplied recording; no ActiveCampaign fallback."""
+          import os
+          import time
+          import tempfile
+          from datetime import date
+          from urllib.parse import urlparse
+          from playwright.sync_api import sync_playwright, TimeoutError as ZoomTimeout
+
+
+          def zoom_visible(locator):
+              return [locator.nth(i) for i in range(locator.count()) if locator.nth(i).is_visible()]
+
+
+          def zoom_one(locator, description, seconds=30):
+              deadline = time.monotonic() + seconds
+              while time.monotonic() < deadline:
+                  visible = zoom_visible(locator)
+                  if len(visible) == 1:
+                      return visible[0]
+                  time.sleep(0.3)
+              raise RuntimeError('Zoom ' + description + ' is missing or ambiguous.')
+
+
+          def zoom_click(page, text):
+              zoom_one(page.get_by_text(text, exact=True), text).click()
+
+
+          def verify_saved_zoom_login(page):
+              print('Zoom: checking the saved browser session; no password sign-in will be attempted.')
+              page.goto('https://us06web.zoom.us/profile', wait_until='domcontentloaded')
+              try:
+                  zoom_one(page.get_by_text('Reports', exact=True), 'signed-in Reports navigation', seconds=45)
+                  address = urlparse(page.url)
+                  if not zoom_session_host(address.hostname) or address.path.rstrip('/') != '/profile':
+                      raise RuntimeError('Session not authenticated')
+              except (RuntimeError, ZoomTimeout):
+                  raise RuntimeError('Zoom session expired or was not accepted on this runner. Run the Zoom '
+                                     'session setup again and replace ZOOM_STORAGE_STATE_B64. '
+                                     'No password retries, authentication bypass, or Sheets writes were attempted.') from None
+              print('Zoom: saved sign-in verified.')
+
+
+          def zoom_report_url(event_date):
+              # Route and date/scope parameters observed in the supplied recording.
+              previous = event_date - timedelta(days=1)
+              return ('https://us06web.zoom.us/account/report?isPersonal=true'
+                      '#/usageReports/meetingRegistration?dateFrom=' + previous.isoformat()
+                      + '&dateTo=' + event_date.isoformat() + '&meetingScope=webinar&page=1')
+
+
+          def verify_zoom_filters(page, event_date):
+              zoom_one(page.get_by_text('Meeting and webinar registrations', exact=True), 'registration report')
+              expected = [(event_date - timedelta(days=1)).strftime('%m/%d/%Y'), event_date.strftime('%m/%d/%Y')]
+              values = [element.input_value().strip() for element in zoom_visible(page.locator('input'))]
+              dates = [value for value in values if re.fullmatch(r'\d{2}/\d{2}/\d{4}', value)]
+              if dates != expected:
+                  raise RuntimeError('Zoom From/To fields do not match yesterday/current UTM date. No export requested.')
+              zoom_one(page.get_by_text('Webinars', exact=True), 'selected Webinars scope')
+              print('Zoom search range verified:', expected[0], 'through', expected[1])
+
+
+          def select_zoom_row(records, event_date):
+              candidates = []
+              for record in records:
+                  if (zoom_text(record['topic']) == zoom_text(ZOOM_TOPIC)
+                          and record['type'].strip() == 'Webinar'):
+                      scheduled = datetime.strptime(zoom_text(record['scheduled']), '%m/%d/%Y %I:%M:%S %p')
+                      if scheduled.date() == event_date:
+                          candidates.append(record)
+              if len(candidates) != 1:
+                  raise RuntimeError('Expected exactly one Zoom webinar matching the topic and UTM event date '
+                                     + event_date.isoformat() + '; found ' + str(len(candidates))
+                                     + '. A previous-day webinar will not be substituted.')
+              return candidates[0]
+
+
+          def zoom_rows(page):
+              # Map columns from the observed table headings; no positional page-wide clicks.
+              tables = page.get_by_role('table')
+              selected = []
+              required = ['Topic', 'Type', 'ID', 'Host', 'Scheduled time', 'Registrants']
+              for table in zoom_visible(tables):
+                  headers = [zoom_text(x.inner_text()) for x in zoom_visible(table.get_by_role('columnheader'))]
+                  if all(header in headers for header in required):
+                      selected.append((table, headers))
+              if len(selected) != 1:
+                  raise RuntimeError('Zoom registrations table cannot be identified uniquely.')
+              table, headers = selected[0]
+              result = []
+              for row in zoom_visible(table.get_by_role('row')):
+                  cells = row.get_by_role('cell')
+                  if cells.count() < len(required):
+                      continue
+                  get = lambda header: cells.nth(headers.index(header)).inner_text()
+                  result.append({'topic': get('Topic'), 'type': get('Type'), 'id': get('ID'),
+                                 'scheduled': get('Scheduled time'), 'row': row})
+              return result
+
+
+          def export_zoom(page, event_date, outdir):
+              print('Zoom: opening the recorded registrants report with dynamic date filters.')
+              page.goto(zoom_report_url(event_date), wait_until='domcontentloaded')
+              verify_zoom_filters(page, event_date)
+              zoom_one(page.get_by_role('button', name='Search', exact=True), 'Search').click()
+              # Wait for the result total to settle. Require all results to be visible so a
+              # second matching webinar on an unseen page cannot be silently ignored.
+              deadline = time.monotonic() + 60
+              records = []
+              stable = None
+              since = time.monotonic()
+              while time.monotonic() < deadline:
+                  totals = zoom_visible(page.get_by_text(re.compile(r'^\s*\d+\s+result\(s\)\s*$')))
+                  if len(totals) != 1:
+                      time.sleep(0.5)
+                      continue
+                  total = int(re.search(r'\d+', totals[0].inner_text()).group())
+                  if total:
+                      try:
+                          records = zoom_rows(page)
+                      except RuntimeError:
+                          time.sleep(0.5)
+                          continue
+                  else:
+                      records = []
+                  signature = (total, tuple((r['topic'], r['id'], r['scheduled']) for r in records))
+                  if signature != stable:
+                      stable, since = signature, time.monotonic()
+                  if time.monotonic() - since >= 3:
+                      if total != len(records):
+                          raise RuntimeError('Zoom search has additional or incomplete result pages; no ambiguous export attempted.')
+                      break
+                  time.sleep(0.5)
+              else:
+                  raise RuntimeError('Zoom search did not produce a stable results table.')
+              verify_zoom_filters(page, event_date)
+              chosen = select_zoom_row(records, event_date)
+              print('Zoom webinar selected:', ZOOM_TOPIC, '| scheduled:', zoom_text(chosen['scheduled']),
+                    '| ID:', zoom_text(chosen['id']))
+              zoom_one(chosen['row'].get_by_text('Generate', exact=True), 'selected webinar Generate').click()
+              with page.expect_download(timeout=600000) as pending:
+                  zoom_click(page, 'All registrants')
+              download = pending.value
+              if download.failure():
+                  raise RuntimeError('Zoom registrants download failed.')
+              with tempfile.TemporaryDirectory() as folder:
+                  raw_path = Path(folder) / 'zoom-registration.csv'
+                  download.save_as(str(raw_path))
+                  meta = save_zoom_contacts(raw_path, outdir, event_date, chosen['id'])
+              print('Zoom CSV verified: event=' + meta['event_date'] + '; registrants=' + str(meta['downloaded_count']))
+
+
+          def run_zoom_export():
+              event_date = date.fromisoformat(os.environ['UTM_TAB_DATE'])
+              stage = 'saved-session'
+              seed = zoom_seed_value()
+              cache_file = Path(os.environ['RUNNER_TEMP']) / 'zoom-session-cache' / 'state.enc'
+              bundle = load_zoom_session(seed, cache_file)
+              with sync_playwright() as playwright:
+                  browser = playwright.chromium.launch(headless=True)
+                  context = browser.new_context(viewport={'width': 1440, 'height': 1000},
+                                                timezone_id='Asia/Kolkata', locale='en-US', accept_downloads=True,
+                                                storage_state=bundle['storage_state'])
+                  install_zoom_session_storage(context, bundle)
+                  page = context.new_page()
+                  page.set_default_timeout(30000)
+                  try:
+                      verify_saved_zoom_login(page)
+                      stage = 'report'
+                      export_zoom(page, event_date, Path('zoom'))
+                      save_zoom_session_cache(context, seed, cache_file)
+                  except Exception as error:
+                      # Do not capture credentials, login inputs, cookies, or storage state.
+                      Path('zoom-diagnostics').mkdir(exist_ok=True)
+                      (Path('zoom-diagnostics') / 'stage.json').write_text(json.dumps({
+                          'stage': stage, 'event_date': event_date.isoformat(), 'error_type': type(error).__name__}))
+                      if stage == 'report' and '/account/report' in urlparse(page.url).path:
+                          page.screenshot(path='zoom-diagnostics/report.png', full_page=True)
+                      if isinstance(error, RuntimeError):
+                          print(str(error))
+                      raise RuntimeError('Zoom export stopped at ' + stage + '; no Sheets writes and no copied ActiveCampaign data.') from None
+                  finally:
+                      browser.close()
+
+
+          run_zoom_export()
+
+          PY
+      - name: Save refreshed encrypted Zoom browser session
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/zoom-session-cache
+          key: zoom-session-v1-${{ runner.os }}-${{ steps.zoom-session-key.outputs.fingerprint }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Save verified Zoom contacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zoom-registrants-${{ github.run_id }}
+          path: zoom/*
+          if-no-files-found: error
+          retention-days: 7
+      - name: Save Zoom report diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zoom-diagnostics-${{ github.run_id }}
+          path: zoom-diagnostics/*
+          if-no-files-found: ignore
+          retention-days: 3
+
   compare-reports:
     name: Import to Descrepancy, process data and update Stats
-    needs: [test-google-sheets, test-flexifunnels]
+    needs: [test-google-sheets, test-flexifunnels, download-zoom]
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -2331,6 +3050,11 @@ jobs:
         with:
           name: flexifunnels-reports-${{ github.run_id }}
           path: reports
+      - name: Download this run's verified Zoom registrants
+        uses: actions/download-artifact@v4
+        with:
+          name: zoom-registrants-${{ github.run_id }}
+          path: zoom
       - name: Install Sheets and ActiveCampaign dependencies
         run: python -m pip install gspread google-auth requests
       - name: Download the selected UTM snapshot
@@ -3014,6 +3738,101 @@ jobs:
               return {'created': created, 'updated': updated, 'hidden_legacy_tabs': hidden,
                       'titles': {title: title for title in prepared}}
 
+          """Parse the observed Zoom Registration Report format, not attendance reports."""
+          import csv
+          import hashlib
+          import json
+          import re
+          from datetime import datetime, timedelta
+          from pathlib import Path
+
+          ZOOM_TOPIC = 'Launch Your Business Online in 10 Minutes — Directly From Your Phone | Live Build'
+
+
+          def zoom_text(value):
+              return ' '.join(value.split())
+
+
+          def read_zoom_export(path, event_date, expected_id=None):
+              with path.open(encoding='utf-8-sig', newline='') as source:
+                  rows = [[cell.strip() for cell in row] for row in csv.reader(source)]
+              if not rows or rows[0] != ['Registration Report']:
+                  raise RuntimeError('Zoom file is not the recorded Registration Report CSV.')
+              metadata_headers = ['Topic', 'ID', 'Scheduled Time', 'Duration (minutes)', '# Registrants',
+                                  '# Cancelled registrants', '# Approved registrants', '# Denied registrants']
+              meta_indices = [i for i, row in enumerate(rows) if row == metadata_headers]
+              contact_headers = ['First Name', 'Last Name', 'Email', 'Registration Time', 'Approval Status', 'Phone']
+              contact_indices = [i for i, row in enumerate(rows) if row == contact_headers]
+              if len(meta_indices) != 1 or len(contact_indices) != 1:
+                  raise RuntimeError('Zoom CSV metadata/contact headers are missing or ambiguous.')
+              m, h = meta_indices[0], contact_indices[0]
+              if m + 1 >= len(rows) or len(rows[m + 1]) != len(metadata_headers) or h <= m + 1:
+                  raise RuntimeError('Zoom CSV report structure is incomplete.')
+              meta = dict(zip(metadata_headers, rows[m + 1]))
+              if zoom_text(meta['Topic']) != zoom_text(ZOOM_TOPIC):
+                  raise RuntimeError('Zoom CSV is for a different webinar topic.')
+              scheduled = datetime.strptime(meta['Scheduled Time'], '%m/%d/%Y %I:%M:%S %p')
+              if scheduled.date() != event_date:
+                  raise RuntimeError('Zoom CSV webinar date does not match the selected UTM event date.')
+              webinar_id = re.sub(r'\s+', '', meta['ID'])
+              if not webinar_id.isascii() or not webinar_id.isdigit():
+                  raise RuntimeError('Zoom CSV webinar ID is invalid.')
+              if expected_id is not None and webinar_id != re.sub(r'\s+', '', expected_id):
+                  raise RuntimeError('Downloaded Zoom CSV does not match the selected webinar ID.')
+              contacts = []
+              for row in rows[h + 1:]:
+                  if not row or not any(row):
+                      continue
+                  if len(row) != len(contact_headers):
+                      raise RuntimeError('Zoom CSV has an incomplete registrant row.')
+                  record = dict(zip(contact_headers, row))
+                  contacts.append({'name': ' '.join(filter(None, [record['First Name'], record['Last Name']])),
+                                   'email': record['Email'], 'phone': record['Phone']})
+              # Reconcile the downloaded report's own total, never the changing website count.
+              count = int(meta['# Registrants'].replace(',', ''))
+              if count != len(contacts):
+                  raise RuntimeError('Zoom CSV rows do not reconcile with its own report total.')
+              return contacts, {'topic': ZOOM_TOPIC, 'webinar_id': webinar_id,
+                                'scheduled_time': meta['Scheduled Time'], 'event_date': event_date.isoformat(),
+                                'report_type': 'All registrants', 'downloaded_count': len(contacts)}
+
+
+          def save_zoom_contacts(raw_path, outdir, event_date, expected_id):
+              contacts, meta = read_zoom_export(raw_path, event_date, expected_id)
+              outdir.mkdir(exist_ok=True)
+              path = outdir / 'registrants.csv'
+              with path.open('w', encoding='utf-8-sig', newline='') as output:
+                  writer = csv.DictWriter(output, fieldnames=['name', 'email', 'phone'])
+                  writer.writeheader()
+                  writer.writerows(contacts)
+              meta.update({'search_from': (event_date - timedelta(days=1)).isoformat(),
+                           'search_to': event_date.isoformat(), 'timezone': 'Asia/Kolkata',
+                           'csv_sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+              (outdir / 'manifest.json').write_text(json.dumps(meta, indent=2))
+              return meta
+
+
+          def load_zoom_contacts(folder, event_date):
+              meta = json.loads((folder / 'manifest.json').read_text())
+              if (meta.get('event_date') != event_date.isoformat()
+                      or meta.get('search_from') != (event_date - timedelta(days=1)).isoformat()
+                      or meta.get('search_to') != event_date.isoformat()
+                      or meta.get('topic') != ZOOM_TOPIC or meta.get('report_type') != 'All registrants'
+                      or meta.get('timezone') != 'Asia/Kolkata'
+                      or datetime.strptime(meta['scheduled_time'], '%m/%d/%Y %I:%M:%S %p').date() != event_date):
+                  raise RuntimeError('Zoom report metadata does not match this UTM event.')
+              path = folder / 'registrants.csv'
+              if hashlib.sha256(path.read_bytes()).hexdigest() != meta.get('csv_sha256'):
+                  raise RuntimeError('Zoom CSV differs from the verified download.')
+              with path.open(encoding='utf-8-sig', newline='') as source:
+                  reader = csv.DictReader(source)
+                  if reader.fieldnames != ['name', 'email', 'phone']:
+                      raise RuntimeError('Zoom identity columns are invalid.')
+                  contacts = list(reader)
+              if len(contacts) != meta.get('downloaded_count'):
+                  raise RuntimeError('Zoom artifact count does not reconcile.')
+              return contacts, meta
+
           """Final stage; inlined after comparison, ActiveCampaign and Sheets helpers."""
 
           def sorted_records(rows):
@@ -3048,7 +3867,7 @@ jobs:
                          'Reports', 'UTM', 'Active Campaign', 'Zoom']
               keys = ['checked_date', 'checked_time', 'webinar_date', 'webinar_type',
                       'reports', 'utm', 'activecampaign', 'zoom']
-              return {'mode': 'dated_business_list_most_active', 'zoom': 'copy_activecampaign'}, [
+              return {'mode': 'dated_business_list_most_active', 'zoom': 'zoom_all_registrants'}, [
                   {'header': header, 'key': key} for header, key in zip(headers, keys)]
 
 
@@ -3109,7 +3928,7 @@ jobs:
               ac = ActiveCampaignReader(os.environ['ACTIVECAMPAIGN_API_URL'], os.environ['ACTIVECAMPAIGN_API_KEY'])
               contacts, selected_list = ac.event_contacts(event_date)
               ac_rows = contacts
-              zoom_rows = [dict(row) for row in ac_rows]
+              zoom_rows, zoom_report = load_zoom_contacts(Path('zoom'), event_date)
               outdir = Path('comparison')
               outdir.mkdir(exist_ok=True)
               invalid_utm = [row for row in utm_business + utm_reg if match_key(row) is None]
@@ -3136,13 +3955,14 @@ jobs:
               validate_stats_layout(stats_sheet, headers)
               print('Clean all datasets: sort, deduplicate email+phone pairs, remove explicit +91 prefixes.')
               raw_counts = {'landing': len(ff_business), 'landing_reg': len(ff_reg),
-                            'utm_business': len(utm_business), 'utm_reg': len(utm_reg), 'activecampaign': len(ac_rows)}
+                            'utm_business': len(utm_business), 'utm_reg': len(utm_reg), 'activecampaign': len(ac_rows),
+                            'zoom': len(zoom_rows)}
               ff_business = prepare_contact_rows(ff_business)
               ff_reg = prepare_contact_rows(ff_reg)
               utm_business = prepare_contact_rows(utm_business)
               utm_reg = prepare_contact_rows(utm_reg)
               ac_rows = prepare_contact_rows(ac_rows)
-              zoom_rows = [dict(row) for row in ac_rows]
+              zoom_rows = prepare_contact_rows(zoom_rows)
               print('STAGE 1: Update the five daily data tabs in Descrepancy:', raw_book.title)
               merged_utm = merge_utm_records(utm_business, utm_reg)
               source_datasets = {'UTM': merged_utm, 'LANDING PAGE': sorted_records(ff_business),
@@ -3209,7 +4029,8 @@ jobs:
                   'source_tabs': imported['titles'],
                   'reports': summary, 'totals': counts, 'published_tabs': published['titles'], 'stats_status': stats_status,
                   'activecampaign_list': selected_list,
-                  'zoom_source': 'Exact copy of selected ActiveCampaign active contacts, as requested',
+                  'zoom_source': 'Zoom Registration Report: All registrants for the UTM event date',
+                  'zoom_report': zoom_report,
               }, indent=2))
               print('COMPLETE: sorted datasets and UTM-minus-Zoom discrepancy written; Stats appended below existing rows.')
               print('Counts:', counts)
