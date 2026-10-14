@@ -949,7 +949,7 @@ jobs:
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
-          print('WORKFLOW REVISION: V16-R2 — latest UTM date drives the complete workflow')
+          print('WORKFLOW REVISION: V16-R4 — latest UTM date drives the complete workflow')
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
           PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
           LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
@@ -1849,21 +1849,20 @@ jobs:
 
           def wait_applied_report(page):
               deadline = time.monotonic() + 60
-              previous_count = None
               stable_since = None
               range_confirmed = False
               while time.monotonic() < deadline:
                   range_confirmed = applied_range_matches(page)
                   count = read_report_count(page)
-                  if range_confirmed and count is not None:
-                      if count != previous_count or stable_since is None:
-                          previous_count, stable_since = count, time.monotonic()
+                  if range_confirmed:
+                      if stable_since is None:
+                          stable_since = time.monotonic()
                       elif time.monotonic() - stable_since >= 3:
                           print('Applied range verified:', yesterday.isoformat(), 'through', today.isoformat())
-                          print('Filtered Page Reports count:', count)
+                          print('Live Page Reports count (informational only):', count)
                           return count
                   else:
-                      previous_count, stable_since = None, None
+                      stable_since = None
                   time.sleep(0.5)
               # Emit only the known report header and date-control evidence.
               print('Applied range matched:', range_confirmed)
@@ -1885,7 +1884,7 @@ jobs:
                   'expectedDates': [yesterday.isoformat(), today.isoformat()],
                   'visibleDateValues': dates, 'reportHeader': nearby,
               }, indent=2))
-              raise RuntimeError('Applied range or nearby Page Reports count could not be verified; see applied-filter diagnostics.')
+              raise RuntimeError('Applied date range could not be verified; see applied-filter diagnostics.')
 
 
           def set_recorded_date_range(page):
@@ -1945,12 +1944,52 @@ jobs:
               return bool(visible_items(page.get_by_text(empty)))
 
 
+          def export_row_metadata(page):
+              result = []
+              rows = download_rows(page)
+              for index in range(rows.count()):
+                  cells = rows.nth(index).get_by_role('cell')
+                  if cells.count() < 5:
+                      continue
+                  result.append({'index': index,
+                                 'details': ' '.join(cells.nth(0).inner_text().split()),
+                                 'records': cells.nth(1).inner_text().strip(),
+                                 'status': cells.nth(2).inner_text().strip(),
+                                 'created': ' '.join(cells.nth(3).inner_text().split())})
+              return result
+
+
+          def export_identity(row):
+              # Status/count can change while processing; they are not identity fields.
+              return row['details'], row['created']
+
+
+          def new_export_rows(before, current):
+              from collections import Counter
+              old = Counter(export_identity(row) for row in before)
+              now = Counter(export_identity(row) for row in current)
+              surplus = now - old
+              result = []
+              # Recorded table prepends new rows, including duplicate minute timestamps.
+              for row in current:
+                  key = export_identity(row)
+                  if surplus[key] > 0:
+                      result.append(row)
+                      surplus[key] -= 1
+              return result
+
+
+          def completed_export_candidates(before, current):
+              return [row for row in new_export_rows(before, current)
+                      if row['status'].strip().casefold() == 'completed']
+
+
           def wait_downloads_snapshot(page):
               deadline = time.monotonic() + 45
               previous, stable_since = None, None
               while time.monotonic() < deadline:
                   if downloads_view_ready(page):
-                      texts = download_rows(page).all_text_contents()
+                      texts = export_row_metadata(page)
                       if texts != previous:
                           previous, stable_since = texts, time.monotonic()
                       elif time.monotonic() - stable_since >= 3:
@@ -1971,69 +2010,85 @@ jobs:
               raise RuntimeError('Downloads view not confirmed; see downloads-view diagnostics. No export was started.')
 
 
+          def validate_and_reduce_export(path, start_date, end_date):
+              # The CSV is the count source. No comparison with a live screen count.
+              with path.open(encoding='utf-8-sig', newline='') as source:
+                  reader = csv.DictReader(source)
+                  required = ('first_name', 'email', 'phone', 'created_at')
+                  if any(key not in (reader.fieldnames or []) for key in required):
+                      raise RuntimeError('CSV is missing required identity/timestamp columns.')
+                  identities = []
+                  for record in reader:
+                      timestamp = datetime.strptime(record['created_at'].strip(), '%b %d, %Y %I:%M %p (IST)')
+                      if not start_date <= timestamp.date() <= end_date:
+                          raise RuntimeError('Export contains a record outside the requested date range.')
+                      identities.append({'name': record['first_name'].strip(), 'email': record['email'].strip(), 'phone': record['phone'].strip()})
+              with path.open('w', encoding='utf-8-sig', newline='') as output:
+                  writer = csv.DictWriter(output, fieldnames=['name', 'email', 'phone'])
+                  writer.writeheader()
+                  writer.writerows(identities)
+              return len(identities)
+
+
           def export_current_report(page, label, count):
               click_text(page, 'Downloads')
               before = wait_downloads_snapshot(page)
               click_text(page, 'Reports')
+              latest_count = wait_applied_report(page)
+              if latest_count != count:
+                  print(label + ': filtered count changed before export:', count, '->', latest_count)
+              count = latest_count
               wait_unique(page.get_by_text('Export Data', exact=True), 'Export Data').click()
               click_text(page, 'Filtered Data')
               click_text(page, 'Downloads')
               deadline = time.monotonic() + 600
-              seen_new = False
+              current = []
+              last_observed = None
               while time.monotonic() < deadline:
-                  rows = download_rows(page)
-                  texts = rows.all_text_contents()
-                  if texts:
-                      # Recorded exports prepend to Downloads. Require evidence of a new
-                      # row, so an old Completed export cannot be downloaded by mistake.
-                      normalize = lambda s: re.sub(r'Pending|Completed|Queued\.\.\.|Download', '', s).strip()
-                      if len(texts) > len(before) or not before or normalize(texts[0]) != normalize(before[0]):
-                          seen_new = True
-                      first = rows.first
-                      if seen_new:
-                          cells = first.get_by_role('cell')
-                          if cells.count() < 5:
-                              raise RuntimeError('Downloads columns differ from the recording.')
-                          if cells.nth(1).inner_text().strip() != str(count):
-                              raise RuntimeError('New export record count differs from filtered report.')
-                          status = cells.nth(2).inner_text().strip()
-                          if status == 'Completed':
-                              with page.expect_download(timeout=60000) as event:
-                                  wait_unique(first.get_by_text('Download', exact=True), 'new export Download').click()
-                              download = event.value
-                              if download.failure():
-                                  raise RuntimeError('CSV download failed.')
-                              path = Path('reports') / (label + '.csv')
-                              download.save_as(str(path))
-                              with path.open(encoding='utf-8-sig', newline='') as source:
-                                  reader = csv.reader(source)
-                                  header = next(reader, None)
-                                  total = sum(1 for row in reader if any(row))
-                              if not header or total != count:
-                                  raise RuntimeError('Downloaded CSV row count does not match report.')
-                              # Validate timestamps, then retain only the three requested
-                              # fields in the downloadable artifact. Dates are metadata.
-                              with path.open(encoding='utf-8-sig', newline='') as source:
-                                  reader = csv.DictReader(source)
-                                  required = ('first_name', 'email', 'phone', 'created_at')
-                                  if any(key not in (reader.fieldnames or []) for key in required):
-                                      raise RuntimeError('CSV is missing required identity/timestamp columns.')
-                                  identities = []
-                                  for record in reader:
-                                      timestamp = datetime.strptime(record['created_at'].strip(), '%b %d, %Y %I:%M %p (IST)')
-                                      if not yesterday <= timestamp.date() <= today:
-                                          raise RuntimeError('Export contains a record outside the requested date range.')
-                                      identities.append({'name': record['first_name'].strip(), 'email': record['email'].strip(), 'phone': record['phone'].strip()})
-                              with path.open('w', encoding='utf-8-sig', newline='') as output:
-                                  writer = csv.DictWriter(output, fieldnames=['name', 'email', 'phone'])
-                                  writer.writeheader()
-                                  writer.writerows(identities)
-                              print(label + ': CSV verified; records=' + str(total))
-                              return
-                          if status not in ('Pending', 'Processing', 'Queued'):
-                              raise RuntimeError('Unexpected export status; stopping.')
+                  current = export_row_metadata(page)
+                  new_rows = new_export_rows(before, current)
+                  observed = [(row['records'], row['status'], row['created']) for row in new_rows]
+                  if observed != last_observed:
+                      print(label + ': new export states (records, status, created):', observed)
+                      last_observed = observed
+                  candidates = completed_export_candidates(before, current)
+                  if len(candidates) > 1:
+                      save_export_diagnostic(label, count, before, current)
+                      raise RuntimeError('Multiple new completed exports appeared; cannot identify this export uniquely.')
+                  if len(candidates) == 1:
+                      chosen = candidates[0]
+                      first = download_rows(page).nth(chosen['index'])
+                      cells = first.get_by_role('cell')
+                      # Recheck the row immediately before clicking, as the table updates.
+                      if (cells.count() >= 5
+                              and ' '.join(cells.nth(0).inner_text().split()) == chosen['details']
+                              and ' '.join(cells.nth(3).inner_text().split()) == chosen['created']
+                              and cells.nth(2).inner_text().strip().casefold() == 'completed'):
+                          with page.expect_download(timeout=60000) as event:
+                              wait_unique(first.get_by_text('Download', exact=True), 'new export Download').click()
+                          download = event.value
+                          if download.failure():
+                              raise RuntimeError('CSV download failed.')
+                          path = Path('reports') / (label + '.csv')
+                          download.save_as(str(path))
+                          total = validate_and_reduce_export(path, yesterday, today)
+                          print(label + ': CSV verified; records=' + str(total))
+                          return
                   time.sleep(2)
-              raise RuntimeError('New export did not complete within 10 minutes. No refresh attempted.')
+              save_export_diagnostic(label, count, before, current)
+              raise RuntimeError('No uniquely new completed export appeared within 10 minutes. '
+                                 + 'See export diagnostics; no older CSV was used.')
+
+
+          def save_export_diagnostic(label, count, before, current):
+              import json
+              Path('diagnostics').mkdir(exist_ok=True)
+              Path('diagnostics/' + label + '-export.json').write_text(json.dumps({
+                  'live_report_count_for_information_only': count,
+                  'date_range': [yesterday.isoformat(), today.isoformat()],
+                  'before': before, 'last_observed': current,
+                  'new_rows': new_export_rows(before, current),
+              }, indent=2))
 
 
           Path('reports').mkdir(exist_ok=True)
@@ -2059,9 +2114,9 @@ jobs:
                       open_recorded_reports(page, published_url)
                       count = set_recorded_date_range(page)
                       export_current_report(page, label, count)
-                  print('VERSION 14: both CSVs verified; Google Sheets remain read-only.')
+                  print('VERSION 16-R4: both CSVs verified; Google Sheets remain read-only.')
               except Exception as error:
-                  print('VERSION 14 stopped:', type(error).__name__, str(error))
+                  print('VERSION 16-R4 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
