@@ -1414,7 +1414,7 @@ jobs:
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
-          print('WORKFLOW REVISION: V17-R5 — latest complete UTM date drives the complete workflow')
+          print('WORKFLOW REVISION: V17-R6 — latest complete UTM date drives the complete workflow')
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
           PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
           LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
@@ -2590,9 +2590,9 @@ jobs:
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 17-R5: both CSVs verified; Google Sheets remain read-only.')
+                  print('VERSION 17-R6: both CSVs verified; Google Sheets remain read-only.')
               except Exception as error:
-                  print('VERSION 17-R5 stopped:', type(error).__name__, str(error))
+                  print('VERSION 17-R6 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
@@ -2992,15 +2992,116 @@ jobs:
                       + '&dateTo=' + event_date.isoformat() + '&meetingScope=webinar&page=1')
 
 
-          def verify_zoom_filters(page, event_date):
+          def zoom_date_value(value):
+              for pattern in ('%m/%d/%Y', '%Y-%m-%d'):
+                  try:
+                      return datetime.strptime(value.strip(), pattern).date()
+                  except ValueError:
+                      pass
+              return None
+
+
+          def zoom_date_fields(page, seconds=30):
+              deadline = time.monotonic() + seconds
+              while time.monotonic() < deadline:
+                  # Prefer real label associations when Zoom exposes them.
+                  starts = zoom_visible(page.get_by_label('From', exact=True))
+                  ends = zoom_visible(page.get_by_label('To', exact=True))
+                  if len(starts) == len(ends) == 1:
+                      return starts[0], ends[0]
+                  candidates = []
+                  for element in zoom_visible(page.locator('input')):
+                      value = element.input_value().strip()
+                      placeholder = (element.get_attribute('placeholder') or '').strip().upper()
+                      if (zoom_date_value(value) is not None or element.get_attribute('type') == 'date'
+                              or placeholder in ('MM/DD/YYYY', 'YYYY-MM-DD')):
+                          candidates.append(element)
+                  if len(candidates) == 2:
+                      # The recording has From on the left and To on the right. Use their
+                      # rendered position rather than their order in the document.
+                      boxes = [(element.bounding_box(), element) for element in candidates]
+                      if all(box for box, _ in boxes):
+                          boxes.sort(key=lambda entry: (entry[0]['y'], entry[0]['x']))
+                          return boxes[0][1], boxes[1][1]
+                  time.sleep(0.3)
+              raise RuntimeError('Zoom From/To inputs are missing or ambiguous; see report diagnostics.')
+
+
+          def zoom_filter_diagnostic(page, event_date):
+              Path('zoom-diagnostics').mkdir(exist_ok=True)
+              controls = []
+              for element in zoom_visible(page.locator('input')):
+                  value = element.input_value().strip()
+                  controls.append({'type': element.get_attribute('type'),
+                                   'placeholder': element.get_attribute('placeholder'),
+                                   'aria_label': element.get_attribute('aria-label'),
+                                   'readonly': element.get_attribute('readonly') is not None,
+                                   'date_value': value if zoom_date_value(value) else None})
+              (Path('zoom-diagnostics') / 'filters.json').write_text(json.dumps({
+                  'expected_from': (event_date - timedelta(days=1)).isoformat(),
+                  'expected_to': event_date.isoformat(), 'visible_input_controls': controls}, indent=2))
+
+
+          def set_zoom_filters(page, event_date):
               zoom_one(page.get_by_text('Meeting and webinar registrations', exact=True), 'registration report')
-              expected = [(event_date - timedelta(days=1)).strftime('%m/%d/%Y'), event_date.strftime('%m/%d/%Y')]
-              values = [element.input_value().strip() for element in zoom_visible(page.locator('input'))]
-              dates = [value for value in values if re.fullmatch(r'\d{2}/\d{2}/\d{4}', value)]
-              if dates != expected:
-                  raise RuntimeError('Zoom From/To fields do not match yesterday/current UTM date. No export requested.')
-              zoom_one(page.get_by_text('Webinars', exact=True), 'selected Webinars scope')
-              print('Zoom search range verified:', expected[0], 'through', expected[1])
+              start, end = zoom_date_fields(page)
+              expected = (event_date - timedelta(days=1), event_date)
+              for description, element, day in [('From', start, expected[0]), ('To', end, expected[1])]:
+                  old = element.input_value().strip()
+                  print('Zoom ' + description + ': observed=' + old + '; required=' + day.isoformat())
+                  if zoom_date_value(old) == day:
+                      continue
+                  if not element.is_editable():
+                      zoom_filter_diagnostic(page, event_date)
+                      raise RuntimeError('Zoom ' + description + ' date input is read-only; calendar DOM verification is needed. See filters.json and report.png.')
+                  pattern = '%Y-%m-%d' if (element.get_attribute('type') == 'date'
+                                            or re.fullmatch(r'\d{4}-\d{2}-\d{2}', old)) else '%m/%d/%Y'
+                  element.fill(day.strftime(pattern))
+                  element.press('Tab')  # Commit Zoom's controlled date input on blur.
+              # Set the recorded Meetings/Webinars dropdown explicitly too.
+              native = []
+              for select in zoom_visible(page.locator('select')):
+                  labels = select.locator('option').all_text_contents()
+                  if 'Webinars' in [label.strip() for label in labels]:
+                      native.append(select)
+              if len(native) == 1:
+                  native[0].select_option(label='Webinars')
+              elif len(native) > 1:
+                  raise RuntimeError('Zoom webinar-scope dropdown is ambiguous.')
+              elif not zoom_visible(page.get_by_text('Webinars', exact=True)):
+                  zoom_click(page, 'Meetings')
+                  zoom_click(page, 'Webinars')
+              verify_zoom_filters(page, event_date)
+
+
+          def verify_zoom_filters(page, event_date):
+              expected = (event_date - timedelta(days=1), event_date)
+              deadline = time.monotonic() + 15
+              matched_since = None
+              observed = ('', '')
+              while time.monotonic() < deadline:
+                  start, end = zoom_date_fields(page, seconds=2)
+                  observed = (start.input_value().strip(), end.input_value().strip())
+                  if tuple(zoom_date_value(value) for value in observed) == expected:
+                      if matched_since is None:
+                          matched_since = time.monotonic()
+                      if time.monotonic() - matched_since >= 1:
+                          selected_native = [select for select in zoom_visible(page.locator('select'))
+                                             if select.locator('option:checked').count() == 1
+                                             and select.locator('option:checked').inner_text().strip() == 'Webinars']
+                          if len(selected_native) > 1:
+                              raise RuntimeError('Zoom selected Webinars scope is ambiguous.')
+                          if not selected_native:
+                              zoom_one(page.get_by_text('Webinars', exact=True), 'selected Webinars scope')
+                          print('Zoom search range verified:', expected[0].isoformat(), 'through', expected[1].isoformat())
+                          return
+                  else:
+                      matched_since = None
+                  time.sleep(0.25)
+              zoom_filter_diagnostic(page, event_date)
+              raise RuntimeError('Zoom From/To fields did not retain the selected dates: observed '
+                                 + str(observed) + '; expected ' + str(tuple(day.isoformat() for day in expected))
+                                 + '. No export requested; see filters.json.')
 
 
           def select_zoom_row(records, event_date):
@@ -3044,7 +3145,7 @@ jobs:
           def export_zoom(page, event_date, outdir):
               print('Zoom: opening the recorded registrants report with dynamic date filters.')
               page.goto(zoom_report_url(event_date), wait_until='domcontentloaded')
-              verify_zoom_filters(page, event_date)
+              set_zoom_filters(page, event_date)
               zoom_one(page.get_by_role('button', name='Search', exact=True), 'Search').click()
               # Wait for the result total to settle. Require all results to be visible so a
               # second matching webinar on an unseen page cannot be silently ignored.
