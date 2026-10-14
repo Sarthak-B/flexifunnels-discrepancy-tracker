@@ -44,8 +44,6 @@ jobs:
           TIMEZONE: ${{ vars.TIMEZONE }}
           ACTIVECAMPAIGN_API_URL: ${{ secrets.ACTIVECAMPAIGN_API_URL }}
           ACTIVECAMPAIGN_API_KEY: ${{ secrets.ACTIVECAMPAIGN_API_KEY }}
-          ACTIVECAMPAIGN_EVENT_GROUPS: ${{ vars.ACTIVECAMPAIGN_EVENT_GROUPS }}
-          STATS_LAYOUT_JSON: ${{ vars.STATS_LAYOUT_JSON }}
 
         run: |
           python -u - <<'PY'
@@ -238,6 +236,7 @@ jobs:
 
           """Read explicit event groups from ActiveCampaign. Never infer attendance."""
           import json
+          import re
           import os
           import time
           from urllib.parse import urlparse
@@ -298,6 +297,36 @@ jobs:
                       offset += len(records)
                   raise RuntimeError('ActiveCampaign group is too large for one workflow run.')
 
+              def event_contacts(self, event_date):
+                  month = 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split()[event_date.month - 1]
+                  search = str(event_date.day) + ' ' + month
+                  lists = self.pages('lists', 'lists', {'filters[name][contains]': search, 'orders[name]': 'ASC'})
+                  pattern = re.compile(r'^0?' + str(event_date.day) + r'\s+' + month
+                                       + r'\s+' + str(event_date.year)
+                                       + r'\s+Flexi\s+Genie\s+10\s+Mins?\s+Business\s+Workshop$', re.I)
+                  candidates = [item for item in lists if pattern.fullmatch(str(item.get('name', '')).strip())]
+                  if not candidates:
+                      raise RuntimeError('No Flexi Genie 10 Mins Business Workshop list found for ' + event_date.isoformat())
+                  ranked = []
+                  for item in candidates:
+                      data = self.get('contacts', {'listid': item['id'], 'status': 1, 'meta': 'only'})
+                      try:
+                          count = int(data['meta']['total'])
+                          if count < 0:
+                              raise ValueError()
+                      except (KeyError, TypeError, ValueError):
+                          raise RuntimeError('Cannot verify the active contact count for a matching list.') from None
+                      ranked.append((count, item))
+                  # max preserves the first result when active counts are equal.
+                  _, selected = max(ranked, key=lambda entry: entry[0])
+                  records = self.pages('contacts', 'contacts', {'listid': selected['id'], 'status': 1, 'orders[id]': 'ASC'})
+                  rows = [{'name': ' '.join(str(c.get(k) or '').strip() for k in ('firstName', 'lastName')).strip(),
+                           'email': str(c.get('email') or '').strip(), 'phone': str(c.get('phone') or '').strip()}
+                          for c in records]
+                  print('ActiveCampaign list selected:', selected['name'])
+                  print('Active contacts fetched:', len(rows))
+                  return rows, {'id': str(selected['id']), 'name': selected['name'], 'active_count': len(rows)}
+
               def contacts(self, selector):
                   kind, value = selector['type'], selector['value']
                   if kind == 'tag':
@@ -339,6 +368,307 @@ jobs:
                   raise RuntimeError('ActiveCampaign list ID must be numeric.')
               return {'type': selector['type'], 'value': value}
 
+          """Non-destructive publication helpers for the discrepancy workflow.
+
+          No credentials or network calls run on import. Pass authenticated gspread objects.
+          Serialize workflow runs with GitHub Actions concurrency: read-then-append cannot
+          guarantee exactly-once statistics writes across concurrent independent writers.
+          """
+
+          import hashlib
+          import json
+          import math
+          import re
+          from collections.abc import Mapping
+
+
+          RECORD_HEADERS = ["name", "email", "phone"]
+          _INVALID_TITLE = re.compile(r"[:\\/?*\[\]]")
+
+
+          def snapshot_title(base_title, run_id, attempt):
+              """Add a GitHub run/attempt suffix, refusing unsafe or truncated titles."""
+              if not isinstance(base_title, str) or not base_title.strip():
+                  raise ValueError("Snapshot base titles must be nonempty strings.")
+              run_id, attempt = str(run_id), str(attempt)
+              if not re.fullmatch(r"[1-9]\d*", run_id) or not re.fullmatch(r"[1-9]\d*", attempt):
+                  raise ValueError("run_id and attempt must be positive integer identifiers.")
+              title = f"{base_title} · {run_id}.{attempt}"
+              if len(title) > 100 or _INVALID_TITLE.search(title) or any(ord(c) < 32 for c in title):
+                  raise ValueError("Snapshot title exceeds 100 characters or contains an invalid character.")
+              return title
+
+
+          def _trim_padding(rows):
+              """Ignore API-provided empty padding only, retaining interior blank rows."""
+              result = []
+              for row in rows:
+                  cells = list(row)
+                  while cells and cells[-1] == "":
+                      cells.pop()
+                  result.append(cells)
+              while result and not result[-1]:
+                  result.pop()
+              return result
+
+
+          def _record_values(rows):
+              if not isinstance(rows, (list, tuple)):
+                  raise ValueError("Each snapshot dataset must be a list of three-column data rows.")
+              values = [list(RECORD_HEADERS)]
+              for number, row in enumerate(rows, 1):
+                  if not isinstance(row, (list, tuple)) or len(row) != 3:
+                      raise ValueError(f"Snapshot record {number} must contain name, email, and phone only.")
+                  if not all(isinstance(cell, str) for cell in row):
+                      raise ValueError(f"Snapshot record {number} must use text cells to preserve identifiers.")
+                  if not any(row):
+                      raise ValueError(f"Snapshot record {number} is entirely empty.")
+                  if any(len(cell) > 50000 for cell in row):
+                      raise ValueError(f"Snapshot record {number} exceeds the Sheets cell size limit.")
+                  values.append(list(row))
+              return values
+
+
+          def _unused_sheet_id(title, used_ids):
+              candidate = int.from_bytes(hashlib.sha256(title.encode("utf-8")).digest()[:4], "big") & 0x7FFFFFFF
+              while candidate in used_ids:
+                  candidate = (candidate + 1) & 0x7FFFFFFF
+              used_ids.add(candidate)
+              return candidate
+
+
+          def publish_snapshot(book, datasets, run_id, attempt):
+              """Publish new record tabs without changing any preexisting cells or tabs.
+
+              ``datasets`` maps descriptive base titles (caller includes the event date) to
+              lists of DATA rows, each exactly [name, email, phone] using string cells.
+              Headers are added here. The final title is ``base · run_id.attempt``.
+              All inputs and existing title collisions are checked before one atomic
+              spreadsheet batchUpdate creates and populates all missing tabs. An existing
+              final title is skipped only if its entire data matrix matches. Any differing
+              content raises before mutation. Repeating after an uncertain response is safe.
+
+              Return: {"created": [final titles], "skipped": [final titles],
+                       "titles": {base title: final title}}.
+              """
+              if not isinstance(datasets, Mapping) or not datasets:
+                  raise ValueError("Provide at least one named snapshot dataset.")
+
+              prepared, title_map = [], {}
+              for base_title, rows in datasets.items():
+                  title = snapshot_title(base_title, run_id, attempt)
+                  title_map[base_title] = title
+                  prepared.append((title, _record_values(rows)))
+              if len(set(title_map.values())) != len(title_map):
+                  raise ValueError("Snapshot titles must be unique.")
+
+              worksheets = list(book.worksheets())
+              existing = {sheet.title: sheet for sheet in worksheets}
+              if len(existing) != len(worksheets):
+                  raise RuntimeError("Spreadsheet contains ambiguous duplicate worksheet titles.")
+              used_ids = {int(sheet.id) for sheet in worksheets}
+              pending, skipped = [], []
+              for title, values in prepared:
+                  if title in existing:
+                      # FORMULA returns formula text rather than allowing a calculated value
+                      # to hide a changed cell. We do not alter even matching existing tabs.
+                      actual = existing[title].get_all_values(value_render_option="FORMULA")
+                      if _trim_padding(actual) != _trim_padding(values):
+                          raise RuntimeError(f"Snapshot title collision: {title!r}; existing contents differ.")
+                      skipped.append(title)
+                  else:
+                      pending.append((title, values))
+
+              requests = []
+              for title, values in pending:
+                  sheet_id = _unused_sheet_id(title, used_ids)
+                  requests.append({"addSheet": {"properties": {
+                      "sheetId": sheet_id, "title": title,
+                      "gridProperties": {"rowCount": max(2, len(values)), "columnCount": 3,
+                                         "frozenRowCount": 1},
+                  }}})
+                  requests.append({"updateCells": {
+                      "start": {"sheetId": sheet_id, "rowIndex": 0, "columnIndex": 0},
+                      "rows": [{"values": [{"userEnteredValue": {"stringValue": cell}}
+                                            for cell in row]} for row in values],
+                      "fields": "userEnteredValue",
+                  }})
+              if requests:
+                  book.batch_update({"requests": requests})
+              return {"created": [title for title, _ in pending], "skipped": skipped, "titles": title_map}
+
+
+          def append_summary(sheet, expected_headers, row, runkey_index):
+              """Append one statistics row only to a verified, already initialized layout.
+
+              Header order and spelling must match ``expected_headers`` exactly. ``row``
+              follows this order and contains only strings or finite numbers. Its run key
+              must be a nonempty string at the zero-based ``runkey_index``. The caller must
+              include any comparison/category in that key if a run writes multiple rows.
+              Existing rows and their order are preserved. A single identical existing key
+              and row returns "skipped"; duplicate keys or differing contents raise.
+              Otherwise append_rows uses RAW/INSERT_ROWS and returns "appended". Headers
+              are never initialized or changed automatically. Serialize writers externally.
+              """
+              if not isinstance(expected_headers, (list, tuple)) or not expected_headers:
+                  raise ValueError("Expected summary headers must be an explicit nonempty list.")
+              headers = list(expected_headers)
+              if (not all(isinstance(value, str) and value for value in headers)
+                      or len(set(headers)) != len(headers)):
+                  raise ValueError("Expected summary headers must be nonempty, unique strings.")
+              if not isinstance(row, (list, tuple)) or len(row) != len(headers):
+                  raise ValueError("Summary row must match the expected header width.")
+              row = list(row)
+              for value in row:
+                  if type(value) not in (str, int, float):
+                      raise ValueError("Summary cells must be strings or finite numbers.")
+                  if isinstance(value, float) and not math.isfinite(value):
+                      raise ValueError("Summary numbers must be finite.")
+              if type(runkey_index) is not int or not 0 <= runkey_index < len(headers):
+                  raise ValueError("runkey_index must point to a summary column.")
+              key = row[runkey_index]
+              if not isinstance(key, str) or not key:
+                  raise ValueError("Summary run key must be a nonempty string.")
+
+              existing = _trim_padding(sheet.get_all_values(value_render_option="UNFORMATTED_VALUE"))
+              if not existing or existing[0] != headers:
+                  raise RuntimeError("Summary headers do not match the explicitly configured layout.")
+              matches = []
+              for old_row in existing[1:]:
+                  if len(old_row) > len(headers):
+                      raise RuntimeError("Existing summary row extends beyond the configured headers.")
+                  padded = old_row + [""] * (len(headers) - len(old_row))
+                  if padded[runkey_index] == key:
+                      matches.append(padded)
+              if len(matches) > 1:
+                  raise RuntimeError("Summary already contains duplicate entries for this run key.")
+              if matches:
+                  if matches[0] != row:
+                      raise RuntimeError("Summary run key exists with different contents.")
+                  return "skipped"
+
+              sheet.append_rows([row], value_input_option="RAW", insert_data_option="INSERT_ROWS")
+              return "appended"
+
+
+          def validate_summary_layout(sheet, expected_headers):
+              """Read-only preflight for an existing stats layout; return occupied rows.
+
+              This can be called before publishing to a separate spreadsheet. Formula text
+              is read so an existing formula displaying an empty string remains occupied.
+              The first row must contain exactly the known headers; no layout is inferred.
+              """
+              if (not isinstance(expected_headers, (list, tuple)) or not expected_headers
+                      or not all(isinstance(value, str) and value for value in expected_headers)
+                      or len(set(expected_headers)) != len(expected_headers)):
+                  raise ValueError("Expected summary headers must be nonempty, unique strings.")
+              rows = _trim_padding(sheet.get_all_values(value_render_option="FORMULA"))
+              if not rows or rows[0] != list(expected_headers):
+                  raise RuntimeError("Summary headers do not match the explicitly configured layout.")
+              if any(len(row) > len(expected_headers) for row in rows[1:]):
+                  raise RuntimeError("Existing summary row extends beyond the configured headers.")
+              return rows
+
+
+          def validate_stats_layout(sheet, expected_headers):
+              """Locate the observed A-H header anywhere; preserve other columns and rows."""
+              rows = _trim_padding(sheet.get_all_values(value_render_option="FORMULA"))
+              normalize = lambda cells: [' '.join(str(cell).split()).casefold() for cell in cells]
+              width = len(expected_headers)
+              expected = normalize(expected_headers)
+              if not any(normalize(row[:width]) == expected for row in rows):
+                  raise RuntimeError('Cannot find the expected Stats headings in columns A-H. Nothing written.')
+              return rows
+
+
+          def append_summary_with_metadata(book, sheet, expected_headers, row, run_key, prefix_headers=False):
+              """Append stats while retaining its existing visible columns.
+
+              The known headers must be present already. One atomic spreadsheet batch adds
+              a stats row below every occupied row and attaches its run key/content hash as
+              developer metadata. No visible run-key column is added. A retry validates the
+              metadata and actual row then returns "skipped"; a conflict raises. Success
+              returns "appended". Existing rows, formulas, formats, and headers are intact.
+
+              Requires an authenticated gspread Spreadsheet and its Worksheet. External
+              writers must be serialized, including manual edits during the short preflight
+              and append period. Metadata and row content are committed together.
+              """
+              if (not isinstance(row, (list, tuple)) or len(row) != len(expected_headers)
+                      or not row):
+                  raise ValueError("Summary row must match the expected header width.")
+              row = list(row)
+              for value in row:
+                  if type(value) not in (str, int, float):
+                      raise ValueError("Summary cells must be strings or finite numbers.")
+                  if isinstance(value, float) and not math.isfinite(value):
+                      raise ValueError("Summary numbers must be finite.")
+              if not isinstance(run_key, str) or not run_key:
+                  raise ValueError("Summary run key must be a nonempty string.")
+              if not any(value != "" for value in row):
+                  raise ValueError("Summary row must contain at least one value.")
+
+              existing_rows = (validate_stats_layout(sheet, expected_headers) if prefix_headers
+                               else validate_summary_layout(sheet, expected_headers))
+              sheet_id = int(sheet.id)
+              metadata = book.fetch_sheet_metadata()
+              sheets = [entry for entry in metadata.get("sheets", [])
+                        if entry.get("properties", {}).get("sheetId") == sheet_id]
+              if len(sheets) != 1:
+                  raise RuntimeError("Stats worksheet was not uniquely identified in its spreadsheet.")
+              grid = sheets[0].get("properties", {}).get("gridProperties", {})
+              capacity = grid.get("rowCount")
+              if not isinstance(capacity, int) or capacity < len(existing_rows):
+                  raise RuntimeError("Stats worksheet row capacity could not be verified.")
+              if grid.get("columnCount", 0) < len(expected_headers):
+                  raise RuntimeError("Stats worksheet has fewer columns than the configured layout.")
+
+              digest = hashlib.sha256(json.dumps(row, ensure_ascii=False, separators=(",", ":"),
+                                                allow_nan=False).encode("utf-8")).hexdigest()
+              marker_value = f"{run_key}|{digest}"
+              candidates = list(metadata.get("developerMetadata", []))
+              for entry in metadata.get("sheets", []):
+                  candidates.extend(entry.get("developerMetadata", []))
+              markers = [entry for entry in candidates
+                         if entry.get("metadataKey") == "ff_discrepancy_run"
+                         and entry.get("metadataValue", "").rsplit("|", 1)[0] == run_key]
+              if len(markers) > 1:
+                  raise RuntimeError("Stats metadata contains duplicate entries for this run key.")
+              if markers:
+                  marker = markers[0]
+                  if marker.get("metadataValue") != marker_value:
+                      raise RuntimeError("Stats run key exists with different summary contents.")
+                  location = marker.get("location", {}).get("dimensionRange", {})
+                  start = location.get("startIndex")
+                  if (location.get("sheetId") != sheet_id or location.get("dimension") != "ROWS"
+                          or type(start) is not int or start < 1
+                          or location.get("endIndex") != start + 1 or start >= len(existing_rows)):
+                      raise RuntimeError("Stats run-key metadata points to an unexpected or missing row.")
+                  actual = existing_rows[start][:len(row)] + [""] * max(0, len(row) - len(existing_rows[start]))
+                  if actual != row:
+                      raise RuntimeError("Stats run-key row was changed after publication.")
+                  return "skipped"
+
+              start = len(existing_rows)
+              requests = []
+              if start >= capacity:
+                  requests.append({"appendDimension": {"sheetId": sheet_id, "dimension": "ROWS",
+                                                       "length": start + 1 - capacity}})
+              cells = [{"userEnteredValue": {"stringValue" if isinstance(value, str) else "numberValue": value}}
+                       for value in row]
+              requests.extend([
+                  {"updateCells": {"start": {"sheetId": sheet_id, "rowIndex": start, "columnIndex": 0},
+                                   "rows": [{"values": cells}], "fields": "userEnteredValue"}},
+                  {"createDeveloperMetadata": {"developerMetadata": {
+                      "metadataKey": "ff_discrepancy_run", "metadataValue": marker_value,
+                      "visibility": "DOCUMENT", "location": {"dimensionRange": {
+                          "sheetId": sheet_id, "dimension": "ROWS", "startIndex": start, "endIndex": start + 1,
+                      }},
+                  }}},
+              ])
+              book.batch_update({"requests": requests})
+              return "appended"
+
           """Final stage; inlined after comparison, ActiveCampaign and Sheets helpers."""
 
           def sorted_records(rows):
@@ -362,26 +692,12 @@ jobs:
 
 
           def required_configuration(event_date):
-              # Explicit event groups prevent accidentally using all AC contacts as Zoom attendees.
-              try:
-                  groups = json.loads(os.environ.get('ACTIVECAMPAIGN_EVENT_GROUPS', ''))
-                  layout = json.loads(os.environ.get('STATS_LAYOUT_JSON', ''))
-              except json.JSONDecodeError:
-                  raise RuntimeError('Configure ACTIVECAMPAIGN_EVENT_GROUPS and STATS_LAYOUT_JSON before enabling Sheets writes.') from None
-              if not isinstance(groups, dict) or set(groups) != {'activecampaign', 'zoom'}:
-                  raise RuntimeError('ACTIVECAMPAIGN_EVENT_GROUPS needs activecampaign and zoom selectors for this event.')
-              selectors = {name: event_selector(json.dumps(selector), event_date) for name, selector in groups.items()}
-              keys = {'event_date', 'range_start', 'range_end', 'run_time', 'run_key',
-                      'landing', 'landing_reg', 'reports', 'utm', 'activecampaign', 'zoom', 'discrepancy'}
-              if not isinstance(layout, list) or not layout:
-                  raise RuntimeError('STATS_LAYOUT_JSON must list the exact existing Stats columns in order.')
-              for column in layout:
-                  if not isinstance(column, dict) or set(column) != {'header', 'key'} or column['key'] not in keys or not isinstance(column['header'], str) or not column['header']:
-                      raise RuntimeError('Each Stats column needs an exact header and a supported count/date key.')
-              headers = [column['header'] for column in layout]
-              if len(headers) != len(set(headers)):
-                  raise RuntimeError('Stats headers must be unique.')
-              return selectors, layout
+              headers = ['Date', 'Time Checked', 'Webinar Date', 'Webinar Type',
+                         'Reports', 'UTM', 'Active Campaign', 'Zoom']
+              keys = ['checked_date', 'checked_time', 'webinar_date', 'webinar_type',
+                      'reports', 'utm', 'activecampaign', 'zoom']
+              return {'mode': 'dated_business_list_most_active', 'zoom': 'copy_activecampaign'}, [
+                  {'header': header, 'key': key} for header, key in zip(headers, keys)]
 
 
           def load_identity_csv(path):
@@ -415,8 +731,9 @@ jobs:
               merged_utm = merge_utm_records(utm_business, utm_reg)
 
               ac = ActiveCampaignReader(os.environ['ACTIVECAMPAIGN_API_URL'], os.environ['ACTIVECAMPAIGN_API_KEY'])
-              ac_rows = sorted_records(ac.contacts(selectors['activecampaign']))
-              zoom_rows = sorted_records(ac.contacts(selectors['zoom']))
+              contacts, selected_list = ac.event_contacts(event_date)
+              ac_rows = sorted_records(contacts)
+              zoom_rows = [dict(row) for row in ac_rows]
               outdir = Path('comparison')
               outdir.mkdir(exist_ok=True)
               invalid_utm = [row for row in merged_utm if match_key(row) is None]
@@ -456,23 +773,29 @@ jobs:
                   raise RuntimeError('Destination spreadsheet IDs must not point to the UTM source.')
               stats_sheet = stats_book.worksheet(os.environ['DISCREPANCY_TAB_NAME'])
               headers = [column['header'] for column in layout]
-              validate_summary_layout(stats_sheet, headers)
+              validate_stats_layout(stats_sheet, headers)
               run_key = os.environ['GITHUB_RUN_ID'] + '.' + os.environ['GITHUB_RUN_ATTEMPT']
               counts = {'event_date': event_date.isoformat(), 'range_start': expected_start.isoformat(),
                         'range_end': event_date.isoformat(), 'run_time': snapshot['captured_at'], 'run_key': run_key,
                         'landing': len(ff_business), 'landing_reg': len(ff_reg), 'reports': len(ff_business) + len(ff_reg),
                         'utm': len(merged_utm), 'activecampaign': len(ac_rows), 'zoom': len(zoom_rows), 'discrepancy': len(discrepancy)}
+              checked_at = datetime.fromisoformat(snapshot['captured_at']).astimezone(ZoneInfo(snapshot['timezone']))
+              counts.update({'checked_date': checked_at.strftime('%d/%m/%Y'),
+                             'checked_time': checked_at.strftime('%I:%M %p'),
+                             'webinar_date': event_date.strftime('%d/%m/%Y'),
+                             'webinar_type': '10 minute business'})
               stats_row = [counts[column['key']] for column in layout]
               dated = {event_date.isoformat() + ' ' + label: [[row['name'], row['email'], row['phone']] for row in rows]
                        for label, rows in datasets.items()}
               published = publish_snapshot(raw_book, dated, os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT'])
-              stats_status = append_summary_with_metadata(stats_book, stats_sheet, headers, stats_row, run_key)
+              stats_status = append_summary_with_metadata(stats_book, stats_sheet, headers, stats_row, run_key, prefix_headers=True)
               (outdir / 'summary.json').write_text(json.dumps({
                   'start_date': expected_start.isoformat(), 'end_date': event_date.isoformat(),
                   'utm_event_date': event_date.isoformat(), 'timezone': snapshot['timezone'],
                   'matching_rule': 'email AND phone; FF comparison occurrences preserved; merged UTM deduplicated',
                   'reports': summary, 'totals': counts, 'published_tabs': published['titles'], 'stats_status': stats_status,
-                  'zoom_source': 'Configured ActiveCampaign event group; no Zoom API write',
+                  'activecampaign_list': selected_list,
+                  'zoom_source': 'Exact copy of selected ActiveCampaign active contacts, as requested',
               }, indent=2))
               print('COMPLETE: sorted datasets and UTM-minus-Zoom discrepancy written; Stats appended below existing rows.')
               print('Counts:', counts)
@@ -547,9 +870,7 @@ jobs:
           print('DISCREPANCY_TAB_NAME: FOUND')
           selectors, layout = required_configuration(target_tab_date)
           headers = [column['header'] for column in layout]
-          stats_values = stats_sheet.get_all_values(value_render_option='UNFORMATTED_VALUE')
-          if not stats_values or stats_values[0] != headers:
-              raise RuntimeError('Provide the exact Stats headings in STATS_LAYOUT_JSON. Nothing written.')
+          validate_stats_layout(stats_sheet, headers)
           if not os.environ.get('ACTIVECAMPAIGN_API_URL') or not os.environ.get('ACTIVECAMPAIGN_API_KEY'):
               raise RuntimeError('ActiveCampaign API URL/key secrets are required for the full workflow.')
           if os.environ['UTM_SHEET_ID'] in (os.environ['RAW_DATA_SHEET_ID'], os.environ['DISCREPANCY_SHEET_ID']):
@@ -628,7 +949,7 @@ jobs:
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
-          print('WORKFLOW REVISION: V16-R1 — latest UTM date drives the complete workflow')
+          print('WORKFLOW REVISION: V16-R2 — latest UTM date drives the complete workflow')
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
           PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
           LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
@@ -1794,8 +2115,6 @@ jobs:
           DISCREPANCY_TAB_NAME: ${{ vars.DISCREPANCY_TAB_NAME }}
           ACTIVECAMPAIGN_API_URL: ${{ secrets.ACTIVECAMPAIGN_API_URL }}
           ACTIVECAMPAIGN_API_KEY: ${{ secrets.ACTIVECAMPAIGN_API_KEY }}
-          ACTIVECAMPAIGN_EVENT_GROUPS: ${{ vars.ACTIVECAMPAIGN_EVENT_GROUPS }}
-          STATS_LAYOUT_JSON: ${{ vars.STATS_LAYOUT_JSON }}
           SELECTED_UTM_BUSINESS_TAB: ${{ needs.test-google-sheets.outputs.utm_landing_tab }}
           SELECTED_UTM_REG_TAB: ${{ needs.test-google-sheets.outputs.utm_reg_tab }}
           UTM_TAB_DATE: ${{ needs.test-google-sheets.outputs.utm_tab_date }}
@@ -1930,6 +2249,7 @@ jobs:
 
           """Read explicit event groups from ActiveCampaign. Never infer attendance."""
           import json
+          import re
           import os
           import time
           from urllib.parse import urlparse
@@ -1989,6 +2309,36 @@ jobs:
                           raise RuntimeError('ActiveCampaign pagination did not reconcile with its total.')
                       offset += len(records)
                   raise RuntimeError('ActiveCampaign group is too large for one workflow run.')
+
+              def event_contacts(self, event_date):
+                  month = 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split()[event_date.month - 1]
+                  search = str(event_date.day) + ' ' + month
+                  lists = self.pages('lists', 'lists', {'filters[name][contains]': search, 'orders[name]': 'ASC'})
+                  pattern = re.compile(r'^0?' + str(event_date.day) + r'\s+' + month
+                                       + r'\s+' + str(event_date.year)
+                                       + r'\s+Flexi\s+Genie\s+10\s+Mins?\s+Business\s+Workshop$', re.I)
+                  candidates = [item for item in lists if pattern.fullmatch(str(item.get('name', '')).strip())]
+                  if not candidates:
+                      raise RuntimeError('No Flexi Genie 10 Mins Business Workshop list found for ' + event_date.isoformat())
+                  ranked = []
+                  for item in candidates:
+                      data = self.get('contacts', {'listid': item['id'], 'status': 1, 'meta': 'only'})
+                      try:
+                          count = int(data['meta']['total'])
+                          if count < 0:
+                              raise ValueError()
+                      except (KeyError, TypeError, ValueError):
+                          raise RuntimeError('Cannot verify the active contact count for a matching list.') from None
+                      ranked.append((count, item))
+                  # max preserves the first result when active counts are equal.
+                  _, selected = max(ranked, key=lambda entry: entry[0])
+                  records = self.pages('contacts', 'contacts', {'listid': selected['id'], 'status': 1, 'orders[id]': 'ASC'})
+                  rows = [{'name': ' '.join(str(c.get(k) or '').strip() for k in ('firstName', 'lastName')).strip(),
+                           'email': str(c.get('email') or '').strip(), 'phone': str(c.get('phone') or '').strip()}
+                          for c in records]
+                  print('ActiveCampaign list selected:', selected['name'])
+                  print('Active contacts fetched:', len(rows))
+                  return rows, {'id': str(selected['id']), 'name': selected['name'], 'active_count': len(rows)}
 
               def contacts(self, selector):
                   kind, value = selector['type'], selector['value']
@@ -2233,7 +2583,18 @@ jobs:
               return rows
 
 
-          def append_summary_with_metadata(book, sheet, expected_headers, row, run_key):
+          def validate_stats_layout(sheet, expected_headers):
+              """Locate the observed A-H header anywhere; preserve other columns and rows."""
+              rows = _trim_padding(sheet.get_all_values(value_render_option="FORMULA"))
+              normalize = lambda cells: [' '.join(str(cell).split()).casefold() for cell in cells]
+              width = len(expected_headers)
+              expected = normalize(expected_headers)
+              if not any(normalize(row[:width]) == expected for row in rows):
+                  raise RuntimeError('Cannot find the expected Stats headings in columns A-H. Nothing written.')
+              return rows
+
+
+          def append_summary_with_metadata(book, sheet, expected_headers, row, run_key, prefix_headers=False):
               """Append stats while retaining its existing visible columns.
 
               The known headers must be present already. One atomic spreadsheet batch adds
@@ -2260,7 +2621,8 @@ jobs:
               if not any(value != "" for value in row):
                   raise ValueError("Summary row must contain at least one value.")
 
-              existing_rows = validate_summary_layout(sheet, expected_headers)
+              existing_rows = (validate_stats_layout(sheet, expected_headers) if prefix_headers
+                               else validate_summary_layout(sheet, expected_headers))
               sheet_id = int(sheet.id)
               metadata = book.fetch_sheet_metadata()
               sheets = [entry for entry in metadata.get("sheets", [])
@@ -2295,7 +2657,7 @@ jobs:
                           or type(start) is not int or start < 1
                           or location.get("endIndex") != start + 1 or start >= len(existing_rows)):
                       raise RuntimeError("Stats run-key metadata points to an unexpected or missing row.")
-                  actual = existing_rows[start] + [""] * (len(row) - len(existing_rows[start]))
+                  actual = existing_rows[start][:len(row)] + [""] * max(0, len(row) - len(existing_rows[start]))
                   if actual != row:
                       raise RuntimeError("Stats run-key row was changed after publication.")
                   return "skipped"
@@ -2343,26 +2705,12 @@ jobs:
 
 
           def required_configuration(event_date):
-              # Explicit event groups prevent accidentally using all AC contacts as Zoom attendees.
-              try:
-                  groups = json.loads(os.environ.get('ACTIVECAMPAIGN_EVENT_GROUPS', ''))
-                  layout = json.loads(os.environ.get('STATS_LAYOUT_JSON', ''))
-              except json.JSONDecodeError:
-                  raise RuntimeError('Configure ACTIVECAMPAIGN_EVENT_GROUPS and STATS_LAYOUT_JSON before enabling Sheets writes.') from None
-              if not isinstance(groups, dict) or set(groups) != {'activecampaign', 'zoom'}:
-                  raise RuntimeError('ACTIVECAMPAIGN_EVENT_GROUPS needs activecampaign and zoom selectors for this event.')
-              selectors = {name: event_selector(json.dumps(selector), event_date) for name, selector in groups.items()}
-              keys = {'event_date', 'range_start', 'range_end', 'run_time', 'run_key',
-                      'landing', 'landing_reg', 'reports', 'utm', 'activecampaign', 'zoom', 'discrepancy'}
-              if not isinstance(layout, list) or not layout:
-                  raise RuntimeError('STATS_LAYOUT_JSON must list the exact existing Stats columns in order.')
-              for column in layout:
-                  if not isinstance(column, dict) or set(column) != {'header', 'key'} or column['key'] not in keys or not isinstance(column['header'], str) or not column['header']:
-                      raise RuntimeError('Each Stats column needs an exact header and a supported count/date key.')
-              headers = [column['header'] for column in layout]
-              if len(headers) != len(set(headers)):
-                  raise RuntimeError('Stats headers must be unique.')
-              return selectors, layout
+              headers = ['Date', 'Time Checked', 'Webinar Date', 'Webinar Type',
+                         'Reports', 'UTM', 'Active Campaign', 'Zoom']
+              keys = ['checked_date', 'checked_time', 'webinar_date', 'webinar_type',
+                      'reports', 'utm', 'activecampaign', 'zoom']
+              return {'mode': 'dated_business_list_most_active', 'zoom': 'copy_activecampaign'}, [
+                  {'header': header, 'key': key} for header, key in zip(headers, keys)]
 
 
           def load_identity_csv(path):
@@ -2396,8 +2744,9 @@ jobs:
               merged_utm = merge_utm_records(utm_business, utm_reg)
 
               ac = ActiveCampaignReader(os.environ['ACTIVECAMPAIGN_API_URL'], os.environ['ACTIVECAMPAIGN_API_KEY'])
-              ac_rows = sorted_records(ac.contacts(selectors['activecampaign']))
-              zoom_rows = sorted_records(ac.contacts(selectors['zoom']))
+              contacts, selected_list = ac.event_contacts(event_date)
+              ac_rows = sorted_records(contacts)
+              zoom_rows = [dict(row) for row in ac_rows]
               outdir = Path('comparison')
               outdir.mkdir(exist_ok=True)
               invalid_utm = [row for row in merged_utm if match_key(row) is None]
@@ -2437,23 +2786,29 @@ jobs:
                   raise RuntimeError('Destination spreadsheet IDs must not point to the UTM source.')
               stats_sheet = stats_book.worksheet(os.environ['DISCREPANCY_TAB_NAME'])
               headers = [column['header'] for column in layout]
-              validate_summary_layout(stats_sheet, headers)
+              validate_stats_layout(stats_sheet, headers)
               run_key = os.environ['GITHUB_RUN_ID'] + '.' + os.environ['GITHUB_RUN_ATTEMPT']
               counts = {'event_date': event_date.isoformat(), 'range_start': expected_start.isoformat(),
                         'range_end': event_date.isoformat(), 'run_time': snapshot['captured_at'], 'run_key': run_key,
                         'landing': len(ff_business), 'landing_reg': len(ff_reg), 'reports': len(ff_business) + len(ff_reg),
                         'utm': len(merged_utm), 'activecampaign': len(ac_rows), 'zoom': len(zoom_rows), 'discrepancy': len(discrepancy)}
+              checked_at = datetime.fromisoformat(snapshot['captured_at']).astimezone(ZoneInfo(snapshot['timezone']))
+              counts.update({'checked_date': checked_at.strftime('%d/%m/%Y'),
+                             'checked_time': checked_at.strftime('%I:%M %p'),
+                             'webinar_date': event_date.strftime('%d/%m/%Y'),
+                             'webinar_type': '10 minute business'})
               stats_row = [counts[column['key']] for column in layout]
               dated = {event_date.isoformat() + ' ' + label: [[row['name'], row['email'], row['phone']] for row in rows]
                        for label, rows in datasets.items()}
               published = publish_snapshot(raw_book, dated, os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT'])
-              stats_status = append_summary_with_metadata(stats_book, stats_sheet, headers, stats_row, run_key)
+              stats_status = append_summary_with_metadata(stats_book, stats_sheet, headers, stats_row, run_key, prefix_headers=True)
               (outdir / 'summary.json').write_text(json.dumps({
                   'start_date': expected_start.isoformat(), 'end_date': event_date.isoformat(),
                   'utm_event_date': event_date.isoformat(), 'timezone': snapshot['timezone'],
                   'matching_rule': 'email AND phone; FF comparison occurrences preserved; merged UTM deduplicated',
                   'reports': summary, 'totals': counts, 'published_tabs': published['titles'], 'stats_status': stats_status,
-                  'zoom_source': 'Configured ActiveCampaign event group; no Zoom API write',
+                  'activecampaign_list': selected_list,
+                  'zoom_source': 'Exact copy of selected ActiveCampaign active contacts, as requested',
               }, indent=2))
               print('COMPLETE: sorted datasets and UTM-minus-Zoom discrepancy written; Stats appended below existing rows.')
               print('Counts:', counts)
