@@ -949,7 +949,7 @@ jobs:
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
-          print('WORKFLOW REVISION: V16-R4 — latest UTM date drives the complete workflow')
+          print('WORKFLOW REVISION: V16-R5 — latest UTM date drives the complete workflow')
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
           PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
           LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
@@ -2030,14 +2030,13 @@ jobs:
               return len(identities)
 
 
-          def export_current_report(page, label, count):
+          def export_current_report(page, label):
+              # Snapshot old exports first. Returning from Downloads can reset or hide
+              # the report filter, so apply the date range only after returning.
               click_text(page, 'Downloads')
               before = wait_downloads_snapshot(page)
               click_text(page, 'Reports')
-              latest_count = wait_applied_report(page)
-              if latest_count != count:
-                  print(label + ': filtered count changed before export:', count, '->', latest_count)
-              count = latest_count
+              count = set_recorded_date_range(page)
               wait_unique(page.get_by_text('Export Data', exact=True), 'Export Data').click()
               click_text(page, 'Filtered Data')
               click_text(page, 'Downloads')
@@ -2112,11 +2111,10 @@ jobs:
                       search_published_url(page, published_url)
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
-                      count = set_recorded_date_range(page)
-                      export_current_report(page, label, count)
-                  print('VERSION 16-R4: both CSVs verified; Google Sheets remain read-only.')
+                      export_current_report(page, label)
+                  print('VERSION 16-R5: both CSVs verified; Google Sheets remain read-only.')
               except Exception as error:
-                  print('VERSION 16-R4 stopped:', type(error).__name__, str(error))
+                  print('VERSION 16-R5 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
