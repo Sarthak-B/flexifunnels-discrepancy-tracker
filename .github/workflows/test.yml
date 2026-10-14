@@ -13,7 +13,7 @@ permissions:
 jobs:
 
   test-google-sheets:
-    name: Discover latest UTM tabs and verify Sheets
+    name: Find today’s UTM tabs and verify Sheets
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -117,12 +117,23 @@ jobs:
           from zoneinfo import ZoneInfo
 
 
+          def normalized_phone(value):
+              phone = re.sub(r'[\s().\-]', '', value.strip())
+              # Remove an explicit Indian dialing prefix, never an internal 91 sequence.
+              if phone.startswith('+91'):
+                  phone = phone[3:]
+              elif phone.startswith('0091'):
+                  phone = phone[4:]
+              elif phone.startswith('+'):
+                  phone = phone[1:]
+              elif phone.startswith('00'):
+                  phone = phone[2:]
+              return phone
+
+
           def match_key(row):
               email = row['email'].strip().casefold()
-              phone = re.sub(r'[\s()+.\-]', '', row['phone'].strip())
-              if phone.startswith('00'):
-                  phone = phone[2:]
-              # Do not guess country codes or match incomplete identifiers.
+              phone = normalized_phone(row['phone'])
               if not email or not phone or not phone.isascii() or not phone.isdigit():
                   return None
               return email, phone
@@ -181,6 +192,26 @@ jobs:
                   else:
                       excluded += 1
               print('UTM timestamp-filtered rows:', len(result), '; outside range:', excluded)
+              return result
+
+
+          def read_utm_tab_contacts(worksheet):
+              # The selected tab's event date defines this cohort. Import its full data,
+              # including registrations made the previous day, as in the manual workflow.
+              values = worksheet.get_all_values()
+              if not values:
+                  raise RuntimeError('Selected UTM tab has no header row.')
+              headers = [str(value).strip().casefold() for value in values[0]]
+              required = ('first_name', 'email', 'phone')
+              if any(headers.count(key) != 1 for key in required):
+                  raise RuntimeError('UTM tab must have unique first_name, email and phone columns.')
+              indexes = {key: headers.index(key) for key in required}
+              result = []
+              for cells in values[1:]:
+                  row = {key: str(cells[indexes[key]]).strip() if indexes[key] < len(cells) else '' for key in required}
+                  if any(row.values()):
+                      result.append({'name': row['first_name'], 'email': row['email'], 'phone': row['phone']})
+              print('UTM tab contact rows imported:', len(result))
               return result
 
 
@@ -669,6 +700,75 @@ jobs:
               book.batch_update({"requests": requests})
               return "appended"
 
+
+          def publish_daily_tabs(book, datasets, event_date, finalize=False):
+              """Upsert only the six named daily tabs; reruns reuse them, newest at front."""
+              labels = ['UTM', 'LANDING PAGE', 'LANDING PAGE REG', 'ACTIVE CAMPAIGN', 'ZOOM', 'DESCREPANCY']
+              prefix = event_date.isoformat() + ' '
+              allowed = [prefix + label for label in labels]
+              if not datasets or any(title not in allowed for title in datasets):
+                  raise ValueError('Only the six daily result tabs may be published.')
+              if finalize and set(datasets) != set(allowed):
+                  raise ValueError('Final publication must contain all six result tabs.')
+              prepared = {title: _record_values(rows) for title, rows in datasets.items()}
+              sheets = list(book.worksheets())
+              existing = {sheet.title: sheet for sheet in sheets}
+              used_ids = {int(sheet.id) for sheet in sheets}
+              requests, sheet_ids, created, updated = [], {}, [], []
+              for title in allowed:
+                  if title not in prepared:
+                      continue
+                  values = prepared[title]
+                  if title in existing:
+                      sheet = existing[title]
+                      old = sheet.get_all_values(value_render_option='FORMULA')
+                      if not old or old[0] != RECORD_HEADERS or any(len(row) > 3 for row in old):
+                          raise RuntimeError('Daily tab has an unexpected layout; will not overwrite: ' + title)
+                      sheet_id = int(sheet.id)
+                      capacity = int(sheet.row_count)
+                      if len(values) > capacity:
+                          requests.append({'appendDimension': {'sheetId': sheet_id, 'dimension': 'ROWS',
+                                                                'length': len(values) - capacity}})
+                      # Clear previous record values, including stale rows after a smaller rerun.
+                      requests.append({'repeatCell': {'range': {'sheetId': sheet_id, 'startRowIndex': 0,
+                                                                 'endRowIndex': max(len(old), len(values)),
+                                                                 'startColumnIndex': 0, 'endColumnIndex': 3},
+                                                       'cell': {}, 'fields': 'userEnteredValue'}})
+                      updated.append(title)
+                  else:
+                      sheet_id = _unused_sheet_id(title, used_ids)
+                      requests.append({'addSheet': {'properties': {'sheetId': sheet_id, 'title': title,
+                          'gridProperties': {'rowCount': max(2, len(values)), 'columnCount': 3, 'frozenRowCount': 1}}}})
+                      created.append(title)
+                  sheet_ids[title] = sheet_id
+                  requests.append({'updateCells': {'start': {'sheetId': sheet_id, 'rowIndex': 0, 'columnIndex': 0},
+                      'rows': [{'values': [{'userEnteredValue': {'stringValue': cell}} for cell in row]} for row in values],
+                      'fields': 'userEnteredValue'}})
+              # Move in reverse order to index zero, producing the requested left-to-right order.
+              for title in reversed(allowed):
+                  if title in sheet_ids:
+                      requests.append({'updateSheetProperties': {'properties': {
+                          'sheetId': sheet_ids[title], 'index': 0, 'hidden': False}, 'fields': 'index,hidden'}})
+              hidden = []
+              if not finalize and prefix + 'DESCREPANCY' in existing:
+                  # Do not display the previous discrepancy alongside newly imported inputs.
+                  requests.append({'updateSheetProperties': {'properties': {
+                      'sheetId': int(existing[prefix + 'DESCREPANCY'].id), 'hidden': True}, 'fields': 'hidden'}})
+              if finalize:
+                  # Earlier versions used exact dated names followed by a run/attempt suffix.
+                  old_labels = labels + ['IMPORT LANDING PAGE', 'IMPORT LANDING PAGE REG',
+                                         'IMPORT UTM BUSINESS', 'IMPORT UTM REG', 'IMPORT ACTIVE CAMPAIGN']
+                  pattern = re.compile(r'^' + re.escape(prefix) + '(?:' + '|'.join(re.escape(x) for x in old_labels)
+                                       + r') · [1-9]\d*\.[1-9]\d*$')
+                  for sheet in sheets:
+                      if pattern.fullmatch(sheet.title):
+                          requests.append({'updateSheetProperties': {'properties': {'sheetId': int(sheet.id), 'hidden': True},
+                                                                      'fields': 'hidden'}})
+                          hidden.append(sheet.title)
+              book.batch_update({'requests': requests})
+              return {'created': created, 'updated': updated, 'hidden_legacy_tabs': hidden,
+                      'titles': {title: title for title in prepared}}
+
           """Final stage; inlined after comparison, ActiveCampaign and Sheets helpers."""
 
           def sorted_records(rows):
@@ -689,6 +789,13 @@ jobs:
                   elif not merged[seen[key]]['name'] and row['name']:
                       merged[seen[key]]['name'] = row['name']
               return sorted_records(merged)
+
+
+          def prepare_contact_rows(rows):
+              cleaned = [{'name': row['name'].strip(), 'email': row['email'].strip(),
+                          'phone': normalized_phone(row['phone'])} for row in rows]
+              # Select email AND phone as the duplicate key, then sort retained records.
+              return merge_utm_records(sorted_records(cleaned), [])
 
 
           def required_configuration(event_date):
@@ -782,26 +889,32 @@ jobs:
               stats_sheet = stats_book.worksheet(os.environ['DISCREPANCY_TAB_NAME'])
               headers = [column['header'] for column in layout]
               validate_stats_layout(stats_sheet, headers)
-              print('STAGE 1: Import source records into Descrepancy workbook:', raw_book.title)
-              source_datasets = {'IMPORT LANDING PAGE': ff_business, 'IMPORT LANDING PAGE REG': ff_reg,
-                                 'IMPORT UTM BUSINESS': utm_business, 'IMPORT UTM REG': utm_reg,
-                                 'IMPORT ACTIVE CAMPAIGN': ac_rows}
+              print('Clean all datasets: sort, deduplicate email+phone pairs, remove explicit +91 prefixes.')
+              raw_counts = {'landing': len(ff_business), 'landing_reg': len(ff_reg),
+                            'utm_business': len(utm_business), 'utm_reg': len(utm_reg), 'activecampaign': len(ac_rows)}
+              ff_business = prepare_contact_rows(ff_business)
+              ff_reg = prepare_contact_rows(ff_reg)
+              utm_business = prepare_contact_rows(utm_business)
+              utm_reg = prepare_contact_rows(utm_reg)
+              ac_rows = prepare_contact_rows(ac_rows)
+              zoom_rows = [dict(row) for row in ac_rows]
+              print('STAGE 1: Update the five daily data tabs in Descrepancy:', raw_book.title)
+              merged_utm = merge_utm_records(utm_business, utm_reg)
+              source_datasets = {'UTM': merged_utm, 'LANDING PAGE': sorted_records(ff_business),
+                                 'LANDING PAGE REG': sorted_records(ff_reg),
+                                 'ACTIVE CAMPAIGN': sorted_records(ac_rows), 'ZOOM': sorted_records(zoom_rows)}
               imported_matrices = sheet_matrices(event_date, source_datasets)
-              imported = publish_snapshot(raw_book, imported_matrices, os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT'])
+              imported = publish_daily_tabs(raw_book, imported_matrices, event_date)
               publication = {'stage': 'sources_imported', 'raw_spreadsheet_id': raw_book.id,
                              'source_tabs': imported['titles'], 'stats_status': 'not_written'}
               (outdir / 'publication.json').write_text(json.dumps(publication, indent=2))
-              print('Imported tabs:', imported['titles'])
+              print('Daily data tabs:', imported['titles'])
               stored = read_verified_snapshot(raw_book, imported['titles'], imported_matrices)
               key = lambda label: event_date.isoformat() + ' ' + label
-              ff_business = sorted_records(stored[key('IMPORT LANDING PAGE')])
-              ff_reg = sorted_records(stored[key('IMPORT LANDING PAGE REG')])
-              utm_business = stored[key('IMPORT UTM BUSINESS')]
-              utm_reg = stored[key('IMPORT UTM REG')]
-              ac_rows = sorted_records(stored[key('IMPORT ACTIVE CAMPAIGN')])
-              zoom_rows = [dict(row) for row in ac_rows]
-              print('STAGE 2: Merge, sort and compare the imported records.')
-              merged_utm = merge_utm_records(utm_business, utm_reg)
+              ff_business, ff_reg = stored[key('LANDING PAGE')], stored[key('LANDING PAGE REG')]
+              merged_utm, ac_rows = stored[key('UTM')], stored[key('ACTIVE CAMPAIGN')]
+              zoom_rows = stored[key('ZOOM')]
+              print('STAGE 2: Compare the records from these daily tabs.')
               zoom_keys = {match_key(row) for row in zoom_rows if match_key(row) is not None}
               discrepancy = [row for row in merged_utm if match_key(row) not in zoom_keys]
 
@@ -812,26 +925,27 @@ jobs:
                       write_rows(outdir / (label + '-' + suffix + '.csv'), sorted_records(rows))
                   summary[label] = {'flexifunnels_rows': len(ff), 'utm_rows': len(utm), 'matched_rows': len(matched),
                                     'missing_from_utm': len(ff_only), 'missing_from_flexifunnels': len(utm_only)}
-              datasets = {'LANDING PAGE': ff_business, 'LANDING PAGE REG': ff_reg,
-                          'UTM': merged_utm, 'ACTIVE CAMPAIGN': ac_rows, 'ZOOM': zoom_rows,
+              datasets = {'UTM': merged_utm, 'LANDING PAGE': ff_business, 'LANDING PAGE REG': ff_reg, 'ACTIVE CAMPAIGN': ac_rows, 'ZOOM': zoom_rows,
                           'DESCREPANCY': discrepancy}
               for label, rows in datasets.items():
                   write_rows(outdir / (label.lower().replace(' ', '-') + '.csv'), rows)
 
               print('STAGE 3: Save and verify completed result tabs in Descrepancy.')
               dated = sheet_matrices(event_date, datasets)
-              published = publish_snapshot(raw_book, dated, os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT'])
-              publication.update({'stage': 'results_saved', 'result_tabs': published['titles']})
+              published = publish_daily_tabs(raw_book, dated, event_date, finalize=True)
+              publication.update({'stage': 'results_saved', 'result_tabs': published['titles'],
+                                  'hidden_legacy_tabs': published['hidden_legacy_tabs']})
               (outdir / 'publication.json').write_text(json.dumps(publication, indent=2))
               saved = read_verified_snapshot(raw_book, published['titles'], dated)
               ff_business, ff_reg = saved[key('LANDING PAGE')], saved[key('LANDING PAGE REG')]
               merged_utm, ac_rows = saved[key('UTM')], saved[key('ACTIVE CAMPAIGN')]
               zoom_rows, discrepancy = saved[key('ZOOM')], saved[key('DESCREPANCY')]
               print('STAGE 4: Append totals from verified result tabs to Discrepancy Stats.')
+              merged_reports = prepare_contact_rows(ff_business + ff_reg)
               run_key = os.environ['GITHUB_RUN_ID'] + '.' + os.environ['GITHUB_RUN_ATTEMPT']
               counts = {'event_date': event_date.isoformat(), 'range_start': expected_start.isoformat(),
                         'range_end': event_date.isoformat(), 'run_time': snapshot['captured_at'], 'run_key': run_key,
-                        'landing': len(ff_business), 'landing_reg': len(ff_reg), 'reports': len(ff_business) + len(ff_reg),
+                        'landing': len(ff_business), 'landing_reg': len(ff_reg), 'reports': len(merged_reports),
                         'utm': len(merged_utm), 'activecampaign': len(ac_rows), 'zoom': len(zoom_rows), 'discrepancy': len(discrepancy)}
               checked_at = datetime.fromisoformat(snapshot['captured_at']).astimezone(ZoneInfo(snapshot['timezone']))
               counts.update({'checked_date': checked_at.strftime('%d/%m/%Y'),
@@ -845,7 +959,8 @@ jobs:
               (outdir / 'summary.json').write_text(json.dumps({
                   'start_date': expected_start.isoformat(), 'end_date': event_date.isoformat(),
                   'utm_event_date': event_date.isoformat(), 'timezone': snapshot['timezone'],
-                  'matching_rule': 'email AND phone; FF comparison occurrences preserved; merged UTM deduplicated',
+                  'matching_rule': 'email AND phone after removing explicit +91; all tabs deduplicated',
+                  'raw_source_counts': raw_counts,
                   'source_tabs': imported['titles'],
                   'reports': summary, 'totals': counts, 'published_tabs': published['titles'], 'stats_status': stats_status,
                   'activecampaign_list': selected_list,
@@ -858,7 +973,7 @@ jobs:
           from datetime import date
 
 
-          def discover_daily_utm_tabs(worksheets):
+          def discover_daily_utm_tabs(worksheets, target_date=None):
               """Return (event_date, business_tab, registration_tab) for the latest date.
 
               A date is eligible only when its titles match the user's two 7:30 PM,
@@ -896,28 +1011,28 @@ jobs:
                       'No daily UTM tabs match the 7:30 PM Flexi Genie 10 Min/Mins '
                       'Business/Busines or Reg team naming patterns.'
                   )
-              target_date = max(matches_by_date)
+              target_date = target_date or max(matches_by_date)
+              if target_date not in matches_by_date:
+                  raise RuntimeError('No UTM tab pair found for the required date ' + target_date.isoformat() + '. No other date substituted.')
               matches = matches_by_date[target_date]
               for kind, items in matches.items():
                   if len(items) != 1:
                       raise RuntimeError(
-                          'Latest UTM event date is ' + target_date.isoformat()
+                          'Required UTM event date is ' + target_date.isoformat()
                           + '. Expected exactly one ' + kind + ' tab'
                           + '; found ' + str(len(items)) + '. No older tab will be substituted.'
                       )
               return target_date, matches['business'][0], matches['registration'][0]
 
-          # Inspect UTM first. The newest matching date ends the report window.
+          # Inspect UTM first for the current date in India. Do not substitute future tabs.
           # 14 Oct tabs -> 13–14 Oct reports; 15 Oct tabs -> 14–15 Oct reports.
           timezone_name = os.environ.get('TIMEZONE', '').strip() or 'Asia/Kolkata'
           run_date = datetime.now(ZoneInfo(timezone_name)).date()
-          target_tab_date, landing_tab, reg_tab = discover_daily_utm_tabs(opened['UTM'].worksheets())
+          target_tab_date, landing_tab, reg_tab = discover_daily_utm_tabs(opened['UTM'].worksheets(), target_date=run_date)
           print('UTM target event date:', target_tab_date.isoformat())
           print('Business tab selected:', landing_tab.title)
           print('Registration tab selected:', reg_tab.title)
           print('Required FlexiFunnels range:', (target_tab_date - timedelta(days=1)).isoformat(), 'through', target_tab_date.isoformat())
-          if target_tab_date > run_date:
-              raise RuntimeError('Newest UTM tabs are future-dated. The recorded FlexiFunnels calendar disables future dates. Run on or after ' + target_tab_date.isoformat() + ' to export this exact range. No earlier tabs substituted.')
 
           discrepancy_name = os.environ['DISCREPANCY_TAB_NAME'].strip()
           stats_sheet = opened['DISCREPANCY STATS'].worksheet(discrepancy_name)
@@ -931,8 +1046,8 @@ jobs:
               raise RuntimeError('UTM source must be separate from the destination spreadsheets.')
           start_date = target_tab_date - timedelta(days=1)
           timezone = ZoneInfo(timezone_name)
-          business_rows = read_utm_rows(landing_tab, start_date, target_tab_date, timezone)
-          registration_rows = read_utm_rows(reg_tab, start_date, target_tab_date, timezone)
+          business_rows = read_utm_tab_contacts(landing_tab)
+          registration_rows = read_utm_tab_contacts(reg_tab)
           Path('utm').mkdir(exist_ok=True)
           write_rows(Path('utm/business.csv'), business_rows)
           write_rows(Path('utm/registration.csv'), registration_rows)
@@ -1003,7 +1118,7 @@ jobs:
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
-          print('WORKFLOW REVISION: V16-R6 — latest UTM date drives the complete workflow')
+          print('WORKFLOW REVISION: V16-R9 — current India date drives the complete workflow')
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
           PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
           LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
@@ -2166,9 +2281,9 @@ jobs:
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 16-R6: both CSVs verified; Google Sheets remain read-only.')
+                  print('VERSION 16-R9: both CSVs verified; Google Sheets remain read-only.')
               except Exception as error:
-                  print('VERSION 16-R6 stopped:', type(error).__name__, str(error))
+                  print('VERSION 16-R9 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
@@ -2237,12 +2352,23 @@ jobs:
           from zoneinfo import ZoneInfo
 
 
+          def normalized_phone(value):
+              phone = re.sub(r'[\s().\-]', '', value.strip())
+              # Remove an explicit Indian dialing prefix, never an internal 91 sequence.
+              if phone.startswith('+91'):
+                  phone = phone[3:]
+              elif phone.startswith('0091'):
+                  phone = phone[4:]
+              elif phone.startswith('+'):
+                  phone = phone[1:]
+              elif phone.startswith('00'):
+                  phone = phone[2:]
+              return phone
+
+
           def match_key(row):
               email = row['email'].strip().casefold()
-              phone = re.sub(r'[\s()+.\-]', '', row['phone'].strip())
-              if phone.startswith('00'):
-                  phone = phone[2:]
-              # Do not guess country codes or match incomplete identifiers.
+              phone = normalized_phone(row['phone'])
               if not email or not phone or not phone.isascii() or not phone.isdigit():
                   return None
               return email, phone
@@ -2301,6 +2427,26 @@ jobs:
                   else:
                       excluded += 1
               print('UTM timestamp-filtered rows:', len(result), '; outside range:', excluded)
+              return result
+
+
+          def read_utm_tab_contacts(worksheet):
+              # The selected tab's event date defines this cohort. Import its full data,
+              # including registrations made the previous day, as in the manual workflow.
+              values = worksheet.get_all_values()
+              if not values:
+                  raise RuntimeError('Selected UTM tab has no header row.')
+              headers = [str(value).strip().casefold() for value in values[0]]
+              required = ('first_name', 'email', 'phone')
+              if any(headers.count(key) != 1 for key in required):
+                  raise RuntimeError('UTM tab must have unique first_name, email and phone columns.')
+              indexes = {key: headers.index(key) for key in required}
+              result = []
+              for cells in values[1:]:
+                  row = {key: str(cells[indexes[key]]).strip() if indexes[key] < len(cells) else '' for key in required}
+                  if any(row.values()):
+                      result.append({'name': row['first_name'], 'email': row['email'], 'phone': row['phone']})
+              print('UTM tab contact rows imported:', len(result))
               return result
 
 
@@ -2789,6 +2935,75 @@ jobs:
               book.batch_update({"requests": requests})
               return "appended"
 
+
+          def publish_daily_tabs(book, datasets, event_date, finalize=False):
+              """Upsert only the six named daily tabs; reruns reuse them, newest at front."""
+              labels = ['UTM', 'LANDING PAGE', 'LANDING PAGE REG', 'ACTIVE CAMPAIGN', 'ZOOM', 'DESCREPANCY']
+              prefix = event_date.isoformat() + ' '
+              allowed = [prefix + label for label in labels]
+              if not datasets or any(title not in allowed for title in datasets):
+                  raise ValueError('Only the six daily result tabs may be published.')
+              if finalize and set(datasets) != set(allowed):
+                  raise ValueError('Final publication must contain all six result tabs.')
+              prepared = {title: _record_values(rows) for title, rows in datasets.items()}
+              sheets = list(book.worksheets())
+              existing = {sheet.title: sheet for sheet in sheets}
+              used_ids = {int(sheet.id) for sheet in sheets}
+              requests, sheet_ids, created, updated = [], {}, [], []
+              for title in allowed:
+                  if title not in prepared:
+                      continue
+                  values = prepared[title]
+                  if title in existing:
+                      sheet = existing[title]
+                      old = sheet.get_all_values(value_render_option='FORMULA')
+                      if not old or old[0] != RECORD_HEADERS or any(len(row) > 3 for row in old):
+                          raise RuntimeError('Daily tab has an unexpected layout; will not overwrite: ' + title)
+                      sheet_id = int(sheet.id)
+                      capacity = int(sheet.row_count)
+                      if len(values) > capacity:
+                          requests.append({'appendDimension': {'sheetId': sheet_id, 'dimension': 'ROWS',
+                                                                'length': len(values) - capacity}})
+                      # Clear previous record values, including stale rows after a smaller rerun.
+                      requests.append({'repeatCell': {'range': {'sheetId': sheet_id, 'startRowIndex': 0,
+                                                                 'endRowIndex': max(len(old), len(values)),
+                                                                 'startColumnIndex': 0, 'endColumnIndex': 3},
+                                                       'cell': {}, 'fields': 'userEnteredValue'}})
+                      updated.append(title)
+                  else:
+                      sheet_id = _unused_sheet_id(title, used_ids)
+                      requests.append({'addSheet': {'properties': {'sheetId': sheet_id, 'title': title,
+                          'gridProperties': {'rowCount': max(2, len(values)), 'columnCount': 3, 'frozenRowCount': 1}}}})
+                      created.append(title)
+                  sheet_ids[title] = sheet_id
+                  requests.append({'updateCells': {'start': {'sheetId': sheet_id, 'rowIndex': 0, 'columnIndex': 0},
+                      'rows': [{'values': [{'userEnteredValue': {'stringValue': cell}} for cell in row]} for row in values],
+                      'fields': 'userEnteredValue'}})
+              # Move in reverse order to index zero, producing the requested left-to-right order.
+              for title in reversed(allowed):
+                  if title in sheet_ids:
+                      requests.append({'updateSheetProperties': {'properties': {
+                          'sheetId': sheet_ids[title], 'index': 0, 'hidden': False}, 'fields': 'index,hidden'}})
+              hidden = []
+              if not finalize and prefix + 'DESCREPANCY' in existing:
+                  # Do not display the previous discrepancy alongside newly imported inputs.
+                  requests.append({'updateSheetProperties': {'properties': {
+                      'sheetId': int(existing[prefix + 'DESCREPANCY'].id), 'hidden': True}, 'fields': 'hidden'}})
+              if finalize:
+                  # Earlier versions used exact dated names followed by a run/attempt suffix.
+                  old_labels = labels + ['IMPORT LANDING PAGE', 'IMPORT LANDING PAGE REG',
+                                         'IMPORT UTM BUSINESS', 'IMPORT UTM REG', 'IMPORT ACTIVE CAMPAIGN']
+                  pattern = re.compile(r'^' + re.escape(prefix) + '(?:' + '|'.join(re.escape(x) for x in old_labels)
+                                       + r') · [1-9]\d*\.[1-9]\d*$')
+                  for sheet in sheets:
+                      if pattern.fullmatch(sheet.title):
+                          requests.append({'updateSheetProperties': {'properties': {'sheetId': int(sheet.id), 'hidden': True},
+                                                                      'fields': 'hidden'}})
+                          hidden.append(sheet.title)
+              book.batch_update({'requests': requests})
+              return {'created': created, 'updated': updated, 'hidden_legacy_tabs': hidden,
+                      'titles': {title: title for title in prepared}}
+
           """Final stage; inlined after comparison, ActiveCampaign and Sheets helpers."""
 
           def sorted_records(rows):
@@ -2809,6 +3024,13 @@ jobs:
                   elif not merged[seen[key]]['name'] and row['name']:
                       merged[seen[key]]['name'] = row['name']
               return sorted_records(merged)
+
+
+          def prepare_contact_rows(rows):
+              cleaned = [{'name': row['name'].strip(), 'email': row['email'].strip(),
+                          'phone': normalized_phone(row['phone'])} for row in rows]
+              # Select email AND phone as the duplicate key, then sort retained records.
+              return merge_utm_records(sorted_records(cleaned), [])
 
 
           def required_configuration(event_date):
@@ -2902,26 +3124,32 @@ jobs:
               stats_sheet = stats_book.worksheet(os.environ['DISCREPANCY_TAB_NAME'])
               headers = [column['header'] for column in layout]
               validate_stats_layout(stats_sheet, headers)
-              print('STAGE 1: Import source records into Descrepancy workbook:', raw_book.title)
-              source_datasets = {'IMPORT LANDING PAGE': ff_business, 'IMPORT LANDING PAGE REG': ff_reg,
-                                 'IMPORT UTM BUSINESS': utm_business, 'IMPORT UTM REG': utm_reg,
-                                 'IMPORT ACTIVE CAMPAIGN': ac_rows}
+              print('Clean all datasets: sort, deduplicate email+phone pairs, remove explicit +91 prefixes.')
+              raw_counts = {'landing': len(ff_business), 'landing_reg': len(ff_reg),
+                            'utm_business': len(utm_business), 'utm_reg': len(utm_reg), 'activecampaign': len(ac_rows)}
+              ff_business = prepare_contact_rows(ff_business)
+              ff_reg = prepare_contact_rows(ff_reg)
+              utm_business = prepare_contact_rows(utm_business)
+              utm_reg = prepare_contact_rows(utm_reg)
+              ac_rows = prepare_contact_rows(ac_rows)
+              zoom_rows = [dict(row) for row in ac_rows]
+              print('STAGE 1: Update the five daily data tabs in Descrepancy:', raw_book.title)
+              merged_utm = merge_utm_records(utm_business, utm_reg)
+              source_datasets = {'UTM': merged_utm, 'LANDING PAGE': sorted_records(ff_business),
+                                 'LANDING PAGE REG': sorted_records(ff_reg),
+                                 'ACTIVE CAMPAIGN': sorted_records(ac_rows), 'ZOOM': sorted_records(zoom_rows)}
               imported_matrices = sheet_matrices(event_date, source_datasets)
-              imported = publish_snapshot(raw_book, imported_matrices, os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT'])
+              imported = publish_daily_tabs(raw_book, imported_matrices, event_date)
               publication = {'stage': 'sources_imported', 'raw_spreadsheet_id': raw_book.id,
                              'source_tabs': imported['titles'], 'stats_status': 'not_written'}
               (outdir / 'publication.json').write_text(json.dumps(publication, indent=2))
-              print('Imported tabs:', imported['titles'])
+              print('Daily data tabs:', imported['titles'])
               stored = read_verified_snapshot(raw_book, imported['titles'], imported_matrices)
               key = lambda label: event_date.isoformat() + ' ' + label
-              ff_business = sorted_records(stored[key('IMPORT LANDING PAGE')])
-              ff_reg = sorted_records(stored[key('IMPORT LANDING PAGE REG')])
-              utm_business = stored[key('IMPORT UTM BUSINESS')]
-              utm_reg = stored[key('IMPORT UTM REG')]
-              ac_rows = sorted_records(stored[key('IMPORT ACTIVE CAMPAIGN')])
-              zoom_rows = [dict(row) for row in ac_rows]
-              print('STAGE 2: Merge, sort and compare the imported records.')
-              merged_utm = merge_utm_records(utm_business, utm_reg)
+              ff_business, ff_reg = stored[key('LANDING PAGE')], stored[key('LANDING PAGE REG')]
+              merged_utm, ac_rows = stored[key('UTM')], stored[key('ACTIVE CAMPAIGN')]
+              zoom_rows = stored[key('ZOOM')]
+              print('STAGE 2: Compare the records from these daily tabs.')
               zoom_keys = {match_key(row) for row in zoom_rows if match_key(row) is not None}
               discrepancy = [row for row in merged_utm if match_key(row) not in zoom_keys]
 
@@ -2932,26 +3160,27 @@ jobs:
                       write_rows(outdir / (label + '-' + suffix + '.csv'), sorted_records(rows))
                   summary[label] = {'flexifunnels_rows': len(ff), 'utm_rows': len(utm), 'matched_rows': len(matched),
                                     'missing_from_utm': len(ff_only), 'missing_from_flexifunnels': len(utm_only)}
-              datasets = {'LANDING PAGE': ff_business, 'LANDING PAGE REG': ff_reg,
-                          'UTM': merged_utm, 'ACTIVE CAMPAIGN': ac_rows, 'ZOOM': zoom_rows,
+              datasets = {'UTM': merged_utm, 'LANDING PAGE': ff_business, 'LANDING PAGE REG': ff_reg, 'ACTIVE CAMPAIGN': ac_rows, 'ZOOM': zoom_rows,
                           'DESCREPANCY': discrepancy}
               for label, rows in datasets.items():
                   write_rows(outdir / (label.lower().replace(' ', '-') + '.csv'), rows)
 
               print('STAGE 3: Save and verify completed result tabs in Descrepancy.')
               dated = sheet_matrices(event_date, datasets)
-              published = publish_snapshot(raw_book, dated, os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT'])
-              publication.update({'stage': 'results_saved', 'result_tabs': published['titles']})
+              published = publish_daily_tabs(raw_book, dated, event_date, finalize=True)
+              publication.update({'stage': 'results_saved', 'result_tabs': published['titles'],
+                                  'hidden_legacy_tabs': published['hidden_legacy_tabs']})
               (outdir / 'publication.json').write_text(json.dumps(publication, indent=2))
               saved = read_verified_snapshot(raw_book, published['titles'], dated)
               ff_business, ff_reg = saved[key('LANDING PAGE')], saved[key('LANDING PAGE REG')]
               merged_utm, ac_rows = saved[key('UTM')], saved[key('ACTIVE CAMPAIGN')]
               zoom_rows, discrepancy = saved[key('ZOOM')], saved[key('DESCREPANCY')]
               print('STAGE 4: Append totals from verified result tabs to Discrepancy Stats.')
+              merged_reports = prepare_contact_rows(ff_business + ff_reg)
               run_key = os.environ['GITHUB_RUN_ID'] + '.' + os.environ['GITHUB_RUN_ATTEMPT']
               counts = {'event_date': event_date.isoformat(), 'range_start': expected_start.isoformat(),
                         'range_end': event_date.isoformat(), 'run_time': snapshot['captured_at'], 'run_key': run_key,
-                        'landing': len(ff_business), 'landing_reg': len(ff_reg), 'reports': len(ff_business) + len(ff_reg),
+                        'landing': len(ff_business), 'landing_reg': len(ff_reg), 'reports': len(merged_reports),
                         'utm': len(merged_utm), 'activecampaign': len(ac_rows), 'zoom': len(zoom_rows), 'discrepancy': len(discrepancy)}
               checked_at = datetime.fromisoformat(snapshot['captured_at']).astimezone(ZoneInfo(snapshot['timezone']))
               counts.update({'checked_date': checked_at.strftime('%d/%m/%Y'),
@@ -2965,7 +3194,8 @@ jobs:
               (outdir / 'summary.json').write_text(json.dumps({
                   'start_date': expected_start.isoformat(), 'end_date': event_date.isoformat(),
                   'utm_event_date': event_date.isoformat(), 'timezone': snapshot['timezone'],
-                  'matching_rule': 'email AND phone; FF comparison occurrences preserved; merged UTM deduplicated',
+                  'matching_rule': 'email AND phone after removing explicit +91; all tabs deduplicated',
+                  'raw_source_counts': raw_counts,
                   'source_tabs': imported['titles'],
                   'reports': summary, 'totals': counts, 'published_tabs': published['titles'], 'stats_status': stats_status,
                   'activecampaign_list': selected_list,
