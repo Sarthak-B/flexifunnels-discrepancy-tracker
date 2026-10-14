@@ -3100,14 +3100,11 @@ jobs:
 
           def zoom_input_range(page):
               try:
-                  values = page.evaluate('''() => Array.from(document.querySelectorAll('input'))
-                      .filter(el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
-                      .map(el => el.value || '')''')
-              except Exception:
+                  start = zoom_box_value(zoom_date_box(page, 'From', seconds=2))
+                  end = zoom_box_value(zoom_date_box(page, 'To', seconds=2))
+              except RuntimeError:
                   return None
-              dates = [zoom_date_value(value) for value in values]
-              dates = [day for day in dates if day is not None]
-              return (dates[0], dates[1]) if len(dates) == 2 else None
+              return (start, end) if start and end else None
 
 
           def zoom_displayed_range(page):
@@ -3194,13 +3191,61 @@ jobs:
           ZOOM_MONTHS = 'January February March April May June July August September October November December'.split()
 
 
-          def zoom_date_box(page, label):
-              """The date box that follows the visible 'From' or 'To' label."""
-              caption = zoom_one(page.get_by_text(label, exact=True), label + ' label', seconds=15)
-              box = caption.locator('xpath=following::input[1]')
-              if box.count() == 1 and box.is_visible():
-                  return box
-              raise RuntimeError('Zoom ' + label + ' date box was not found next to its label.')
+          ZOOM_BOX_JS = '''(label) => {
+              const visible = el => {
+                  const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+                  return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              document.querySelectorAll('[data-ff-box="' + label + '"]').forEach(el => el.removeAttribute('data-ff-box'));
+              let labels = Array.from(document.querySelectorAll('body *'))
+                  .filter(el => visible(el) && (el.innerText || '').trim() === label);
+              labels = labels.filter(el => !labels.some(other => other !== el && el.contains(other)));
+              if (labels.length !== 1) return {status: 'label', count: labels.length};
+              const L = labels[0].getBoundingClientRect();
+              const middle = (L.top + L.bottom) / 2;
+              const sameRowRight = el => {
+                  const r = el.getBoundingClientRect();
+                  return Math.abs((r.top + r.bottom) / 2 - middle) <= 25 && r.left >= L.right - 2;
+              };
+              const dateRe = /^\\s*\\d{1,2}\\/\\d{1,2}\\/\\d{4}\\s*$/;
+              let best = null;
+              for (const el of document.querySelectorAll('body *')) {
+                  if (!visible(el) || !sameRowRight(el)) continue;
+                  const text = el.tagName === 'INPUT' ? (el.value || '') : (el.children.length ? '' : (el.textContent || ''));
+                  if (!dateRe.test(text)) continue;
+                  const left = el.getBoundingClientRect().left;
+                  if (!best || left < best[0]) best = [left, el];
+              }
+              if (!best) {
+                  for (const el of document.querySelectorAll('input, [role="combobox"], [class*="date" i], [class*="picker" i]')) {
+                      if (!visible(el) || !sameRowRight(el) || /search/i.test(el.getAttribute('placeholder') || '')) continue;
+                      const left = el.getBoundingClientRect().left;
+                      if (!best || left < best[0]) best = [left, el];
+                  }
+              }
+              if (!best) return {status: 'box'};
+              best[1].setAttribute('data-ff-box', label);
+              return {status: 'ok', tag: best[1].tagName, text: best[1].tagName === 'INPUT' ? best[1].value : best[1].textContent.trim()};
+          }'''
+
+
+          def zoom_date_box(page, label, seconds=15):
+              # The box showing a date on the same line as the visible 'From' / 'To' label.
+              deadline = time.monotonic() + seconds
+              found = None
+              while time.monotonic() < deadline:
+                  found = page.evaluate(ZOOM_BOX_JS, label)
+                  if found and found.get('status') == 'ok':
+                      return page.locator('[data-ff-box="' + label + '"]')
+                  time.sleep(0.5)
+              raise RuntimeError('Zoom ' + label + ' date box was not found next to its label (' + str(found) + ').')
+
+
+          def zoom_box_value(box):
+              try:
+                  return zoom_date_value(box.evaluate("el => el.tagName === 'INPUT' ? el.value : el.innerText"))
+              except Exception:
+                  return None
 
 
           ZOOM_CALENDAR_JS = '''() => {
@@ -3276,7 +3321,7 @@ jobs:
               if popup is not None:
                   return popup, shown
               # Try the calendar icon beside the box.
-              icons = zoom_visible(box.locator('xpath=ancestor::*[1]').locator('svg, i, [class*="icon"]'))
+              icons = zoom_visible(box.locator('xpath=ancestor::*[2]').locator('svg, i, [class*="icon"]'))
               for icon in icons[:2]:
                   icon.click()
                   popup, shown = zoom_calendar(page)
@@ -3285,6 +3330,10 @@ jobs:
               Path('zoom-diagnostics').mkdir(exist_ok=True)
               try:
                   page.screenshot(path='zoom-diagnostics/calendar-' + label.lower() + '.png', full_page=True)
+                  # The filter row only (dates, dropdown, buttons); no registrant data.
+                  html = box.evaluate('''el => { let n = el; for (let i = 0; i < 4 && n.parentElement; i++) n = n.parentElement;
+                                                 return n.outerHTML.slice(0, 30000); }''')
+                  (Path('zoom-diagnostics') / ('filter-row-' + label.lower() + '.html')).write_text(html)
               except Exception:
                   pass
               raise RuntimeError('Zoom ' + label + ' calendar did not open (see calendar-' + label.lower() + '.png).')
@@ -3345,7 +3394,7 @@ jobs:
               cells.nth(index).click()
               page.wait_for_timeout(800)
               zoom_close_calendar(page)
-              value = zoom_date_value(box.input_value()) if box.count() == 1 else None
+              value = zoom_box_value(zoom_date_box(page, label, seconds=5))
               if value is not None and value != target:
                   raise RuntimeError('Zoom ' + label + ' shows ' + value.isoformat() + ' after picking '
                                      + target.isoformat() + '.')
