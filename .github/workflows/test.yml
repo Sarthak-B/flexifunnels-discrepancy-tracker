@@ -3203,61 +3203,122 @@ jobs:
               raise RuntimeError('Zoom ' + label + ' date box was not found next to its label.')
 
 
-          def zoom_calendar(page):
-              """The open calendar popup: the block around a 'Month YYYY' header that holds day numbers."""
-              header_pattern = re.compile(r'^\s*(' + '|'.join(ZOOM_MONTHS) + r')\s+(\d{4})\s*$')
-              deadline = time.monotonic() + 10
+          ZOOM_CALENDAR_JS = '''() => {
+              const months = ['January','February','March','April','May','June','July','August',
+                              'September','October','November','December'];
+              const shortMonths = months.map(m => m.slice(0, 3));
+              const visible = el => {
+                  const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+                  return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              const monthRe = new RegExp('\\\\b(' + months.join('|') + '|' + shortMonths.join('|') + ')\\\\b');
+              document.querySelectorAll('[data-ff-cal],[data-ff-prev],[data-ff-next]').forEach(el => {
+                  el.removeAttribute('data-ff-cal'); el.removeAttribute('data-ff-prev'); el.removeAttribute('data-ff-next');
+              });
+              // Smallest visible block that shows a month name, a year and one month of day numbers.
+              let best = null;
+              for (const el of document.querySelectorAll('body *')) {
+                  if (!visible(el)) continue;
+                  const text = el.innerText || '';
+                  if (!monthRe.test(text) || !/\\b20\\d\\d\\b/.test(text)) continue;
+                  const days = Array.from(el.querySelectorAll('*')).filter(c => !c.children.length && visible(c)
+                                    && /^\\d{1,2}$/.test((c.textContent || '').trim()));
+                  const nums = new Set(days.map(c => c.textContent.trim()));
+                  if (!nums.has('1') || !nums.has('15') || !nums.has('28') || days.length > 50) continue;
+                  if (!best || best.contains(el)) best = el;
+              }
+              if (!best) return null;
+              best.setAttribute('data-ff-cal', '1');
+              const text = best.innerText;
+              const monthMatch = text.match(monthRe);
+              const year = (text.match(/\\b(20\\d\\d)\\b/) || [])[1];
+              const label = monthMatch[1];
+              const month = (months.indexOf(label) >= 0 ? months.indexOf(label) : shortMonths.indexOf(label)) + 1;
+              // Header = leaf elements holding the month name or the year.
+              const heads = Array.from(best.querySelectorAll('*')).filter(c => !c.children.length && visible(c)
+                                && (monthRe.test(c.textContent || '') || /^\\s*20\\d\\d\\s*$/.test(c.textContent || '')));
+              if (heads.length) {
+                  const boxes = heads.map(h => h.getBoundingClientRect());
+                  const left = Math.min(...boxes.map(b => b.left)), right = Math.max(...boxes.map(b => b.right));
+                  const middle = (Math.min(...boxes.map(b => b.top)) + Math.max(...boxes.map(b => b.bottom))) / 2;
+                  let prev = null, next = null;
+                  for (const c of best.querySelectorAll('button, [role="button"], a, i, svg, span')) {
+                      if (!visible(c) || heads.includes(c)) continue;
+                      const r = c.getBoundingClientRect();
+                      const t = (c.innerText || '').trim();
+                      if (r.width > 40 || Math.abs((r.top + r.bottom) / 2 - middle) > 15) continue;
+                      if (t && !/^[<>‹›«»]+$/.test(t)) continue;
+                      const centre = (r.left + r.right) / 2;
+                      if (centre < left && (!prev || centre > prev[0])) prev = [centre, c];
+                      if (centre > right && (!next || centre < next[0])) next = [centre, c];
+                  }
+                  if (prev) prev[1].setAttribute('data-ff-prev', '1');
+                  if (next) next[1].setAttribute('data-ff-next', '1');
+              }
+              return {year: Number(year), month: month};
+          }'''
+
+
+          def zoom_calendar(page, seconds=6):
+              """The open calendar popup and the (year, month) it shows."""
+              deadline = time.monotonic() + seconds
               while time.monotonic() < deadline:
-                  headers = zoom_visible(page.get_by_text(header_pattern))
-                  if headers:
-                      header = headers[-1]
-                      popup = header.locator("xpath=ancestor::*[.//*[normalize-space(.)='28'] "
-                                             "and .//*[normalize-space(.)='14']][1]")
-                      if popup.count() == 1 and popup.is_visible():
-                          month, year = header_pattern.match(header.inner_text()).groups()
-                          return popup, header, (int(year), ZOOM_MONTHS.index(month) + 1)
-                  time.sleep(0.25)
-              raise RuntimeError('Zoom calendar did not open.')
+                  found = page.evaluate(ZOOM_CALENDAR_JS)
+                  if found and found.get('year') and found.get('month'):
+                      return page.locator('[data-ff-cal="1"]'), (found['year'], found['month'])
+                  time.sleep(0.3)
+              return None, None
 
 
-          def zoom_calendar_arrows(popup, header):
-              """Return (previous-month, next-month) controls: the arrows nearest the month header."""
-              head = header.bounding_box()
-              middle = head['y'] + head['height'] / 2
-              left, right = [], []
-              for item in zoom_visible(popup.locator('button, [role="button"], a, i, svg, span')):
-                  box = item.bounding_box()
-                  if not box or box['width'] > 40 or abs(box['y'] + box['height'] / 2 - middle) > 15:
-                      continue
-                  if (item.inner_text() or '').strip() and not re.fullmatch(r'[<>‹›«»]+', item.inner_text().strip()):
-                      continue
-                  centre = box['x'] + box['width'] / 2
-                  if centre < head['x']:
-                      left.append((centre, item))
-                  elif centre > head['x'] + head['width']:
-                      right.append((centre, item))
-              previous = max(left, key=lambda entry: entry[0])[1] if left else None
-              following = min(right, key=lambda entry: entry[0])[1] if right else None
-              return previous, following
+          def zoom_open_calendar(page, box, label):
+              box.click()
+              popup, shown = zoom_calendar(page)
+              if popup is not None:
+                  return popup, shown
+              # Try the calendar icon beside the box.
+              icons = zoom_visible(box.locator('xpath=ancestor::*[1]').locator('svg, i, [class*="icon"]'))
+              for icon in icons[:2]:
+                  icon.click()
+                  popup, shown = zoom_calendar(page)
+                  if popup is not None:
+                      return popup, shown
+              Path('zoom-diagnostics').mkdir(exist_ok=True)
+              try:
+                  page.screenshot(path='zoom-diagnostics/calendar-' + label.lower() + '.png', full_page=True)
+              except Exception:
+                  pass
+              raise RuntimeError('Zoom ' + label + ' calendar did not open (see calendar-' + label.lower() + '.png).')
+
+
+          def zoom_close_calendar(page):
+              popup, _ = zoom_calendar(page, seconds=1)
+              if popup is None:
+                  return
+              notes = zoom_visible(page.get_by_text(re.compile(r'Maximum report duration', re.I)))
+              if notes:
+                  notes[0].click()
+              else:
+                  page.keyboard.press('Escape')
+              page.wait_for_timeout(500)
 
 
           def zoom_pick_date(page, label, target):
               """Open the From/To calendar and click the target day, as in the recording."""
+              zoom_close_calendar(page)
               box = zoom_date_box(page, label)
-              box.click()
-              page.wait_for_timeout(700)
-              popup, header, shown = zoom_calendar(page)
+              popup, shown = zoom_open_calendar(page, box, label)
+              wanted = (target.year, target.month)
               for _ in range(24):
-                  wanted = (target.year, target.month)
                   if shown == wanted:
                       break
-                  previous, following = zoom_calendar_arrows(popup, header)
-                  arrow = previous if shown > wanted else following
-                  if arrow is None:
+                  arrow = page.locator('[data-ff-prev="1"]' if shown > wanted else '[data-ff-next="1"]')
+                  if arrow.count() != 1:
                       raise RuntimeError('Zoom calendar month arrows were not found.')
                   arrow.click()
                   page.wait_for_timeout(500)
-                  popup, header, shown = zoom_calendar(page)
+                  popup, shown = zoom_calendar(page)
+                  if popup is None:
+                      raise RuntimeError('Zoom calendar closed while changing month.')
               else:
                   raise RuntimeError('Zoom calendar could not reach ' + target.strftime('%B %Y') + '.')
               # Day cells in grid order. Leading cells from the previous month are always >= 22,
@@ -3283,6 +3344,7 @@ jobs:
                   raise RuntimeError('Zoom calendar day ' + target.isoformat() + ' is greyed out (not selectable).')
               cells.nth(index).click()
               page.wait_for_timeout(800)
+              zoom_close_calendar(page)
               value = zoom_date_value(box.input_value()) if box.count() == 1 else None
               if value is not None and value != target:
                   raise RuntimeError('Zoom ' + label + ' shows ' + value.isoformat() + ' after picking '
