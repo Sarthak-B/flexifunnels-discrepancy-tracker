@@ -1978,27 +1978,41 @@ jobs:
                   timeout=60000,
               )
 
-              page.wait_for_timeout(3000)
-
-              print(
-                  "Projects location:",
-                  safe_location(page),
-              )
-
-              if current_path(page) != "/projects":
-                  raise RuntimeError(
-                      "Projects page inaccessible."
-                  )
-
-              search_field = unique_visible(
-                  page.locator(
-                      'input[placeholder*="Search" i]'
-                  )
-              )
+              search_field = None
+              for attempt in range(2):
+                  # Wait up to 45 s for the list to load; close any pop-up that covers it.
+                  deadline = time.monotonic() + 45
+                  while time.monotonic() < deadline:
+                      search_field = unique_visible(page.locator('input[placeholder*="Search" i]'))
+                      if search_field is not None:
+                          break
+                      for close in visible_items(page.locator(
+                              '[aria-label="Close" i], button.close, .modal [data-dismiss="modal"], '
+                              '.modal [data-bs-dismiss="modal"], button:has-text("Skip"), button:has-text("Got it")'), 5):
+                          try:
+                              close.click(timeout=2000)
+                          except Exception:
+                              pass
+                      time.sleep(1)
+                  print("Projects location:", safe_location(page))
+                  if current_path(page) != "/projects":
+                      raise RuntimeError("Projects page inaccessible.")
+                  if search_field is not None:
+                      break
+                  if attempt == 0:
+                      print("Projects search field not visible yet; reloading the page once.")
+                      page.reload(wait_until="domcontentloaded", timeout=60000)
 
               if search_field is None:
+                  Path('diagnostics').mkdir(exist_ok=True)
+                  try:
+                      page.screenshot(path='diagnostics/projects.png', full_page=True)
+                  except Exception:
+                      pass
+                  print("Visible search inputs:",
+                        len(visible_items(page.locator('input[placeholder*="Search" i]'))))
                   raise RuntimeError(
-                      "Projects search field missing."
+                      "Projects search field missing (see diagnostics/projects.png)."
                   )
 
               print("Projects page verified.")
@@ -3808,17 +3822,36 @@ jobs:
               stage = 'saved-session'
               seed = zoom_seed_value()
               cache_file = Path(os.environ['RUNNER_TEMP']) / 'zoom-session-cache' / 'state.enc'
-              bundle = load_zoom_session(seed, cache_file)
+              cached = load_zoom_session(seed, cache_file)
+              initial = decode_zoom_seed(seed)
+              candidates = [('cached session', cached)]
+              if cached != initial:
+                  candidates.append(('original saved session (GitHub secret)', initial))
               with sync_playwright() as playwright:
                   browser = playwright.chromium.launch(headless=True)
-                  context = browser.new_context(viewport={'width': 1440, 'height': 1000},
-                                                timezone_id='Asia/Kolkata', locale='en-US', accept_downloads=True,
-                                                storage_state=bundle['storage_state'])
-                  install_zoom_session_storage(context, bundle)
-                  page = context.new_page()
-                  page.set_default_timeout(30000)
+                  context = page = None
+                  for name, bundle in candidates:
+                      if context is not None:
+                          context.close()
+                      context = browser.new_context(viewport={'width': 1440, 'height': 1000},
+                                                    timezone_id='Asia/Kolkata', locale='en-US', accept_downloads=True,
+                                                    storage_state=bundle['storage_state'])
+                      install_zoom_session_storage(context, bundle)
+                      page = context.new_page()
+                      page.set_default_timeout(30000)
+                      try:
+                          verify_saved_zoom_login(page)
+                          print('Zoom: signed in with the ' + name + '.')
+                          break
+                      except RuntimeError:
+                          print('Zoom: the ' + name + ' was not accepted.')
+                  else:
+                      browser.close()
+                      print('Zoom: every saved sign-in has expired. Run the Zoom session setup again and '
+                            'replace the ZOOM_STORAGE_STATE_B64 secret.')
+                      raise RuntimeError('Zoom export stopped at saved-session; no Sheets writes and no copied ActiveCampaign data.')
                   try:
-                      verify_saved_zoom_login(page)
+                      save_zoom_session_cache(context, seed, cache_file)  # Keep the refreshed sign-in.
                       stage = 'report'
                       export_zoom(page, event_date, Path('zoom'))
                       save_zoom_session_cache(context, seed, cache_file)
@@ -3846,7 +3879,7 @@ jobs:
 
           PY
       - name: Save refreshed encrypted Zoom browser session
-        if: success()
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/zoom-session-cache
