@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       event_date:
-        description: "Webinar date to process (YYYY-MM-DD). Clear it to auto-pick the latest non-future date."
+        description: "Webinar date (YYYY-MM-DD, a Tue/Wed/Sun). Leave blank to use the latest finished Tue/Wed/Sun webinar."
         required: false
-        default: "2026-10-14"
+        default: ""
 
 concurrency:
   group: flexifunnels-discrepancy-sheets
@@ -25,6 +25,8 @@ jobs:
       utm_landing_tab: ${{ steps.verify-sheets.outputs.utm_landing_tab }}
       utm_reg_tab: ${{ steps.verify-sheets.outputs.utm_reg_tab }}
       utm_tab_date: ${{ steps.verify-sheets.outputs.utm_tab_date }}
+      window_start: ${{ steps.verify-sheets.outputs.window_start }}
+      window_end: ${{ steps.verify-sheets.outputs.window_end }}
 
     steps:
 
@@ -1151,9 +1153,14 @@ jobs:
               snapshot = json.loads(Path('utm/snapshot.json').read_text())
               window = json.loads(Path('reports/report-window.json').read_text())
               event_date = date.fromisoformat(snapshot['event_date'])
-              expected_start = event_date - timedelta(days=1)
-              if window != {'start_date': expected_start.isoformat(), 'end_date': event_date.isoformat(), 'timezone': snapshot['timezone']}:
-                  raise RuntimeError('UTM snapshot and FlexiFunnels report dates do not agree.')
+              window_start = datetime.fromisoformat(snapshot['window_start'])
+              window_end = datetime.fromisoformat(snapshot['window_end'])
+              expected_start = window_start.date()
+              if window != {'start_date': expected_start.isoformat(), 'end_date': window_end.date().isoformat(),
+                            'timezone': snapshot['timezone'], 'window_start': snapshot['window_start'],
+                            'window_end': snapshot['window_end']} or window_end.date() != event_date:
+                  raise RuntimeError('UTM snapshot and FlexiFunnels report windows do not agree.')
+              print('Data window (IST): after', snapshot['window_start'], 'up to', snapshot['window_end'])
               selectors, layout = required_configuration(event_date)
               if snapshot['activecampaign_selectors'] != selectors or snapshot['stats_layout'] != layout:
                   raise RuntimeError('Configuration changed after discovery; rerun the whole workflow.')
@@ -1256,8 +1263,8 @@ jobs:
               print('STAGE 4: Append totals from verified result tabs to Discrepancy Stats.')
               merged_reports = prepare_contact_rows(ff_business + ff_reg)
               run_key = os.environ['GITHUB_RUN_ID'] + '.' + os.environ['GITHUB_RUN_ATTEMPT']
-              counts = {'event_date': event_date.isoformat(), 'range_start': expected_start.isoformat(),
-                        'range_end': event_date.isoformat(), 'run_time': snapshot['captured_at'], 'run_key': run_key,
+              counts = {'event_date': event_date.isoformat(), 'range_start': snapshot['window_start'],
+                        'range_end': snapshot['window_end'], 'run_time': snapshot['captured_at'], 'run_key': run_key,
                         'landing': len(ff_business), 'landing_reg': len(ff_reg), 'reports': len(merged_reports),
                         'utm': len(merged_utm), 'activecampaign': len(ac_rows), 'zoom': len(zoom_rows), 'discrepancy': len(discrepancy)}
               checked_at = datetime.fromisoformat(snapshot['captured_at']).astimezone(ZoneInfo(snapshot['timezone']))
@@ -1287,7 +1294,29 @@ jobs:
           from datetime import date
 
 
-          def discover_daily_utm_tabs(worksheets, target_date=None, today=None):
+          # ---- WEBINAR SCHEDULE (edit here only) ------------------------------------
+          # Webinars run Tuesday, Wednesday and Sunday at 7:30 PM IST. Each webinar's data is
+          # what came in after the previous backend switch, up to its own backend switch:
+          #   Sunday    : Wednesday 6 PM  -> Sunday 9 AM
+          #   Tuesday   : Sunday 9 AM     -> Tuesday 6 PM
+          #   Wednesday : Tuesday 6 PM    -> Wednesday 6 PM
+          # weekday (Mon=0 ... Sun=6): (days back to the start day, start hour, end hour)
+          WEBINAR_WINDOWS = {6: (4, 18, 9), 1: (2, 9, 18), 2: (1, 18, 18)}
+          WEBINAR_DAY_NAMES = {6: 'Sunday', 1: 'Tuesday', 2: 'Wednesday'}
+
+
+          def event_window(event_date):
+              """(start, end) as IST wall-clock datetimes: start exclusive, end inclusive."""
+              if event_date.weekday() not in WEBINAR_WINDOWS:
+                  raise RuntimeError(event_date.isoformat() + ' is a ' + event_date.strftime('%A')
+                                     + '; discrepancy checks run only for Tuesday, Wednesday and Sunday webinars.')
+              back, start_hour, end_hour = WEBINAR_WINDOWS[event_date.weekday()]
+              start = datetime.combine(event_date - timedelta(days=back), datetime.min.time()).replace(hour=start_hour)
+              end = datetime.combine(event_date, datetime.min.time()).replace(hour=end_hour)
+              return start, end
+
+
+          def discover_daily_utm_tabs(worksheets, target_date=None, today=None, now=None):
               """Select the newest calendar date with both matching UTM tab types.
 
               Ignore incomplete newer dates until both tabs exist, and never auto-select a
@@ -1327,11 +1356,16 @@ jobs:
                   )
               if target_date is not None and today is not None and target_date > today:
                   raise RuntimeError('Requested event date ' + target_date.isoformat() + ' is in the future.')
+              if target_date is not None:
+                  event_window(target_date)  # Rejects dates that are not Tue/Wed/Sun.
               if target_date is None:
-                  # Tabs are created ahead of time for upcoming webinars; never pick a future date.
+                  # Only Tue/Wed/Sun webinars whose data window has already closed. Tabs made
+                  # ahead of time for upcoming webinars are skipped.
                   complete_dates = [day for day, kinds in matches_by_date.items()
                                     if kinds['business'] and kinds['registration']
-                                    and (today is None or day <= today)]
+                                    and day.weekday() in WEBINAR_WINDOWS
+                                    and (today is None or day <= today)
+                                    and (now is None or event_window(day)[1] <= now)]
                   if not complete_dates:
                       raise RuntimeError('No complete daily UTM pair found: business and registration tabs must share the same date.')
                   target_date = max(complete_dates)
@@ -1358,12 +1392,17 @@ jobs:
           requested_date = date.fromisoformat(override) if override else None
           if requested_date is not None:
               print('Event date requested for this run:', requested_date.isoformat())
+          now_local = datetime.now(ZoneInfo(timezone_name)).replace(tzinfo=None)
           target_tab_date, landing_tab, reg_tab = discover_daily_utm_tabs(
-              opened['UTM'].worksheets(), target_date=requested_date, today=today_local)
-          print('UTM target event date:', target_tab_date.isoformat())
+              opened['UTM'].worksheets(), target_date=requested_date, today=today_local, now=now_local)
+          window_start, window_end = event_window(target_tab_date)
+          print('Webinar:', WEBINAR_DAY_NAMES[target_tab_date.weekday()], target_tab_date.isoformat(), '7:30 PM')
+          print('Data window (IST): after', window_start.strftime('%a %d %b %Y %I:%M %p'),
+                'up to', window_end.strftime('%a %d %b %Y %I:%M %p'))
+          if window_end > now_local:
+              print('WARNING: this window has not closed yet; data after now will be missing.')
           print('Business tab selected:', landing_tab.title)
           print('Registration tab selected:', reg_tab.title)
-          print('Required FlexiFunnels range:', (target_tab_date - timedelta(days=1)).isoformat(), 'through', target_tab_date.isoformat())
 
           discrepancy_name = os.environ['DISCREPANCY_TAB_NAME'].strip()
           stats_sheet = opened['DISCREPANCY STATS'].worksheet(discrepancy_name)
@@ -1378,13 +1417,52 @@ jobs:
               raise RuntimeError('UTM source must be separate from the destination spreadsheets.')
           start_date = target_tab_date - timedelta(days=1)
           timezone = ZoneInfo(timezone_name)
-          business_rows = read_utm_tab_contacts(landing_tab)
-          registration_rows = read_utm_tab_contacts(reg_tab)
+          def read_utm_window_contacts(worksheet, start, end, tz):
+              """UTM rows whose webhook timestamp falls inside the webinar window."""
+              values = worksheet.get_all_values()
+              if not values:
+                  raise RuntimeError('Selected UTM tab has no header row: ' + worksheet.title)
+              headers = [str(value).strip().casefold() for value in values[0]]
+              required = ('first_name', 'email', 'phone')
+              if any(headers.count(key) != 1 for key in required):
+                  raise RuntimeError('UTM tab must have unique first_name, email and phone columns.')
+              if headers.count('timestamp_incoming_webhook') != 1:
+                  print(worksheet.title + ': no timestamp_incoming_webhook column; importing all rows.')
+                  return read_utm_tab_contacts(worksheet)
+              index = {key: headers.index(key) for key in required + ('timestamp_incoming_webhook',)}
+              start_tz, end_tz = start.replace(tzinfo=tz), end.replace(tzinfo=tz)
+              kept, before, after, unreadable = [], 0, 0, 0
+              for cells in values[1:]:
+                  get = lambda key: str(cells[index[key]]).strip() if index[key] < len(cells) else ''
+                  row = {'name': get('first_name'), 'email': get('email'), 'phone': get('phone')}
+                  if not any(row.values()):
+                      continue
+                  try:
+                      stamp = parse_utm_timestamp(get('timestamp_incoming_webhook'), tz)
+                  except RuntimeError:
+                      unreadable += 1
+                      kept.append(row)  # Kept so no registrant is silently dropped.
+                      continue
+                  if stamp <= start_tz:
+                      before += 1
+                  elif stamp > end_tz:
+                      after += 1
+                  else:
+                      kept.append(row)
+              print(worksheet.title + ': kept ' + str(len(kept)) + ' rows in window; before window '
+                    + str(before) + '; after window ' + str(after) + '; unreadable timestamp (kept) '
+                    + str(unreadable))
+              return kept
+
+
+          business_rows = read_utm_window_contacts(landing_tab, window_start, window_end, timezone)
+          registration_rows = read_utm_window_contacts(reg_tab, window_start, window_end, timezone)
           Path('utm').mkdir(exist_ok=True)
           write_rows(Path('utm/business.csv'), business_rows)
           write_rows(Path('utm/registration.csv'), registration_rows)
           Path('utm/snapshot.json').write_text(json.dumps({
               'event_date': target_tab_date.isoformat(), 'timezone': timezone_name,
+              'window_start': window_start.isoformat(), 'window_end': window_end.isoformat(),
               'captured_at': datetime.now(timezone).isoformat(),
               'business_tab': landing_tab.title, 'registration_tab': reg_tab.title,
               'business_count': len(business_rows), 'registration_count': len(registration_rows),
@@ -1397,6 +1475,8 @@ jobs:
                   output.write('utm_landing_tab=' + landing_tab.title + '\n')
                   output.write('utm_reg_tab=' + reg_tab.title + '\n')
                   output.write('utm_tab_date=' + target_tab_date.isoformat() + '\n')
+                  output.write('window_start=' + window_start.isoformat() + '\n')
+                  output.write('window_end=' + window_end.isoformat() + '\n')
 
           print()
           print("=" * 60)
@@ -1437,6 +1517,8 @@ jobs:
           FLEXIFUNNELS_REG_URL: ${{ vars.FLEXIFUNNELS_REG_URL }}
           TIMEZONE: ${{ vars.TIMEZONE }}
           UTM_TAB_DATE: ${{ needs.test-google-sheets.outputs.utm_tab_date }}
+          WINDOW_START: ${{ needs.test-google-sheets.outputs.window_start }}
+          WINDOW_END: ${{ needs.test-google-sheets.outputs.window_end }}
         run: |
           python -u - <<'PY'
           import os
@@ -1497,9 +1579,15 @@ jobs:
               )
 
 
-          today = datetime.strptime(os.environ['UTM_TAB_DATE'], '%Y-%m-%d').date()
-
-          yesterday = today - timedelta(days=1)
+          # The webinar's data window decides everything (set by the UTM job).
+          WINDOW_START = datetime.fromisoformat(os.environ['WINDOW_START'])
+          WINDOW_END = datetime.fromisoformat(os.environ['WINDOW_END'])
+          if WINDOW_END.date().isoformat() != os.environ['UTM_TAB_DATE']:
+              raise RuntimeError('Data window does not end on the webinar date.')
+          # Report calendar range: from the window's first day to its last day.
+          yesterday = WINDOW_START.date()
+          today = WINDOW_END.date()
+          print('Data window (IST): after', WINDOW_START.isoformat(), 'up to', WINDOW_END.isoformat())
 
           print()
           print("Timezone:", TIMEZONE)
@@ -2540,28 +2628,29 @@ jobs:
                   if any(key not in (reader.fieldnames or []) for key in required):
                       raise RuntimeError('CSV is missing required identity/timestamp columns.')
                   identities = []
-                  # The selected UTM event date determines Sunday, not the runner clock.
-                  # Sunday keeps Saturday after 09:00 IST; all other days use 18:00.
-                  cutoff_hour = 9 if end_date.weekday() == 6 else 18
-                  cutoff = datetime.combine(start_date, datetime.min.time()).replace(hour=cutoff_hour)
+                  # Keep only leads inside the webinar window: after WINDOW_START, up to WINDOW_END.
                   downloaded = 0
                   excluded = 0
+                  after_end = 0
                   for record in reader:
                       downloaded += 1
                       timestamp = datetime.strptime(record['created_at'].strip(), '%b %d, %Y %I:%M %p (IST)')
                       if not start_date <= timestamp.date() <= end_date:
                           raise RuntimeError('Export contains a record outside the requested date range.')
-                      if timestamp <= cutoff:
+                      if timestamp <= WINDOW_START:
                           excluded += 1
+                          continue
+                      if timestamp > WINDOW_END:
+                          after_end += 1
                           continue
                       identities.append({'name': record['first_name'].strip(), 'email': record['email'].strip(), 'phone': record['phone'].strip()})
               with path.open('w', encoding='utf-8-sig', newline='') as output:
                   writer = csv.DictWriter(output, fieldnames=['name', 'email', 'phone'])
                   writer.writeheader()
                   writer.writerows(identities)
-              print(path.name + ': cutoff (IST, exclusive)=' + cutoff.isoformat()
-                    + '; downloaded=' + str(downloaded) + '; excluded at/before cutoff='
-                    + str(excluded) + '; retained=' + str(len(identities)))
+              print(path.name + ': window ' + WINDOW_START.isoformat() + ' -> ' + WINDOW_END.isoformat()
+                    + '; downloaded=' + str(downloaded) + '; before window=' + str(excluded)
+                    + '; after window=' + str(after_end) + '; retained=' + str(len(identities)))
               return len(identities)
 
 
@@ -2629,6 +2718,7 @@ jobs:
           import json
           Path('reports/report-window.json').write_text(json.dumps({
               'start_date': yesterday.isoformat(), 'end_date': today.isoformat(), 'timezone': TIMEZONE,
+              'window_start': WINDOW_START.isoformat(), 'window_end': WINDOW_END.isoformat(),
           }))
           with sync_playwright() as playwright:
               browser = playwright.chromium.launch(headless=True)
@@ -3345,14 +3435,18 @@ jobs:
 
           def zoom_try_open_calendar(page, box, label):
               """Click the date box (then its icon); return the popup or None. Leaves nothing open on failure."""
-              box.click()
+              box.click(timeout=10000)
               popup, shown = zoom_calendar(page)
               if popup is not None:
                   return popup, shown
               zoom_save_popup_diagnostic(page, label)
               icons = zoom_visible(box.locator('xpath=ancestor-or-self::*[2]').locator('svg, i, [class*="icon"]'))
               for icon in icons[:1]:
-                  icon.click()
+                  try:
+                      icon.click(timeout=3000)
+                  except Exception as error:
+                      print('Zoom: calendar icon not clickable (' + type(error).__name__ + ').')
+                      continue
                   popup, shown = zoom_calendar(page, seconds=4)
                   if popup is not None:
                       return popup, shown
@@ -3421,7 +3515,10 @@ jobs:
                   return False
               text = target.strftime('%m/%d/%Y')
               field.evaluate('el => el.removeAttribute("readonly")')
-              field.click()
+              try:
+                  field.click(timeout=5000)
+              except Exception:
+                  field.focus()
               page.keyboard.press('Control+A')
               page.keyboard.press('Backspace')
               page.keyboard.type(text, delay=40)
@@ -3441,13 +3538,25 @@ jobs:
               if before == target:
                   print('Zoom: ' + label + ' already', target.isoformat())
                   return True
-              popup, shown = zoom_try_open_calendar(page, box, label)
               method = 'calendar'
-              if popup is not None:
+              try:
+                  popup, shown = zoom_try_open_calendar(page, box, label)
+                  if popup is None:
+                      raise RuntimeError('no calendar popup found')
                   zoom_click_calendar_day(page, popup, shown, target)
-              else:
+              except Exception as error:
+                  print('Zoom: ' + label + ' calendar route failed (' + type(error).__name__ + ': '
+                        + ' '.join(str(error).split())[:200] + '); typing the date instead.')
+                  zoom_save_popup_diagnostic(page, label)
+                  page.keyboard.press('Escape')
                   method = 'typing'
-                  if not zoom_type_date(page, zoom_date_box(page, label), target):
+                  try:
+                      if not zoom_type_date(page, zoom_date_box(page, label), target):
+                          print('Zoom: ' + label + ' box has no text field to type into.')
+                          return False
+                  except Exception as error:
+                      print('Zoom: ' + label + ' typing failed (' + type(error).__name__ + ': '
+                            + ' '.join(str(error).split())[:200] + ').')
                       return False
               value = zoom_box_value(zoom_date_box(page, label, seconds=5))
               print('Zoom: ' + label + ' ->', value.isoformat() if value else 'unreadable', 'via', method,
@@ -3492,14 +3601,20 @@ jobs:
               everything.forEach(el => el.removeAttribute('data-ff-scope'));
               const to = everything.find(el => el.getAttribute('data-ff-box') === 'To');
               const anchor = to ? to.getBoundingClientRect() : null;
+              // Prefer the control on the same line, right of the To box; else the nearest one.
               let best = null;
               for (const el of everything) {
                   if (!visible(el)) continue;
                   const text = ownText(el).trim();
                   if (text !== 'Meetings' && text !== 'Webinars') continue;
                   const r = el.getBoundingClientRect();
-                  if (anchor && (Math.abs((r.top + r.bottom) / 2 - (anchor.top + anchor.bottom) / 2) > 25 || r.left < anchor.right - 2)) continue;
-                  if (!best || r.left < best[0]) best = [r.left, el, text];
+                  let score = 0;
+                  if (anchor) {
+                      const sameRow = Math.abs((r.top + r.bottom) / 2 - (anchor.top + anchor.bottom) / 2) <= 25
+                                      && r.left >= anchor.right - 2;
+                      score = (sameRow ? 0 : 100000) + Math.hypot(r.left - anchor.right, r.top - anchor.top);
+                  }
+                  if (!best || score < best[0]) best = [score, el, text];
               }
               if (!best) return null;
               best[1].setAttribute('data-ff-scope', '1');
@@ -3664,8 +3779,14 @@ jobs:
                           'stage': stage, 'event_date': event_date.isoformat(), 'error_type': type(error).__name__}))
                       if stage == 'report' and '/account/report' in urlparse(page.url).path:
                           page.screenshot(path='zoom-diagnostics/report.png', full_page=True)
+                      import traceback
                       if isinstance(error, RuntimeError):
                           print(str(error))
+                      else:
+                          # Browser errors: type, first lines of the message, and where it happened.
+                          print('Zoom error:', type(error).__name__, '-', ' '.join(str(error).split())[:600])
+                          frames = traceback.extract_tb(error.__traceback__)
+                          print('Zoom error location:', ' <- '.join(f.name for f in reversed(frames[-6:])))
                       raise RuntimeError('Zoom export stopped at ' + stage + '; no Sheets writes and no copied ActiveCampaign data.') from None
                   finally:
                       browser.close()
@@ -4638,9 +4759,14 @@ jobs:
               snapshot = json.loads(Path('utm/snapshot.json').read_text())
               window = json.loads(Path('reports/report-window.json').read_text())
               event_date = date.fromisoformat(snapshot['event_date'])
-              expected_start = event_date - timedelta(days=1)
-              if window != {'start_date': expected_start.isoformat(), 'end_date': event_date.isoformat(), 'timezone': snapshot['timezone']}:
-                  raise RuntimeError('UTM snapshot and FlexiFunnels report dates do not agree.')
+              window_start = datetime.fromisoformat(snapshot['window_start'])
+              window_end = datetime.fromisoformat(snapshot['window_end'])
+              expected_start = window_start.date()
+              if window != {'start_date': expected_start.isoformat(), 'end_date': window_end.date().isoformat(),
+                            'timezone': snapshot['timezone'], 'window_start': snapshot['window_start'],
+                            'window_end': snapshot['window_end']} or window_end.date() != event_date:
+                  raise RuntimeError('UTM snapshot and FlexiFunnels report windows do not agree.')
+              print('Data window (IST): after', snapshot['window_start'], 'up to', snapshot['window_end'])
               selectors, layout = required_configuration(event_date)
               if snapshot['activecampaign_selectors'] != selectors or snapshot['stats_layout'] != layout:
                   raise RuntimeError('Configuration changed after discovery; rerun the whole workflow.')
@@ -4743,8 +4869,8 @@ jobs:
               print('STAGE 4: Append totals from verified result tabs to Discrepancy Stats.')
               merged_reports = prepare_contact_rows(ff_business + ff_reg)
               run_key = os.environ['GITHUB_RUN_ID'] + '.' + os.environ['GITHUB_RUN_ATTEMPT']
-              counts = {'event_date': event_date.isoformat(), 'range_start': expected_start.isoformat(),
-                        'range_end': event_date.isoformat(), 'run_time': snapshot['captured_at'], 'run_key': run_key,
+              counts = {'event_date': event_date.isoformat(), 'range_start': snapshot['window_start'],
+                        'range_end': snapshot['window_end'], 'run_time': snapshot['captured_at'], 'run_key': run_key,
                         'landing': len(ff_business), 'landing_reg': len(ff_reg), 'reports': len(merged_reports),
                         'utm': len(merged_utm), 'activecampaign': len(ac_rows), 'zoom': len(zoom_rows), 'discrepancy': len(discrepancy)}
               checked_at = datetime.fromisoformat(snapshot['captured_at']).astimezone(ZoneInfo(snapshot['timezone']))
