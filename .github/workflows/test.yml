@@ -3433,23 +3433,70 @@ jobs:
                   pass
 
 
+          def zoom_safe_click(page, locator, description, timeout=3000):
+              """Normal click; if another layer catches it, click at the same spot on screen instead."""
+              try:
+                  locator.click(timeout=timeout)
+                  return
+              except Exception:
+                  pass
+              locator.scroll_into_view_if_needed(timeout=3000)
+              box = locator.bounding_box()
+              if not box:
+                  raise RuntimeError('Zoom ' + description + ' has no position on screen.')
+              page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2)
+
+
+          ZOOM_CONTROL_JS = r"""(el) => {
+              const visible = n => { const r = n.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+              document.querySelectorAll('[data-ff-control]').forEach(n => n.removeAttribute('data-ff-control'));
+              // 1) A control that names this label via aria-labelledby / aria-describedby.
+              if (el.id) {
+                  const linked = Array.from(document.querySelectorAll('[aria-labelledby], [aria-describedby]'))
+                      .find(n => (' ' + (n.getAttribute('aria-labelledby') || '') + ' ' + (n.getAttribute('aria-describedby') || '') + ' ')
+                                 .includes(' ' + el.id + ' '));
+                  if (linked) { linked.setAttribute('data-ff-control', '1'); return linked.tagName; }
+              }
+              // 2) The nearest wrapper's input / combobox / button.
+              let node = el;
+              for (let i = 0; i < 5 && node; i++, node = node.parentElement) {
+                  const found = node.querySelector('input:not([type="hidden"]), [role="combobox"], [role="button"], button');
+                  if (found) { found.setAttribute('data-ff-control', '1'); return found.tagName; }
+              }
+              // 3) The topmost element at the label's centre.
+              const r = el.getBoundingClientRect();
+              const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+              if (top && top !== el) { top.setAttribute('data-ff-control', '1'); return top.tagName; }
+              return null;
+          }"""
+
+
+          def zoom_box_control(page, box):
+              """The real control behind a displayed date label (the label itself is aria-hidden)."""
+              tag = box.evaluate(ZOOM_CONTROL_JS)
+              return page.locator('[data-ff-control="1"]').first if tag else None
+
+
           def zoom_try_open_calendar(page, box, label):
-              """Click the date box (then its icon); return the popup or None. Leaves nothing open on failure."""
-              box.click(timeout=10000)
-              popup, shown = zoom_calendar(page)
-              if popup is not None:
-                  return popup, shown
-              zoom_save_popup_diagnostic(page, label)
-              icons = zoom_visible(box.locator('xpath=ancestor-or-self::*[2]').locator('svg, i, [class*="icon"]'))
-              for icon in icons[:1]:
+              """Open the date picker: click the label's spot, then the real control, then its icon."""
+              attempts = [('date box', lambda: zoom_safe_click(page, box, label + ' date box'))]
+              control = zoom_box_control(page, box)
+              if control is not None:
+                  attempts.append(('linked control', lambda: zoom_safe_click(page, control, label + ' date control')))
+              icons = zoom_visible(box.locator('xpath=ancestor::*[3]').locator('svg, i, [class*="icon"]'))
+              if icons:
+                  attempts.append(('calendar icon', lambda: zoom_safe_click(page, icons[0], label + ' calendar icon')))
+              for name, action in attempts:
                   try:
-                      icon.click(timeout=3000)
+                      action()
                   except Exception as error:
-                      print('Zoom: calendar icon not clickable (' + type(error).__name__ + ').')
+                      print('Zoom: ' + label + ' ' + name + ' not clickable (' + type(error).__name__ + ').')
                       continue
                   popup, shown = zoom_calendar(page, seconds=4)
                   if popup is not None:
+                      print('Zoom: ' + label + ' calendar opened via ' + name + '.')
                       return popup, shown
+              zoom_save_popup_diagnostic(page, label)
               page.keyboard.press('Escape')
               page.wait_for_timeout(300)
               return None, None
@@ -3475,7 +3522,7 @@ jobs:
                   arrow = page.locator('[data-ff-prev="1"]' if shown > wanted else '[data-ff-next="1"]')
                   if arrow.count() != 1:
                       raise RuntimeError('Zoom calendar month arrows were not found.')
-                  arrow.click()
+                  zoom_safe_click(page, arrow, 'calendar month arrow')
                   page.wait_for_timeout(500)
                   popup, shown = zoom_calendar(page)
                   if popup is None:
@@ -3503,20 +3550,23 @@ jobs:
                   raise RuntimeError('Zoom calendar day grid is out of order; ' + target.isoformat() + ' not clicked.')
               if info[index]['disabled']:
                   raise RuntimeError('Zoom calendar day ' + target.isoformat() + ' is greyed out (not selectable).')
-              cells.nth(index).click()
+              zoom_safe_click(page, cells.nth(index), 'calendar day ' + target.isoformat())
               page.wait_for_timeout(800)
               zoom_close_calendar(page)
 
 
           def zoom_type_date(page, box, target):
               """Type the date into the box's text field (works for typeable date pickers)."""
-              field = box if box.evaluate("el => el.tagName === 'INPUT'") else box.locator('input').first
-              if field.count() != 1:
-                  return False
+              if box.evaluate("el => el.tagName === 'INPUT'"):
+                  field = box
+              else:
+                  field = zoom_box_control(page, box)
+                  if field is None or not field.evaluate("el => el.tagName === 'INPUT' || el.isContentEditable"):
+                      return False
               text = target.strftime('%m/%d/%Y')
               field.evaluate('el => el.removeAttribute("readonly")')
               try:
-                  field.click(timeout=5000)
+                  zoom_safe_click(page, field, 'date field')
               except Exception:
                   field.focus()
               page.keyboard.press('Control+A')
