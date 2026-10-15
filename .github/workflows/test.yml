@@ -3754,37 +3754,69 @@ jobs:
               return candidates[0]
 
 
+          def zoom_search_buttons(page):
+              return (zoom_visible(page.get_by_role('button', name='Search', exact=True))
+                      or zoom_visible(page.get_by_text('Search', exact=True)))
+
+
+          def zoom_search_results(page, event_date):
+              """Click Search, wait for Zoom's spinner to finish, and retry if 0 results come back."""
+              records, total = [], 0
+              for attempt in range(1, 4):
+                  # Close any open dropdown so it cannot cover the Search button.
+                  page.keyboard.press('Escape')
+                  notes = zoom_visible(page.get_by_text(re.compile(r'Maximum report duration', re.I)))
+                  if notes:
+                      zoom_safe_click(page, notes[0], 'page background')
+                  page.wait_for_timeout(500)
+                  if zoom_scope(page) != 'Webinars':
+                      zoom_select_webinars(page)
+                  buttons = zoom_search_buttons(page)
+                  if len(buttons) != 1:
+                      zoom_filter_diagnostic(page, event_date)
+                      raise RuntimeError('Zoom Search button is missing or ambiguous.')
+                  zoom_safe_click(page, buttons[0], 'Search button')
+                  page.wait_for_timeout(1500)
+                  # While loading, the Search button shows a spinner instead of its text.
+                  deadline = time.monotonic() + 90
+                  while time.monotonic() < deadline and len(zoom_search_buttons(page)) != 1:
+                      time.sleep(0.5)
+                  # Then wait for the count and rows to stay unchanged for 5 seconds.
+                  deadline = time.monotonic() + 60
+                  stable, since = None, time.monotonic()
+                  while time.monotonic() < deadline:
+                      totals = zoom_visible(page.get_by_text(re.compile(r'^\s*\d+\s+result\(s\)\s*$')))
+                      if len(totals) == 1 and len(zoom_search_buttons(page)) == 1:
+                          total = int(re.search(r'\d+', totals[0].inner_text()).group())
+                          records = zoom_rows(page) if total else []
+                          signature = (total, tuple((r['scheduled'], r['id']) for r in records))
+                          if signature != stable:
+                              stable, since = signature, time.monotonic()
+                          elif time.monotonic() - since >= 5:
+                              break
+                      time.sleep(0.5)
+                  params = zoom_url_params(page)
+                  print('Zoom: search attempt', attempt, '-> results =', total, '| type =', zoom_scope(page),
+                        '| address says', params.get('dateFrom'), 'to', params.get('dateTo'),
+                        'scope', params.get('meetingScope'))
+                  if total:
+                      return total, records
+                  page.wait_for_timeout(3000)
+              Path('zoom-diagnostics').mkdir(exist_ok=True)
+              try:
+                  page.screenshot(path='zoom-diagnostics/results.png', full_page=True)
+              except Exception:
+                  pass
+              return total, records
+
+
           def export_zoom(page, event_date, outdir):
               start, end = event_date - timedelta(days=1), event_date
               open_registration_report(page)
               # Recorded order: From = previous day, To = event day, Meetings -> Webinars, Search.
               zoom_set_dates(page, start, end, event_date)
               zoom_select_webinars(page)
-              buttons = (zoom_visible(page.get_by_role('button', name='Search', exact=True))
-                         or zoom_visible(page.get_by_text('Search', exact=True)))
-              if len(buttons) != 1:
-                  zoom_filter_diagnostic(page, event_date)
-                  raise RuntimeError('Zoom Search button is missing or ambiguous.')
-              buttons[0].click()
-              # Wait for the result count and rows to settle.
-              deadline = time.monotonic() + 60
-              records, total, stable, since = [], None, None, time.monotonic()
-              while time.monotonic() < deadline:
-                  totals = zoom_visible(page.get_by_text(re.compile(r'^\s*\d+\s+result\(s\)\s*$')))
-                  if len(totals) != 1:
-                      time.sleep(0.5)
-                      continue
-                  total = int(re.search(r'\d+', totals[0].inner_text()).group())
-                  records = zoom_rows(page) if total else []
-                  signature = (total, tuple((r['scheduled'], r['id']) for r in records))
-                  if signature != stable:
-                      stable, since = signature, time.monotonic()
-                  elif time.monotonic() - since >= 3:
-                      break
-                  time.sleep(0.5)
-              else:
-                  zoom_filter_diagnostic(page, event_date)
-                  raise RuntimeError('Zoom search did not produce a stable results table.')
+              total, records = zoom_search_results(page, event_date)
               shown = zoom_displayed_range(page)
               print('Zoom: results =', total, '| rows read =', len(records), '| range =',
                     (shown[0].isoformat() + ' to ' + shown[1].isoformat()) if shown else 'not readable')
