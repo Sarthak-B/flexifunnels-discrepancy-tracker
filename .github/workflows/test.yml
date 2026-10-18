@@ -166,7 +166,7 @@ jobs:
           from google.oauth2.service_account import Credentials
 
           print("=" * 60)
-          print("GOOGLE SHEETS TEST - VERSION 19-R3")
+          print("GOOGLE SHEETS TEST - VERSION 19-R4")
           print("=" * 60)
 
           required = [
@@ -1480,40 +1480,46 @@ jobs:
           import re
 
 
-          def discover_webinar_utm_tabs(worksheets, event_date, slot):
-              """Find the dated 7:30 PM pair used for every session, including Sunday 11 AM.
+          def normalize_utm_title(title):
+              import unicodedata
+              text = unicodedata.normalize('NFKC', str(title))
+              text = ''.join(char for char in text if unicodedata.category(char) != 'Cf')
+              text = ' '.join(text.split()).casefold()
+              text = re.sub(r'7\s*:\s*30\s*pm', '7:30 pm', text)
+              return text
 
-              The user confirmed that 7:30 PM is a fixed part of both UTM tab names.
-              Actual webinar time controls the timestamp window and Zoom selection only.
-              """
+
+          def discover_webinar_utm_tabs(worksheets, event_date, slot):
+              """Compare full displayed tab names; the fixed 7:30 PM text is not event time."""
+              import json
               plan = schedule_for(event_date, slot)
-              months = {name.lower(): i + 1 for i, name in enumerate('Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split())}
-              pattern = re.compile(
-                  r'^\s*(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+'
-                  r'7\s*:\s*30\s*PM\s+'
-                  r'Flexi\s+Genie\s+10\s+Mins?\s+(Busines(?:s)?|Reg\s+team)\s*$', re.I)
-              matches = {'business': [], 'registration': []}
-              for ws in worksheets:
-                  if '\n' in ws.title or '\r' in ws.title:
-                      continue
-                  match = pattern.fullmatch(ws.title)
-                  if not match:
-                      continue
-                  day, month, year, kind = match.groups()
-                  try:
-                      tab_date = date(int(year), months[month.lower()], int(day))
-                  except (ValueError, KeyError):
-                      continue
-                  if tab_date != event_date:
-                      continue
-                  key = 'registration' if 'reg' in kind.casefold() else 'business'
-                  matches[key].append(ws)
-              for kind, items in matches.items():
-                  if len(items) != 1:
-                      raise RuntimeError('Expected exactly one ' + kind + ' UTM tab for '
-                                         + plan['event_date'] + ' with the fixed 7:30 PM Flexi Genie 10 Min/Mins title'
-                                         + '; found ' + str(len(items)) + '. No other date substituted.')
-              print('UTM uses the fixed 7:30 PM tab names for this date; selected webinar time:', plan['event_time'])
+              month = 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split()[event_date.month - 1]
+              prefix = f'{event_date.day} {month} {event_date.year} 7:30 PM Flexi Genie 10 '
+              expected = {'business': prefix + 'Mins Busines', 'registration': prefix + 'Min Reg team'}
+              # Preserve the previously supported spelling/plural variants, but compare
+              # complete names so unrelated dates, times and backup tabs cannot match.
+              accepted = {kind: set() for kind in expected}
+              for day in {str(event_date.day), f'{event_date.day:02d}'}:
+                  stem = f'{day} {month} {event_date.year} 7:30 PM Flexi Genie 10 '
+                  for minute in ('Min', 'Mins'):
+                      for business in ('Busines', 'Business'):
+                          accepted['business'].add(normalize_utm_title(stem + minute + ' ' + business))
+                      accepted['registration'].add(normalize_utm_title(stem + minute + ' Reg team'))
+              sheets = list(worksheets)
+              matches = {kind: [ws for ws in sheets if normalize_utm_title(ws.title) in titles]
+                         for kind, titles in accepted.items()}
+              for kind, title in expected.items():
+                  print('UTM full tab name required (' + kind + '):', title)
+              if any(len(items) != 1 for items in matches.values()):
+                  print('UTM title diagnostics: actual titles returned by the configured UTM spreadsheet:')
+                  candidates = [ws for ws in sheets if any(term in normalize_utm_title(ws.title)
+                                for term in ('flexi', 'genie', '10 min'))]
+                  for ws in (candidates or sheets):
+                      print('UTM available title:', json.dumps(ws.title, ensure_ascii=True))
+                  failed = ', '.join(kind + '=' + str(len(items)) for kind, items in matches.items() if len(items) != 1)
+                  raise RuntimeError('Expected exactly one of each full UTM tab name shown above; found ' + failed
+                                     + '. Check the available titles and that UTM_SHEET_ID points to the spreadsheet in your screenshot.')
+              print('UTM fixed tab names matched for', plan['event_date'], '; actual webinar time:', plan['event_time'])
               return matches['business'][0], matches['registration'][0]
 
 
@@ -1736,7 +1742,7 @@ jobs:
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
-          print('WORKFLOW REVISION: V19-R3 — selected event date drives the complete workflow')
+          print('WORKFLOW REVISION: V19-R4 — selected event date drives the complete workflow')
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
           PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
           LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
@@ -2941,9 +2947,9 @@ jobs:
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 19-R3: both CSVs verified; Google Sheets remain read-only.')
+                  print('VERSION 19-R4: both CSVs verified; Google Sheets remain read-only.')
               except Exception as error:
-                  print('VERSION 19-R3 stopped:', type(error).__name__, str(error))
+                  print('VERSION 19-R4 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
