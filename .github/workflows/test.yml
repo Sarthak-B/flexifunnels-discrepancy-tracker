@@ -166,7 +166,7 @@ jobs:
           from google.oauth2.service_account import Credentials
 
           print("=" * 60)
-          print("GOOGLE SHEETS TEST - VERSION 19-R2")
+          print("GOOGLE SHEETS TEST - VERSION 19-R3")
           print("=" * 60)
 
           required = [
@@ -1481,13 +1481,17 @@ jobs:
 
 
           def discover_webinar_utm_tabs(worksheets, event_date, slot):
-              """Require one pair for the selected weekday/date/session; never substitute."""
+              """Find the dated 7:30 PM pair used for every session, including Sunday 11 AM.
+
+              The user confirmed that 7:30 PM is a fixed part of both UTM tab names.
+              Actual webinar time controls the timestamp window and Zoom selection only.
+              """
               plan = schedule_for(event_date, slot)
               months = {name.lower(): i + 1 for i, name in enumerate('Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split())}
               pattern = re.compile(
                   r'^\s*(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+'
-                  r'(?:(\d{1,2})(?:\s*:\s*(\d{2}))?\s*(AM|PM)\s+)?'
-                  r'Flexi\s+Genie\s+10\s+Mins?\s+(Busines(?:s)?|(?:Busines(?:s)?\s+)?Reg\s+team)\s*$', re.I)
+                  r'7\s*:\s*30\s*PM\s+'
+                  r'Flexi\s+Genie\s+10\s+Mins?\s+(Busines(?:s)?|Reg\s+team)\s*$', re.I)
               matches = {'business': [], 'registration': []}
               for ws in worksheets:
                   if '\n' in ws.title or '\r' in ws.title:
@@ -1495,31 +1499,22 @@ jobs:
                   match = pattern.fullmatch(ws.title)
                   if not match:
                       continue
-                  day, month, year, hour, minute, ampm, kind = match.groups()
+                  day, month, year, kind = match.groups()
                   try:
                       tab_date = date(int(year), months[month.lower()], int(day))
                   except (ValueError, KeyError):
                       continue
                   if tab_date != event_date:
                       continue
-                  if hour:
-                      hour, minute = int(hour), int(minute or '0')
-                      if not 1 <= hour <= 12 or not 0 <= minute <= 59:
-                          continue
-                      h24 = hour % 12 + (12 if ampm.upper() == 'PM' else 0)
-                      if f'{h24:02d}:{minute:02d}' != plan['event_time']:
-                          continue
                   key = 'registration' if 'reg' in kind.casefold() else 'business'
-                  matches[key].append((ws, bool(hour)))
+                  matches[key].append(ws)
               for kind, items in matches.items():
                   if len(items) != 1:
                       raise RuntimeError('Expected exactly one ' + kind + ' UTM tab for '
-                                         + plan['event_date'] + ' ' + plan['event_time']
-                                         + '; found ' + str(len(items)) + '. No other event substituted.')
-              # Do not pair a time-qualified source with an unqualified source by accident.
-              if matches['business'][0][1] != matches['registration'][0][1]:
-                  raise RuntimeError('Business and Reg team UTM tabs must use the same date/time naming style.')
-              return matches['business'][0][0], matches['registration'][0][0]
+                                         + plan['event_date'] + ' with the fixed 7:30 PM Flexi Genie 10 Min/Mins title'
+                                         + '; found ' + str(len(items)) + '. No other date substituted.')
+              print('UTM uses the fixed 7:30 PM tab names for this date; selected webinar time:', plan['event_time'])
+              return matches['business'][0], matches['registration'][0]
 
 
           def read_window_utm_contacts(worksheet, plan):
@@ -1741,7 +1736,7 @@ jobs:
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
-          print('WORKFLOW REVISION: V19-R2 — selected event date drives the complete workflow')
+          print('WORKFLOW REVISION: V19-R3 — selected event date drives the complete workflow')
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
           PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
           LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
@@ -2946,9 +2941,9 @@ jobs:
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 19-R2: both CSVs verified; Google Sheets remain read-only.')
+                  print('VERSION 19-R3: both CSVs verified; Google Sheets remain read-only.')
               except Exception as error:
-                  print('VERSION 19-R2 stopped:', type(error).__name__, str(error))
+                  print('VERSION 19-R3 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
