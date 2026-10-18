@@ -4,9 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       event_date:
-        description: "Webinar date (YYYY-MM-DD, a Tue/Wed/Sun). Leave blank to use the latest finished Tue/Wed/Sun webinar."
+        description: "Webinar date YYYY-MM-DD; leave blank for today in India (Tue/Wed/Sun only)."
         required: false
         default: ""
+      webinar_session:
+        description: "Auto: Sunday before 9 AM = morning, from 9 AM = evening (India time). Override for a rerun."
+        type: choice
+        required: true
+        default: auto
+        options:
+          - auto
+          - morning
+          - evening
 
 concurrency:
   group: flexifunnels-discrepancy-sheets
@@ -18,15 +27,15 @@ permissions:
 jobs:
 
   test-google-sheets:
-    name: Find latest paired UTM tabs and verify Sheets
+    name: Verify selected webinar and its UTM collection window
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       utm_landing_tab: ${{ steps.verify-sheets.outputs.utm_landing_tab }}
       utm_reg_tab: ${{ steps.verify-sheets.outputs.utm_reg_tab }}
       utm_tab_date: ${{ steps.verify-sheets.outputs.utm_tab_date }}
-      window_start: ${{ steps.verify-sheets.outputs.window_start }}
-      window_end: ${{ steps.verify-sheets.outputs.window_end }}
+      webinar_slot: ${{ steps.verify-sheets.outputs.webinar_slot }}
+      event_plan: ${{ steps.verify-sheets.outputs.event_plan }}
 
     steps:
 
@@ -40,7 +49,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install gspread google-auth
 
-      - name: Verify Google Sheets access and discover daily UTM tabs
+      - name: Verify Sheets and the selected webinar UTM tabs
         id: verify-sheets
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -48,14 +57,105 @@ jobs:
           UTM_SHEET_ID: ${{ vars.UTM_SHEET_ID }}
           DISCREPANCY_SHEET_ID: ${{ vars.DISCREPANCY_SHEET_ID }}
           DISCREPANCY_TAB_NAME: ${{ vars.DISCREPANCY_TAB_NAME }}
-          TIMEZONE: ${{ vars.TIMEZONE }}
+          TIMEZONE: Asia/Kolkata
           ACTIVECAMPAIGN_API_URL: ${{ secrets.ACTIVECAMPAIGN_API_URL }}
           ACTIVECAMPAIGN_API_KEY: ${{ secrets.ACTIVECAMPAIGN_API_KEY }}
           ZOOM_STORAGE_STATE_B64: ${{ secrets.ZOOM_STORAGE_STATE_B64 }}
           TARGET_EVENT_DATE: ${{ inputs.event_date }}
+          WEBINAR_SLOT: ${{ inputs.webinar_session }}
 
         run: |
           python -u - <<'PY'
+          """Single event plan shared by discovery, both exports and final publication."""
+          import json
+          import os
+          from datetime import date, datetime, timedelta
+          from zoneinfo import ZoneInfo
+
+          EVENT_TIMEZONE = 'Asia/Kolkata'
+
+
+          def resolve_manual_event(date_text='', session='auto', now=None):
+              """A manual run selects today's event, including an unfinished window."""
+              tz = ZoneInfo(EVENT_TIMEZONE)
+              now = now or datetime.now(tz)
+              if now.tzinfo is None:
+                  raise RuntimeError('Manual event selection requires a timezone-aware clock.')
+              now = now.astimezone(tz)
+              event_date = date.fromisoformat(date_text.strip()) if date_text.strip() else now.date()
+              if event_date > now.date():
+                  raise RuntimeError('The requested webinar date is in the future.')
+              session = session.strip() or 'auto'
+              if session in ('auto', 'choose'):
+                  if event_date.weekday() == 6:
+                      if event_date != now.date():
+                          raise RuntimeError('For a past Sunday, explicitly choose morning (11 AM) or evening (7:30 PM).')
+                      session = 'morning' if now.hour < 9 else 'evening'
+                  else:
+                      session = 'evening'
+              plan = schedule_for(event_date, session)
+              if now < datetime.fromisoformat(plan['start_exclusive']):
+                  raise RuntimeError('This webinar collection window has not started yet.')
+              # Do not wait for the end cutoff and do not choose an older finished event.
+              return event_date, session, plan
+
+
+          def schedule_for(event_date, slot):
+              if isinstance(event_date, str):
+                  event_date = date.fromisoformat(event_date)
+              if slot not in ('morning', 'evening'):
+                  raise RuntimeError('Choose morning or evening for the webinar session.')
+              weekday = event_date.weekday()
+              if weekday not in (1, 2, 6):
+                  raise RuntimeError('Webinar date must be Tuesday, Wednesday or Sunday; no other date substituted.')
+              if slot == 'morning' and weekday != 6:
+                  raise RuntimeError('The 11 AM session is available only on Sunday.')
+              tz = ZoneInfo(EVENT_TIMEZONE)
+              midnight = datetime.combine(event_date, datetime.min.time(), tzinfo=tz)
+              if weekday == 1:
+                  start, end = midnight - timedelta(days=2) + timedelta(hours=18), midnight + timedelta(hours=18)
+              elif weekday == 2:
+                  start, end = midnight - timedelta(days=1) + timedelta(hours=18), midnight + timedelta(hours=18)
+              elif slot == 'morning':
+                  start, end = midnight - timedelta(days=4) + timedelta(hours=18), midnight + timedelta(hours=9)
+              else:
+                  start, end = midnight + timedelta(hours=9), midnight + timedelta(hours=18)
+              event_time = '11:00' if slot == 'morning' else '19:30'
+              return {
+                  'event_date': event_date.isoformat(), 'event_time': event_time, 'slot': slot,
+                  'timezone': EVENT_TIMEZONE, 'start_date': start.date().isoformat(),
+                  'end_date': end.date().isoformat(), 'start_exclusive': start.isoformat(),
+                  'end_inclusive': end.isoformat(),
+              }
+
+
+          def selected_schedule(event_date=None):
+              event_date = event_date or os.environ.get('UTM_TAB_DATE', '')
+              plan = schedule_for(event_date, os.environ.get('WEBINAR_SLOT', 'evening'))
+              recorded = os.environ.get('EVENT_PLAN_JSON', '').strip()
+              if recorded and json.loads(recorded) != plan:
+                  raise RuntimeError('Selected webinar and collection window differ from the verified UTM event.')
+              return plan
+
+
+          def within_event_window(timestamp, plan):
+              tz = ZoneInfo(plan['timezone'])
+              if timestamp.tzinfo is None:
+                  timestamp = timestamp.replace(tzinfo=tz)
+              return datetime.fromisoformat(plan['start_exclusive']) < timestamp <= datetime.fromisoformat(plan['end_inclusive'])
+
+
+          def event_tab_prefix(event_date):
+              plan = selected_schedule(event_date)
+              # Preserve weekday tab names; Sunday has two independently rerunnable events.
+              suffix = (' 11AM' if plan['slot'] == 'morning' else ' 730PM') if date.fromisoformat(plan['event_date']).weekday() == 6 else ''
+              return plan['event_date'] + suffix + ' '
+
+
+          def event_report_window(plan):
+              return {'start_date': plan['start_date'], 'end_date': plan['end_date'],
+                      'timezone': plan['timezone'], 'event_plan': plan}
+
           import json
           import os
           import re
@@ -66,7 +166,7 @@ jobs:
           from google.oauth2.service_account import Credentials
 
           print("=" * 60)
-          print("GOOGLE SHEETS TEST - VERSION 18")
+          print("GOOGLE SHEETS TEST - VERSION 19-R2")
           print("=" * 60)
 
           required = [
@@ -478,15 +578,80 @@ jobs:
                   raise RuntimeError('ActiveCampaign group is too large for one workflow run.')
 
               def event_contacts(self, event_date):
+                  from datetime import datetime
+
+                  schedule = selected_schedule(event_date)
+                  event_time = schedule['event_time']
                   month = 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split()[event_date.month - 1]
                   search = str(event_date.day) + ' ' + month
+                  override = os.environ.get('ACTIVECAMPAIGN_LIST_ID', '').strip()
+                  if override and not re.fullmatch(r'[1-9][0-9]*', override):
+                      raise RuntimeError('ActiveCampaign list ID must be a positive numeric ID.')
                   lists = self.pages('lists', 'lists', {'filters[name][contains]': search, 'orders[name]': 'ASC'})
-                  pattern = re.compile(r'^0?' + str(event_date.day) + r'\s+' + month
-                                       + r'\s+' + str(event_date.year)
-                                       + r'\s+Flexi\s+Genie\s+10\s+Mins?\s+Business\s+Workshop$', re.I)
-                  candidates = [item for item in lists if pattern.fullmatch(str(item.get('name', '')).strip())]
-                  if not candidates:
-                      raise RuntimeError('No Flexi Genie 10 Mins Business Workshop list found for ' + event_date.isoformat())
+
+                  # The known family stays exact. Optional clock times distinguish Sunday's
+                  # two events; an unrelated title containing the same date never qualifies.
+                  clock = r'(?:0?[1-9]|1[0-2])(?::[0-5][0-9])?\s*[AP]M|(?:[01]?[0-9]|2[0-3]):[0-5][0-9]'
+                  divider = r'\s*[-|\u2013\u2014]?\s*'
+                  pattern = re.compile(
+                      r'^0?' + str(event_date.day) + r'\s+' + month + r'\s+' + str(event_date.year)
+                      + divider + r'(?:(?P<before>' + clock + r')' + divider + r')?'
+                      + r'Flexi\s+Genie\s+10\s+Mins?\s+Business\s+Workshop'
+                      + r'(?:' + divider + r'(?P<after>' + clock + r'))?\s*$', re.I)
+
+                  def declared_time(item):
+                      title = str(item.get('name', '')).strip()
+                      if '\n' in title or '\r' in title:
+                          return False, None
+                      match = pattern.fullmatch(title)
+                      if not match or (match.group('before') and match.group('after')):
+                          return False, None
+                      token = match.group('before') or match.group('after')
+                      if token is None:
+                          return True, None
+                      token = re.sub(r'\s+', '', token).upper()
+                      for fmt in ('%I:%M%p', '%I%p', '%H:%M'):
+                          try:
+                              return True, datetime.strptime(token, fmt).strftime('%H:%M')
+                          except ValueError:
+                              pass
+                      return False, None
+
+                  if override:
+                      candidates = [item for item in lists if str(item.get('id')) == override]
+                      if len(candidates) != 1:
+                          raise RuntimeError('The requested ActiveCampaign list ID was not found uniquely among lists for '
+                                             + event_date.isoformat() + '.')
+                      valid, clock_time = declared_time(candidates[0])
+                      if not valid or (clock_time is not None and clock_time != event_time):
+                          raise RuntimeError('The requested ActiveCampaign list does not match the selected webinar date, '
+                                             '10-minute Business Workshop family and time.')
+                      selection_mode = 'explicit_list_id'
+                      scope = 'shared_sunday_list' if event_date.weekday() == 6 and clock_time is None else 'event_list'
+                  else:
+                      qualified, untimed = [], []
+                      for item in lists:
+                          valid, clock_time = declared_time(item)
+                          if valid and clock_time == event_time:
+                              qualified.append(item)
+                          elif valid and clock_time is None:
+                              untimed.append(item)
+                      if event_date.weekday() == 6:
+                          # The user confirmed the dated Sunday list holds both sessions.
+                          # Prefer a separately named exact-time list if one exists; otherwise
+                          # use that shared list and identify its combined count explicitly.
+                          candidates = qualified or untimed
+                          scope = 'event_list' if qualified else 'shared_sunday_list'
+                      else:
+                          candidates = [item for item in lists if item in qualified or item in untimed]
+                          scope = 'event_list'
+                      if not candidates:
+                          raise RuntimeError('No Flexi Genie 10 Mins Business Workshop list found for '
+                                             + event_date.isoformat() + ' at ' + event_time + '.')
+                      selection_mode = ('shared_sunday_business_most_active' if scope == 'shared_sunday_list'
+                                        else 'dated_time_qualified_most_active' if event_date.weekday() == 6
+                                        else 'dated_business_most_active')
+
                   ranked = []
                   for item in candidates:
                       data = self.get('contacts', {'listid': item['id'], 'status': 1, 'meta': 'only'})
@@ -497,15 +662,20 @@ jobs:
                       except (KeyError, TypeError, ValueError):
                           raise RuntimeError('Cannot verify the active contact count for a matching list.') from None
                       ranked.append((count, item))
-                  # max preserves the first result when active counts are equal.
+                  # Preserve the existing first-result tie rule inside the correctly scoped event.
                   _, selected = max(ranked, key=lambda entry: entry[0])
                   records = self.pages('contacts', 'contacts', {'listid': selected['id'], 'status': 1, 'orders[id]': 'ASC'})
                   rows = [{'name': ' '.join(str(c.get(k) or '').strip() for k in ('firstName', 'lastName')).strip(),
                            'email': str(c.get('email') or '').strip(), 'phone': str(c.get('phone') or '').strip()}
                           for c in records]
                   print('ActiveCampaign list selected:', selected['name'])
+                  print('ActiveCampaign webinar:', event_date.isoformat(), event_time)
                   print('Active contacts fetched:', len(rows))
-                  return rows, {'id': str(selected['id']), 'name': selected['name'], 'active_count': len(rows)}
+                  if scope == 'shared_sunday_list':
+                      print('ActiveCampaign: shared Sunday list; this count combines both Sunday sessions:', len(rows))
+                  return rows, {'id': str(selected['id']), 'name': selected['name'], 'active_count': len(rows),
+                                'event_date': event_date.isoformat(), 'event_time': event_time,
+                                'slot': schedule['slot'], 'selection_mode': selection_mode, 'scope': scope}
 
               def contacts(self, selector):
                   kind, value = selector['type'], selector['value']
@@ -761,7 +931,7 @@ jobs:
               return rows
 
 
-          def append_summary_with_metadata(book, sheet, expected_headers, row, run_key, prefix_headers=False):
+          def append_summary_with_metadata(book, sheet, expected_headers, row, run_key, prefix_headers=False, cell_notes=None):
               """Append stats while retaining its existing visible columns.
 
               The known headers must be present already. One atomic spreadsheet batch adds
@@ -803,7 +973,7 @@ jobs:
               if grid.get("columnCount", 0) < len(expected_headers):
                   raise RuntimeError("Stats worksheet has fewer columns than the configured layout.")
 
-              digest = hashlib.sha256(json.dumps(row, ensure_ascii=False, separators=(",", ":"),
+              digest = hashlib.sha256(json.dumps({"row": row, "notes": cell_notes or {}}, ensure_ascii=False, separators=(",", ":"),
                                                 allow_nan=False).encode("utf-8")).hexdigest()
               marker_value = f"{run_key}|{digest}"
               candidates = list(metadata.get("developerMetadata", []))
@@ -836,9 +1006,11 @@ jobs:
                                                        "length": start + 1 - capacity}})
               cells = [{"userEnteredValue": {"stringValue" if isinstance(value, str) else "numberValue": value}}
                        for value in row]
+              for index, note in (cell_notes or {}).items():
+                  cells[index]["note"] = note
               requests.extend([
                   {"updateCells": {"start": {"sheetId": sheet_id, "rowIndex": start, "columnIndex": 0},
-                                   "rows": [{"values": cells}], "fields": "userEnteredValue"}},
+                                   "rows": [{"values": cells}], "fields": "userEnteredValue,note"}},
                   {"createDeveloperMetadata": {"developerMetadata": {
                       "metadataKey": "ff_discrepancy_run", "metadataValue": marker_value,
                       "visibility": "DOCUMENT", "location": {"dimensionRange": {
@@ -853,7 +1025,7 @@ jobs:
           def publish_daily_tabs(book, datasets, event_date, finalize=False):
               """Upsert only the six named daily tabs; reruns reuse them, newest at front."""
               labels = ['UTM', 'LANDING PAGE', 'LANDING PAGE REG', 'ACTIVE CAMPAIGN', 'ZOOM', 'DESCREPANCY']
-              prefix = event_date.isoformat() + ' '
+              prefix = event_tab_prefix(event_date)
               allowed = [prefix + label for label in labels]
               if not datasets or any(title not in allowed for title in datasets):
                   raise ValueError('Only the six daily result tabs may be published.')
@@ -1000,8 +1172,10 @@ jobs:
               if zoom_text(meta['Topic']) != zoom_text(ZOOM_TOPIC):
                   raise RuntimeError('Zoom CSV is for a different webinar topic.')
               scheduled = datetime.strptime(meta['Scheduled Time'], '%m/%d/%Y %I:%M:%S %p')
-              if scheduled.date() != event_date:
-                  raise RuntimeError('Zoom CSV webinar date does not match the selected UTM event date.')
+              plan = selected_schedule(event_date)
+              if (scheduled.date() != event_date
+                      or scheduled.strftime('%H:%M:%S') != plan['event_time'] + ':00'):
+                  raise RuntimeError('Zoom CSV webinar date/time does not match the selected event session.')
               webinar_id = re.sub(r'\s+', '', meta['ID'])
               if not webinar_id.isascii() or not webinar_id.isdigit():
                   raise RuntimeError('Zoom CSV webinar ID is invalid.')
@@ -1034,6 +1208,7 @@ jobs:
               contacts.sort(key=lambda row: (row['name'].casefold(), row['email'].casefold(), row['phone']))
               return contacts, {'topic': ZOOM_TOPIC, 'webinar_id': webinar_id,
                                 'scheduled_time': meta['Scheduled Time'], 'event_date': event_date.isoformat(),
+                                'event_plan': plan,
                                 'report_type': 'All registrants', 'downloaded_count': len(contacts),
                                 'last_name_phone_rows_repaired': repaired_names}
 
@@ -1048,22 +1223,31 @@ jobs:
                   writer = csv.DictWriter(output, fieldnames=['name', 'email', 'phone'])
                   writer.writeheader()
                   writer.writerows(contacts)
-              meta.update({'search_from': (event_date - timedelta(days=1)).isoformat(),
-                           'search_to': event_date.isoformat(), 'timezone': 'Asia/Kolkata',
+              plan = selected_schedule(event_date)
+              meta.update({'search_from': plan['start_date'],
+                           'search_to': plan['end_date'], 'timezone': 'Asia/Kolkata',
+                           'event_plan': plan,
                            'csv_sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
               (outdir / 'manifest.json').write_text(json.dumps(meta, indent=2))
               return meta
 
 
           def load_zoom_contacts(folder, event_date):
+              plan = selected_schedule(event_date)
               meta = json.loads((folder / 'manifest.json').read_text())
-              if (meta.get('event_date') != event_date.isoformat()
-                      or meta.get('search_from') != (event_date - timedelta(days=1)).isoformat()
-                      or meta.get('search_to') != event_date.isoformat()
+              try:
+                  scheduled = datetime.strptime(meta['scheduled_time'], '%m/%d/%Y %I:%M:%S %p')
+                  time_matches = (scheduled.date() == event_date
+                                  and scheduled.strftime('%H:%M:%S') == plan['event_time'] + ':00')
+              except (KeyError, TypeError, ValueError):
+                  time_matches = False
+              if (meta.get('event_date') != plan['event_date']
+                      or meta.get('search_from') != plan['start_date']
+                      or meta.get('search_to') != plan['end_date']
+                      or meta.get('event_plan') != plan
                       or meta.get('topic') != ZOOM_TOPIC or meta.get('report_type') != 'All registrants'
-                      or meta.get('timezone') != 'Asia/Kolkata'
-                      or datetime.strptime(meta['scheduled_time'], '%m/%d/%Y %I:%M:%S %p').date() != event_date):
-                  raise RuntimeError('Zoom report metadata does not match this UTM event.')
+                      or meta.get('timezone') != 'Asia/Kolkata' or not time_matches):
+                  raise RuntimeError('Zoom report metadata does not match this event date, session, and registration window.')
               path = folder / 'registrants.csv'
               if hashlib.sha256(path.read_bytes()).hexdigest() != meta.get('csv_sha256'):
                   raise RuntimeError('Zoom CSV differs from the verified download.')
@@ -1123,7 +1307,7 @@ jobs:
 
 
           def sheet_matrices(event_date, datasets):
-              return {event_date.isoformat() + ' ' + label:
+              return {event_tab_prefix(event_date) + label:
                       [[row['name'], row['email'], row['phone']] for row in rows]
                       for label, rows in datasets.items()}
 
@@ -1153,14 +1337,10 @@ jobs:
               snapshot = json.loads(Path('utm/snapshot.json').read_text())
               window = json.loads(Path('reports/report-window.json').read_text())
               event_date = date.fromisoformat(snapshot['event_date'])
-              window_start = datetime.fromisoformat(snapshot['window_start'])
-              window_end = datetime.fromisoformat(snapshot['window_end'])
-              expected_start = window_start.date()
-              if window != {'start_date': expected_start.isoformat(), 'end_date': window_end.date().isoformat(),
-                            'timezone': snapshot['timezone'], 'window_start': snapshot['window_start'],
-                            'window_end': snapshot['window_end']} or window_end.date() != event_date:
-                  raise RuntimeError('UTM snapshot and FlexiFunnels report windows do not agree.')
-              print('Data window (IST): after', snapshot['window_start'], 'up to', snapshot['window_end'])
+              plan = selected_schedule(event_date)
+              expected_start = date.fromisoformat(plan['start_date'])
+              if snapshot.get('event_plan') != plan or window != event_report_window(plan):
+                  raise RuntimeError('UTM snapshot and FlexiFunnels export must use the same webinar session and collection window.')
               selectors, layout = required_configuration(event_date)
               if snapshot['activecampaign_selectors'] != selectors or snapshot['stats_layout'] != layout:
                   raise RuntimeError('Configuration changed after discovery; rerun the whole workflow.')
@@ -1222,7 +1402,7 @@ jobs:
               (outdir / 'publication.json').write_text(json.dumps(publication, indent=2))
               print('Daily data tabs:', imported['titles'])
               stored = read_verified_snapshot(raw_book, imported['titles'], imported_matrices)
-              key = lambda label: event_date.isoformat() + ' ' + label
+              key = lambda label: event_tab_prefix(event_date) + label
               ff_business, ff_reg = stored[key('LANDING PAGE')], stored[key('LANDING PAGE REG')]
               merged_utm, ac_rows = stored[key('UTM')], stored[key('ACTIVE CAMPAIGN')]
               zoom_rows = stored[key('ZOOM')]
@@ -1263,8 +1443,8 @@ jobs:
               print('STAGE 4: Append totals from verified result tabs to Discrepancy Stats.')
               merged_reports = prepare_contact_rows(ff_business + ff_reg)
               run_key = os.environ['GITHUB_RUN_ID'] + '.' + os.environ['GITHUB_RUN_ATTEMPT']
-              counts = {'event_date': event_date.isoformat(), 'range_start': snapshot['window_start'],
-                        'range_end': snapshot['window_end'], 'run_time': snapshot['captured_at'], 'run_key': run_key,
+              counts = {'event_date': event_date.isoformat(), 'event_time': plan['event_time'], 'event_plan': plan, 'range_start': expected_start.isoformat(),
+                        'range_end': event_date.isoformat(), 'run_time': snapshot['captured_at'], 'run_key': run_key,
                         'landing': len(ff_business), 'landing_reg': len(ff_reg), 'reports': len(merged_reports),
                         'utm': len(merged_utm), 'activecampaign': len(ac_rows), 'zoom': len(zoom_rows), 'discrepancy': len(discrepancy)}
               checked_at = datetime.fromisoformat(snapshot['captured_at']).astimezone(ZoneInfo(snapshot['timezone']))
@@ -1273,13 +1453,16 @@ jobs:
                              'webinar_date': event_date.strftime('%d/%m/%Y'),
                              'webinar_type': '10 minute business'})
               stats_row = [counts[column['key']] for column in layout]
-              stats_status = append_summary_with_metadata(stats_book, stats_sheet, headers, stats_row, run_key, prefix_headers=True)
+              stats_status = append_summary_with_metadata(stats_book, stats_sheet, headers, stats_row, run_key, prefix_headers=True, cell_notes={
+                  2: 'Webinar: ' + plan['event_date'] + ' at ' + plan['event_time'] + ' IST. Collection: after ' + plan['start_exclusive'] + ' through ' + plan['end_inclusive'],
+                  6: ('Shared Sunday list: includes contacts from both Sunday sessions.' if selected_list.get('scope') == 'shared_sunday_list' else 'Selected webinar ActiveCampaign list.')})
               publication.update({'stage': 'complete', 'stats_status': stats_status})
               (outdir / 'publication.json').write_text(json.dumps(publication, indent=2))
               (outdir / 'summary.json').write_text(json.dumps({
                   'start_date': expected_start.isoformat(), 'end_date': event_date.isoformat(),
                   'utm_event_date': event_date.isoformat(), 'timezone': snapshot['timezone'],
                   'matching_rule': 'deduplicated on email+phone; UTM-vs-Zoom presence by email OR phone (Indian numbers to 10 digits)',
+                  'event_plan': plan,
                   'raw_source_counts': raw_counts,
                   'source_tabs': imported['titles'],
                   'reports': summary, 'totals': counts, 'published_tabs': published['titles'], 'stats_status': stats_status,
@@ -1294,115 +1477,90 @@ jobs:
           from datetime import date
 
 
-          # ---- WEBINAR SCHEDULE (edit here only) ------------------------------------
-          # Webinars run Tuesday, Wednesday and Sunday at 7:30 PM IST. Each webinar's data is
-          # what came in after the previous backend switch, up to its own backend switch:
-          #   Sunday    : Wednesday 6 PM  -> Sunday 9 AM
-          #   Tuesday   : Sunday 9 AM     -> Tuesday 6 PM
-          #   Wednesday : Tuesday 6 PM    -> Wednesday 6 PM
-          # weekday (Mon=0 ... Sun=6): (days back to the start day, start hour, end hour)
-          WEBINAR_WINDOWS = {6: (4, 18, 9), 1: (2, 9, 18), 2: (1, 18, 18)}
-          WEBINAR_DAY_NAMES = {6: 'Sunday', 1: 'Tuesday', 2: 'Wednesday'}
+          import re
 
 
-          def event_window(event_date):
-              """(start, end) as IST wall-clock datetimes: start exclusive, end inclusive."""
-              if event_date.weekday() not in WEBINAR_WINDOWS:
-                  raise RuntimeError(event_date.isoformat() + ' is a ' + event_date.strftime('%A')
-                                     + '; discrepancy checks run only for Tuesday, Wednesday and Sunday webinars.')
-              back, start_hour, end_hour = WEBINAR_WINDOWS[event_date.weekday()]
-              start = datetime.combine(event_date - timedelta(days=back), datetime.min.time()).replace(hour=start_hour)
-              end = datetime.combine(event_date, datetime.min.time()).replace(hour=end_hour)
-              return start, end
-
-
-          def discover_daily_utm_tabs(worksheets, target_date=None, today=None, now=None):
-              """Select the newest calendar date with both matching UTM tab types.
-
-              Ignore incomplete newer dates until both tabs exist, and never auto-select a
-              date in the future (tabs are created ahead of upcoming webinars). Duplicate
-              tabs on the selected date remain an error. An explicit target_date selects
-              exactly that date.
-              """
-              # Match the event-tab names supplied by the user, not unrelated daily tabs.
+          def discover_webinar_utm_tabs(worksheets, event_date, slot):
+              """Require one pair for the selected weekday/date/session; never substitute."""
+              plan = schedule_for(event_date, slot)
+              months = {name.lower(): i + 1 for i, name in enumerate('Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split())}
               pattern = re.compile(
                   r'^\s*(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+'
-                  r'7\s*:\s*30\s*PM\s+Flexi\s+Genie\s+10\s+Mins?\s+'
-                  r'(Busines(?:s)?|Reg\s+team)\s*$', re.IGNORECASE,
-              )
-              months = {name.lower(): index + 1 for index, name in enumerate(
-                  'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split())}
-              matches_by_date = {}
-              for worksheet in worksheets:
-                  title = worksheet.title
-                  if '\n' in title or '\r' in title:
+                  r'(?:(\d{1,2})(?:\s*:\s*(\d{2}))?\s*(AM|PM)\s+)?'
+                  r'Flexi\s+Genie\s+10\s+Mins?\s+(Busines(?:s)?|(?:Busines(?:s)?\s+)?Reg\s+team)\s*$', re.I)
+              matches = {'business': [], 'registration': []}
+              for ws in worksheets:
+                  if '\n' in ws.title or '\r' in ws.title:
                       continue
-                  match = pattern.fullmatch(title)
+                  match = pattern.fullmatch(ws.title)
                   if not match:
                       continue
-                  day, month, year, kind = match.groups()
+                  day, month, year, hour, minute, ampm, kind = match.groups()
                   try:
                       tab_date = date(int(year), months[month.lower()], int(day))
                   except (ValueError, KeyError):
                       continue
-                  key = 'registration' if kind.lower().startswith('reg') else 'business'
-                  matches_by_date.setdefault(
-                      tab_date, {'business': [], 'registration': []}
-                  )[key].append(worksheet)
-              if not matches_by_date:
-                  raise RuntimeError(
-                      'No daily UTM tabs match the 7:30 PM Flexi Genie 10 Min/Mins '
-                      'Business/Busines or Reg team naming patterns.'
-                  )
-              if target_date is not None and today is not None and target_date > today:
-                  raise RuntimeError('Requested event date ' + target_date.isoformat() + ' is in the future.')
-              if target_date is not None:
-                  event_window(target_date)  # Rejects dates that are not Tue/Wed/Sun.
-              if target_date is None:
-                  # Only Tue/Wed/Sun webinars whose data window has already closed. Tabs made
-                  # ahead of time for upcoming webinars are skipped.
-                  complete_dates = [day for day, kinds in matches_by_date.items()
-                                    if kinds['business'] and kinds['registration']
-                                    and day.weekday() in WEBINAR_WINDOWS
-                                    and (today is None or day <= today)
-                                    and (now is None or event_window(day)[1] <= now)]
-                  if not complete_dates:
-                      raise RuntimeError('No complete daily UTM pair found: business and registration tabs must share the same date.')
-                  target_date = max(complete_dates)
-                  skipped = sorted(day.isoformat() for day in matches_by_date if day > target_date)
-                  if skipped:
-                      print('Newer UTM dates skipped (future or incomplete):', ', '.join(skipped))
-              if target_date not in matches_by_date:
-                  raise RuntimeError('No UTM tab pair found for the required date ' + target_date.isoformat() + '. No other date substituted.')
-              matches = matches_by_date[target_date]
+                  if tab_date != event_date:
+                      continue
+                  if hour:
+                      hour, minute = int(hour), int(minute or '0')
+                      if not 1 <= hour <= 12 or not 0 <= minute <= 59:
+                          continue
+                      h24 = hour % 12 + (12 if ampm.upper() == 'PM' else 0)
+                      if f'{h24:02d}:{minute:02d}' != plan['event_time']:
+                          continue
+                  key = 'registration' if 'reg' in kind.casefold() else 'business'
+                  matches[key].append((ws, bool(hour)))
               for kind, items in matches.items():
                   if len(items) != 1:
-                      raise RuntimeError(
-                          'Required UTM event date is ' + target_date.isoformat()
-                          + '. Expected exactly one ' + kind + ' tab'
-                          + '; found ' + str(len(items)) + '. No older tab will be substituted.'
-                      )
-              return target_date, matches['business'][0], matches['registration'][0]
+                      raise RuntimeError('Expected exactly one ' + kind + ' UTM tab for '
+                                         + plan['event_date'] + ' ' + plan['event_time']
+                                         + '; found ' + str(len(items)) + '. No other event substituted.')
+              # Do not pair a time-qualified source with an unqualified source by accident.
+              if matches['business'][0][1] != matches['registration'][0][1]:
+                  raise RuntimeError('Business and Reg team UTM tabs must use the same date/time naming style.')
+              return matches['business'][0][0], matches['registration'][0][0]
 
-          # Inspect UTM first and select the event date.
-          # 14 Oct tabs -> 13–14 Oct reports; 15 Oct tabs -> 14–15 Oct reports.
-          timezone_name = os.environ.get('TIMEZONE', '').strip() or 'Asia/Kolkata'
-          today_local = datetime.now(ZoneInfo(timezone_name)).date()
-          override = os.environ.get('TARGET_EVENT_DATE', '').strip()
-          requested_date = date.fromisoformat(override) if override else None
-          if requested_date is not None:
-              print('Event date requested for this run:', requested_date.isoformat())
-          now_local = datetime.now(ZoneInfo(timezone_name)).replace(tzinfo=None)
-          target_tab_date, landing_tab, reg_tab = discover_daily_utm_tabs(
-              opened['UTM'].worksheets(), target_date=requested_date, today=today_local, now=now_local)
-          window_start, window_end = event_window(target_tab_date)
-          print('Webinar:', WEBINAR_DAY_NAMES[target_tab_date.weekday()], target_tab_date.isoformat(), '7:30 PM')
-          print('Data window (IST): after', window_start.strftime('%a %d %b %Y %I:%M %p'),
-                'up to', window_end.strftime('%a %d %b %Y %I:%M %p'))
-          if window_end > now_local:
-              print('WARNING: this window has not closed yet; data after now will be missing.')
+
+          def read_window_utm_contacts(worksheet, plan):
+              values = worksheet.get_all_values()
+              if not values:
+                  raise RuntimeError('Selected UTM tab is empty and has no header: ' + worksheet.title)
+              headers = [str(value).strip().casefold() for value in values[0]]
+              columns = ('timestamp_incoming_webhook', 'first_name', 'email', 'phone')
+              if any(headers.count(column) != 1 for column in columns):
+                  raise RuntimeError('UTM tab needs unique timestamp_incoming_webhook, first_name, email and phone columns: ' + worksheet.title)
+              indices = [headers.index(column) for column in columns]
+              contacts, excluded = [], 0
+              for row_number, row in enumerate(values[1:], 2):
+                  if not any(str(cell).strip() for cell in row):
+                      continue
+                  if len(row) <= max(indices):
+                      row = list(row) + [''] * (max(indices) + 1 - len(row))
+                  timestamp = parse_utm_timestamp(str(row[indices[0]]), ZoneInfo(plan['timezone']))
+                  if not within_event_window(timestamp, plan):
+                      excluded += 1
+                      continue
+                  contacts.append(dict(zip(('name', 'email', 'phone'),
+                                           (str(row[index]).strip() for index in indices[1:]))))
+              print('UTM window applied:', worksheet.title, '; kept=', len(contacts), '; outside window=', excluded)
+              return contacts
+
+
+          # Manual date defaults to today in India; retries may explicitly select an older event.
+          timezone_name = EVENT_TIMEZONE
+          selection_time = datetime.now(ZoneInfo(timezone_name))
+          target_tab_date, slot, plan = resolve_manual_event(
+              os.environ.get('TARGET_EVENT_DATE', ''), os.environ.get('WEBINAR_SLOT', 'auto'), selection_time)
+          os.environ['WEBINAR_SLOT'] = slot
+          landing_tab, reg_tab = discover_webinar_utm_tabs(opened['UTM'].worksheets(), target_tab_date, slot)
+          print('Selected webinar:', plan['event_date'], plan['event_time'], 'IST')
           print('Business tab selected:', landing_tab.title)
           print('Registration tab selected:', reg_tab.title)
+          print('Collect strictly after:', plan['start_exclusive'], '; through:', plan['end_inclusive'])
+          print('Required report calendar:', plan['start_date'], 'through', plan['end_date'])
+          if selection_time < datetime.fromisoformat(plan['end_inclusive']):
+              print('Collection window is still open: process the available data now for this webinar. Rerun after the cutoff for the completed window.')
 
           discrepancy_name = os.environ['DISCREPANCY_TAB_NAME'].strip()
           stats_sheet = opened['DISCREPANCY STATS'].worksheet(discrepancy_name)
@@ -1415,54 +1573,15 @@ jobs:
           zoom_seed_value()  # Check saved-session format before downloads or Sheets writes.
           if os.environ['UTM_SHEET_ID'] in (os.environ['RAW_DATA_SHEET_ID'], os.environ['DISCREPANCY_SHEET_ID']):
               raise RuntimeError('UTM source must be separate from the destination spreadsheets.')
-          start_date = target_tab_date - timedelta(days=1)
+          start_date = date.fromisoformat(plan['start_date'])
           timezone = ZoneInfo(timezone_name)
-          def read_utm_window_contacts(worksheet, start, end, tz):
-              """UTM rows whose webhook timestamp falls inside the webinar window."""
-              values = worksheet.get_all_values()
-              if not values:
-                  raise RuntimeError('Selected UTM tab has no header row: ' + worksheet.title)
-              headers = [str(value).strip().casefold() for value in values[0]]
-              required = ('first_name', 'email', 'phone')
-              if any(headers.count(key) != 1 for key in required):
-                  raise RuntimeError('UTM tab must have unique first_name, email and phone columns.')
-              if headers.count('timestamp_incoming_webhook') != 1:
-                  print(worksheet.title + ': no timestamp_incoming_webhook column; importing all rows.')
-                  return read_utm_tab_contacts(worksheet)
-              index = {key: headers.index(key) for key in required + ('timestamp_incoming_webhook',)}
-              start_tz, end_tz = start.replace(tzinfo=tz), end.replace(tzinfo=tz)
-              kept, before, after, unreadable = [], 0, 0, 0
-              for cells in values[1:]:
-                  get = lambda key: str(cells[index[key]]).strip() if index[key] < len(cells) else ''
-                  row = {'name': get('first_name'), 'email': get('email'), 'phone': get('phone')}
-                  if not any(row.values()):
-                      continue
-                  try:
-                      stamp = parse_utm_timestamp(get('timestamp_incoming_webhook'), tz)
-                  except RuntimeError:
-                      unreadable += 1
-                      kept.append(row)  # Kept so no registrant is silently dropped.
-                      continue
-                  if stamp <= start_tz:
-                      before += 1
-                  elif stamp > end_tz:
-                      after += 1
-                  else:
-                      kept.append(row)
-              print(worksheet.title + ': kept ' + str(len(kept)) + ' rows in window; before window '
-                    + str(before) + '; after window ' + str(after) + '; unreadable timestamp (kept) '
-                    + str(unreadable))
-              return kept
-
-
-          business_rows = read_utm_window_contacts(landing_tab, window_start, window_end, timezone)
-          registration_rows = read_utm_window_contacts(reg_tab, window_start, window_end, timezone)
+          business_rows = read_window_utm_contacts(landing_tab, plan)
+          registration_rows = read_window_utm_contacts(reg_tab, plan)
           Path('utm').mkdir(exist_ok=True)
           write_rows(Path('utm/business.csv'), business_rows)
           write_rows(Path('utm/registration.csv'), registration_rows)
           Path('utm/snapshot.json').write_text(json.dumps({
-              'event_date': target_tab_date.isoformat(), 'timezone': timezone_name,
-              'window_start': window_start.isoformat(), 'window_end': window_end.isoformat(),
+              'event_date': target_tab_date.isoformat(), 'timezone': timezone_name, 'event_plan': plan,
               'captured_at': datetime.now(timezone).isoformat(),
               'business_tab': landing_tab.title, 'registration_tab': reg_tab.title,
               'business_count': len(business_rows), 'registration_count': len(registration_rows),
@@ -1475,8 +1594,8 @@ jobs:
                   output.write('utm_landing_tab=' + landing_tab.title + '\n')
                   output.write('utm_reg_tab=' + reg_tab.title + '\n')
                   output.write('utm_tab_date=' + target_tab_date.isoformat() + '\n')
-                  output.write('window_start=' + window_start.isoformat() + '\n')
-                  output.write('window_end=' + window_end.isoformat() + '\n')
+                  output.write('webinar_slot=' + slot + '\n')
+                  output.write('event_plan=' + json.dumps(plan, separators=(',', ':')) + '\n')
 
           print()
           print("=" * 60)
@@ -1508,19 +1627,109 @@ jobs:
         run: |
           python -m pip install playwright
           python -m playwright install --with-deps chromium
-      - name: Export the day before the UTM event through the event date
+      - name: Export both landing pages across the webinar collection window
         env:
           FLEXIFUNNELS_EMAIL: ${{ secrets.FLEXIFUNNELS_EMAIL }}
           FLEXIFUNNELS_PASSWORD: ${{ secrets.FLEXIFUNNELS_PASSWORD }}
           FLEXIFUNNELS_PROJECT_URL: ${{ vars.FLEXIFUNNELS_PROJECT_URL }}
           FLEXIFUNNELS_LANDING_URL: ${{ vars.FLEXIFUNNELS_LANDING_URL }}
           FLEXIFUNNELS_REG_URL: ${{ vars.FLEXIFUNNELS_REG_URL }}
-          TIMEZONE: ${{ vars.TIMEZONE }}
+          TIMEZONE: Asia/Kolkata
           UTM_TAB_DATE: ${{ needs.test-google-sheets.outputs.utm_tab_date }}
-          WINDOW_START: ${{ needs.test-google-sheets.outputs.window_start }}
-          WINDOW_END: ${{ needs.test-google-sheets.outputs.window_end }}
+          WEBINAR_SLOT: ${{ needs.test-google-sheets.outputs.webinar_slot }}
+          EVENT_PLAN_JSON: ${{ needs.test-google-sheets.outputs.event_plan }}
         run: |
           python -u - <<'PY'
+          """Single event plan shared by discovery, both exports and final publication."""
+          import json
+          import os
+          from datetime import date, datetime, timedelta
+          from zoneinfo import ZoneInfo
+
+          EVENT_TIMEZONE = 'Asia/Kolkata'
+
+
+          def resolve_manual_event(date_text='', session='auto', now=None):
+              """A manual run selects today's event, including an unfinished window."""
+              tz = ZoneInfo(EVENT_TIMEZONE)
+              now = now or datetime.now(tz)
+              if now.tzinfo is None:
+                  raise RuntimeError('Manual event selection requires a timezone-aware clock.')
+              now = now.astimezone(tz)
+              event_date = date.fromisoformat(date_text.strip()) if date_text.strip() else now.date()
+              if event_date > now.date():
+                  raise RuntimeError('The requested webinar date is in the future.')
+              session = session.strip() or 'auto'
+              if session in ('auto', 'choose'):
+                  if event_date.weekday() == 6:
+                      if event_date != now.date():
+                          raise RuntimeError('For a past Sunday, explicitly choose morning (11 AM) or evening (7:30 PM).')
+                      session = 'morning' if now.hour < 9 else 'evening'
+                  else:
+                      session = 'evening'
+              plan = schedule_for(event_date, session)
+              if now < datetime.fromisoformat(plan['start_exclusive']):
+                  raise RuntimeError('This webinar collection window has not started yet.')
+              # Do not wait for the end cutoff and do not choose an older finished event.
+              return event_date, session, plan
+
+
+          def schedule_for(event_date, slot):
+              if isinstance(event_date, str):
+                  event_date = date.fromisoformat(event_date)
+              if slot not in ('morning', 'evening'):
+                  raise RuntimeError('Choose morning or evening for the webinar session.')
+              weekday = event_date.weekday()
+              if weekday not in (1, 2, 6):
+                  raise RuntimeError('Webinar date must be Tuesday, Wednesday or Sunday; no other date substituted.')
+              if slot == 'morning' and weekday != 6:
+                  raise RuntimeError('The 11 AM session is available only on Sunday.')
+              tz = ZoneInfo(EVENT_TIMEZONE)
+              midnight = datetime.combine(event_date, datetime.min.time(), tzinfo=tz)
+              if weekday == 1:
+                  start, end = midnight - timedelta(days=2) + timedelta(hours=18), midnight + timedelta(hours=18)
+              elif weekday == 2:
+                  start, end = midnight - timedelta(days=1) + timedelta(hours=18), midnight + timedelta(hours=18)
+              elif slot == 'morning':
+                  start, end = midnight - timedelta(days=4) + timedelta(hours=18), midnight + timedelta(hours=9)
+              else:
+                  start, end = midnight + timedelta(hours=9), midnight + timedelta(hours=18)
+              event_time = '11:00' if slot == 'morning' else '19:30'
+              return {
+                  'event_date': event_date.isoformat(), 'event_time': event_time, 'slot': slot,
+                  'timezone': EVENT_TIMEZONE, 'start_date': start.date().isoformat(),
+                  'end_date': end.date().isoformat(), 'start_exclusive': start.isoformat(),
+                  'end_inclusive': end.isoformat(),
+              }
+
+
+          def selected_schedule(event_date=None):
+              event_date = event_date or os.environ.get('UTM_TAB_DATE', '')
+              plan = schedule_for(event_date, os.environ.get('WEBINAR_SLOT', 'evening'))
+              recorded = os.environ.get('EVENT_PLAN_JSON', '').strip()
+              if recorded and json.loads(recorded) != plan:
+                  raise RuntimeError('Selected webinar and collection window differ from the verified UTM event.')
+              return plan
+
+
+          def within_event_window(timestamp, plan):
+              tz = ZoneInfo(plan['timezone'])
+              if timestamp.tzinfo is None:
+                  timestamp = timestamp.replace(tzinfo=tz)
+              return datetime.fromisoformat(plan['start_exclusive']) < timestamp <= datetime.fromisoformat(plan['end_inclusive'])
+
+
+          def event_tab_prefix(event_date):
+              plan = selected_schedule(event_date)
+              # Preserve weekday tab names; Sunday has two independently rerunnable events.
+              suffix = (' 11AM' if plan['slot'] == 'morning' else ' 730PM') if date.fromisoformat(plan['event_date']).weekday() == 6 else ''
+              return plan['event_date'] + suffix + ' '
+
+
+          def event_report_window(plan):
+              return {'start_date': plan['start_date'], 'end_date': plan['end_date'],
+                      'timezone': plan['timezone'], 'event_plan': plan}
+
           import os
           import re
           import time
@@ -1532,7 +1741,7 @@ jobs:
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
-          print('WORKFLOW REVISION: V18 — selected event date drives the complete workflow')
+          print('WORKFLOW REVISION: V19-R2 — selected event date drives the complete workflow')
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
           PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
           LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
@@ -1579,15 +1788,10 @@ jobs:
               )
 
 
-          # The webinar's data window decides everything (set by the UTM job).
-          WINDOW_START = datetime.fromisoformat(os.environ['WINDOW_START'])
-          WINDOW_END = datetime.fromisoformat(os.environ['WINDOW_END'])
-          if WINDOW_END.date().isoformat() != os.environ['UTM_TAB_DATE']:
-              raise RuntimeError('Data window does not end on the webinar date.')
-          # Report calendar range: from the window's first day to its last day.
-          yesterday = WINDOW_START.date()
-          today = WINDOW_END.date()
-          print('Data window (IST): after', WINDOW_START.isoformat(), 'up to', WINDOW_END.isoformat())
+          today = datetime.strptime(os.environ['UTM_TAB_DATE'], '%Y-%m-%d').date()
+
+          plan = selected_schedule(today)
+          yesterday = date.fromisoformat(plan['start_date'])
 
           print()
           print("Timezone:", TIMEZONE)
@@ -2635,36 +2839,30 @@ jobs:
 
 
           def validate_and_reduce_export(path, start_date, end_date):
-              # The CSV is the count source. No comparison with a live screen count.
+              plan = selected_schedule(end_date)
+              if start_date.isoformat() != plan['start_date'] or end_date.isoformat() != plan['end_date']:
+                  raise RuntimeError('Export calendar span does not match the selected webinar collection window.')
               with path.open(encoding='utf-8-sig', newline='') as source:
                   reader = csv.DictReader(source)
                   required = ('first_name', 'email', 'phone', 'created_at')
                   if any(key not in (reader.fieldnames or []) for key in required):
                       raise RuntimeError('CSV is missing required identity/timestamp columns.')
-                  identities = []
-                  # Keep only leads inside the webinar window: after WINDOW_START, up to WINDOW_END.
-                  downloaded = 0
-                  excluded = 0
-                  after_end = 0
+                  identities, downloaded, excluded = [], 0, 0
                   for record in reader:
                       downloaded += 1
                       timestamp = datetime.strptime(record['created_at'].strip(), '%b %d, %Y %I:%M %p (IST)')
                       if not start_date <= timestamp.date() <= end_date:
-                          raise RuntimeError('Export contains a record outside the requested date range.')
-                      if timestamp <= WINDOW_START:
+                          raise RuntimeError('Export contains a record outside the requested calendar range.')
+                      if not within_event_window(timestamp, plan):
                           excluded += 1
-                          continue
-                      if timestamp > WINDOW_END:
-                          after_end += 1
                           continue
                       identities.append({'name': record['first_name'].strip(), 'email': record['email'].strip(), 'phone': record['phone'].strip()})
               with path.open('w', encoding='utf-8-sig', newline='') as output:
                   writer = csv.DictWriter(output, fieldnames=['name', 'email', 'phone'])
                   writer.writeheader()
                   writer.writerows(identities)
-              print(path.name + ': window ' + WINDOW_START.isoformat() + ' -> ' + WINDOW_END.isoformat()
-                    + '; downloaded=' + str(downloaded) + '; before window=' + str(excluded)
-                    + '; after window=' + str(after_end) + '; retained=' + str(len(identities)))
+              print(path.name + ': keep after ' + plan['start_exclusive'] + ' through ' + plan['end_inclusive']
+                    + '; downloaded=' + str(downloaded) + '; outside window=' + str(excluded) + '; retained=' + str(len(identities)))
               return len(identities)
 
 
@@ -2730,10 +2928,7 @@ jobs:
 
           Path('reports').mkdir(exist_ok=True)
           import json
-          Path('reports/report-window.json').write_text(json.dumps({
-              'start_date': yesterday.isoformat(), 'end_date': today.isoformat(), 'timezone': TIMEZONE,
-              'window_start': WINDOW_START.isoformat(), 'window_end': WINDOW_END.isoformat(),
-          }))
+          Path('reports/report-window.json').write_text(json.dumps(event_report_window(plan)))
           with sync_playwright() as playwright:
               browser = playwright.chromium.launch(headless=True)
               context = browser.new_context(viewport={'width': 1440, 'height': 900}, accept_downloads=True, timezone_id=TIMEZONE)
@@ -2751,13 +2946,12 @@ jobs:
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 18: both CSVs verified; Google Sheets remain read-only.')
+                  print('VERSION 19-R2: both CSVs verified; Google Sheets remain read-only.')
               except Exception as error:
-                  print('VERSION 18 stopped:', type(error).__name__, str(error))
+                  print('VERSION 19-R2 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
-
           PY
       - name: Upload report-control diagnostics if verification fails
         if: failure()
@@ -2815,8 +3009,100 @@ jobs:
         env:
           ZOOM_STORAGE_STATE_B64: ${{ secrets.ZOOM_STORAGE_STATE_B64 }}
           UTM_TAB_DATE: ${{ needs.test-google-sheets.outputs.utm_tab_date }}
+          WEBINAR_SLOT: ${{ needs.test-google-sheets.outputs.webinar_slot }}
+          EVENT_PLAN_JSON: ${{ needs.test-google-sheets.outputs.event_plan }}
         run: |
           python -u - <<'PY'
+          """Single event plan shared by discovery, both exports and final publication."""
+          import json
+          import os
+          from datetime import date, datetime, timedelta
+          from zoneinfo import ZoneInfo
+
+          EVENT_TIMEZONE = 'Asia/Kolkata'
+
+
+          def resolve_manual_event(date_text='', session='auto', now=None):
+              """A manual run selects today's event, including an unfinished window."""
+              tz = ZoneInfo(EVENT_TIMEZONE)
+              now = now or datetime.now(tz)
+              if now.tzinfo is None:
+                  raise RuntimeError('Manual event selection requires a timezone-aware clock.')
+              now = now.astimezone(tz)
+              event_date = date.fromisoformat(date_text.strip()) if date_text.strip() else now.date()
+              if event_date > now.date():
+                  raise RuntimeError('The requested webinar date is in the future.')
+              session = session.strip() or 'auto'
+              if session in ('auto', 'choose'):
+                  if event_date.weekday() == 6:
+                      if event_date != now.date():
+                          raise RuntimeError('For a past Sunday, explicitly choose morning (11 AM) or evening (7:30 PM).')
+                      session = 'morning' if now.hour < 9 else 'evening'
+                  else:
+                      session = 'evening'
+              plan = schedule_for(event_date, session)
+              if now < datetime.fromisoformat(plan['start_exclusive']):
+                  raise RuntimeError('This webinar collection window has not started yet.')
+              # Do not wait for the end cutoff and do not choose an older finished event.
+              return event_date, session, plan
+
+
+          def schedule_for(event_date, slot):
+              if isinstance(event_date, str):
+                  event_date = date.fromisoformat(event_date)
+              if slot not in ('morning', 'evening'):
+                  raise RuntimeError('Choose morning or evening for the webinar session.')
+              weekday = event_date.weekday()
+              if weekday not in (1, 2, 6):
+                  raise RuntimeError('Webinar date must be Tuesday, Wednesday or Sunday; no other date substituted.')
+              if slot == 'morning' and weekday != 6:
+                  raise RuntimeError('The 11 AM session is available only on Sunday.')
+              tz = ZoneInfo(EVENT_TIMEZONE)
+              midnight = datetime.combine(event_date, datetime.min.time(), tzinfo=tz)
+              if weekday == 1:
+                  start, end = midnight - timedelta(days=2) + timedelta(hours=18), midnight + timedelta(hours=18)
+              elif weekday == 2:
+                  start, end = midnight - timedelta(days=1) + timedelta(hours=18), midnight + timedelta(hours=18)
+              elif slot == 'morning':
+                  start, end = midnight - timedelta(days=4) + timedelta(hours=18), midnight + timedelta(hours=9)
+              else:
+                  start, end = midnight + timedelta(hours=9), midnight + timedelta(hours=18)
+              event_time = '11:00' if slot == 'morning' else '19:30'
+              return {
+                  'event_date': event_date.isoformat(), 'event_time': event_time, 'slot': slot,
+                  'timezone': EVENT_TIMEZONE, 'start_date': start.date().isoformat(),
+                  'end_date': end.date().isoformat(), 'start_exclusive': start.isoformat(),
+                  'end_inclusive': end.isoformat(),
+              }
+
+
+          def selected_schedule(event_date=None):
+              event_date = event_date or os.environ.get('UTM_TAB_DATE', '')
+              plan = schedule_for(event_date, os.environ.get('WEBINAR_SLOT', 'evening'))
+              recorded = os.environ.get('EVENT_PLAN_JSON', '').strip()
+              if recorded and json.loads(recorded) != plan:
+                  raise RuntimeError('Selected webinar and collection window differ from the verified UTM event.')
+              return plan
+
+
+          def within_event_window(timestamp, plan):
+              tz = ZoneInfo(plan['timezone'])
+              if timestamp.tzinfo is None:
+                  timestamp = timestamp.replace(tzinfo=tz)
+              return datetime.fromisoformat(plan['start_exclusive']) < timestamp <= datetime.fromisoformat(plan['end_inclusive'])
+
+
+          def event_tab_prefix(event_date):
+              plan = selected_schedule(event_date)
+              # Preserve weekday tab names; Sunday has two independently rerunnable events.
+              suffix = (' 11AM' if plan['slot'] == 'morning' else ' 730PM') if date.fromisoformat(plan['event_date']).weekday() == 6 else ''
+              return plan['event_date'] + suffix + ' '
+
+
+          def event_report_window(plan):
+              return {'start_date': plan['start_date'], 'end_date': plan['end_date'],
+                      'timezone': plan['timezone'], 'event_plan': plan}
+
           """Reuse an explicitly saved Zoom session. Only encrypted state is cached in CI."""
           import base64
           import hashlib
@@ -3036,8 +3322,10 @@ jobs:
               if zoom_text(meta['Topic']) != zoom_text(ZOOM_TOPIC):
                   raise RuntimeError('Zoom CSV is for a different webinar topic.')
               scheduled = datetime.strptime(meta['Scheduled Time'], '%m/%d/%Y %I:%M:%S %p')
-              if scheduled.date() != event_date:
-                  raise RuntimeError('Zoom CSV webinar date does not match the selected UTM event date.')
+              plan = selected_schedule(event_date)
+              if (scheduled.date() != event_date
+                      or scheduled.strftime('%H:%M:%S') != plan['event_time'] + ':00'):
+                  raise RuntimeError('Zoom CSV webinar date/time does not match the selected event session.')
               webinar_id = re.sub(r'\s+', '', meta['ID'])
               if not webinar_id.isascii() or not webinar_id.isdigit():
                   raise RuntimeError('Zoom CSV webinar ID is invalid.')
@@ -3070,6 +3358,7 @@ jobs:
               contacts.sort(key=lambda row: (row['name'].casefold(), row['email'].casefold(), row['phone']))
               return contacts, {'topic': ZOOM_TOPIC, 'webinar_id': webinar_id,
                                 'scheduled_time': meta['Scheduled Time'], 'event_date': event_date.isoformat(),
+                                'event_plan': plan,
                                 'report_type': 'All registrants', 'downloaded_count': len(contacts),
                                 'last_name_phone_rows_repaired': repaired_names}
 
@@ -3084,22 +3373,31 @@ jobs:
                   writer = csv.DictWriter(output, fieldnames=['name', 'email', 'phone'])
                   writer.writeheader()
                   writer.writerows(contacts)
-              meta.update({'search_from': (event_date - timedelta(days=1)).isoformat(),
-                           'search_to': event_date.isoformat(), 'timezone': 'Asia/Kolkata',
+              plan = selected_schedule(event_date)
+              meta.update({'search_from': plan['start_date'],
+                           'search_to': plan['end_date'], 'timezone': 'Asia/Kolkata',
+                           'event_plan': plan,
                            'csv_sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
               (outdir / 'manifest.json').write_text(json.dumps(meta, indent=2))
               return meta
 
 
           def load_zoom_contacts(folder, event_date):
+              plan = selected_schedule(event_date)
               meta = json.loads((folder / 'manifest.json').read_text())
-              if (meta.get('event_date') != event_date.isoformat()
-                      or meta.get('search_from') != (event_date - timedelta(days=1)).isoformat()
-                      or meta.get('search_to') != event_date.isoformat()
+              try:
+                  scheduled = datetime.strptime(meta['scheduled_time'], '%m/%d/%Y %I:%M:%S %p')
+                  time_matches = (scheduled.date() == event_date
+                                  and scheduled.strftime('%H:%M:%S') == plan['event_time'] + ':00')
+              except (KeyError, TypeError, ValueError):
+                  time_matches = False
+              if (meta.get('event_date') != plan['event_date']
+                      or meta.get('search_from') != plan['start_date']
+                      or meta.get('search_to') != plan['end_date']
+                      or meta.get('event_plan') != plan
                       or meta.get('topic') != ZOOM_TOPIC or meta.get('report_type') != 'All registrants'
-                      or meta.get('timezone') != 'Asia/Kolkata'
-                      or datetime.strptime(meta['scheduled_time'], '%m/%d/%Y %I:%M:%S %p').date() != event_date):
-                  raise RuntimeError('Zoom report metadata does not match this UTM event.')
+                      or meta.get('timezone') != 'Asia/Kolkata' or not time_matches):
+                  raise RuntimeError('Zoom report metadata does not match this event date, session, and registration window.')
               path = folder / 'registrants.csv'
               if hashlib.sha256(path.read_bytes()).hexdigest() != meta.get('csv_sha256'):
                   raise RuntimeError('Zoom CSV differs from the verified download.')
@@ -3156,10 +3454,10 @@ jobs:
 
           def zoom_report_url(event_date):
               # Route and date/scope parameters observed in the supplied recording.
-              previous = event_date - timedelta(days=1)
+              plan = selected_schedule(event_date)
               return ('https://us06web.zoom.us/account/report?isPersonal=true'
-                      '#/usageReports/meetingRegistration?dateFrom=' + previous.isoformat()
-                      + '&dateTo=' + event_date.isoformat() + '&meetingScope=webinar&page=1')
+                      '#/usageReports/meetingRegistration?dateFrom=' + plan['start_date']
+                      + '&dateTo=' + plan['end_date'] + '&meetingScope=webinar&page=1')
 
 
           import re
@@ -3638,7 +3936,7 @@ jobs:
 
 
           def zoom_set_dates(page, start, end, event_date):
-              """From = previous day, To = event day; verified from the boxes on screen."""
+              """Set the selected schedule dates and verify the date boxes on screen."""
               for attempt in range(2):
                   ok_from = zoom_pick_date(page, 'From', start)
                   ok_to = zoom_pick_date(page, 'To', end)
@@ -3741,16 +4039,18 @@ jobs:
 
 
           def select_zoom_row(records, event_date):
+              plan = selected_schedule(event_date)
               candidates = []
               for record in records:
                   if record['topic_ok'] and record['type'] == 'Webinar' and record['scheduled']:
                       scheduled = datetime.strptime(record['scheduled'], '%m/%d/%Y %I:%M:%S %p')
-                      if scheduled.date() == event_date:
+                      if (scheduled.date() == event_date
+                              and scheduled.strftime('%H:%M:%S') == plan['event_time'] + ':00'):
                           candidates.append(record)
               if len(candidates) != 1:
-                  raise RuntimeError('Expected exactly one Zoom webinar matching the topic and event date '
-                                     + event_date.isoformat() + '; found ' + str(len(candidates))
-                                     + '. A different day\'s webinar will not be substituted.')
+                  raise RuntimeError('Expected exactly one Zoom webinar matching the topic and scheduled session '
+                                     + plan['event_date'] + ' ' + plan['event_time'] + ' IST; found '
+                                     + str(len(candidates)) + '. No other session was selected.')
               return candidates[0]
 
 
@@ -3811,9 +4111,10 @@ jobs:
 
 
           def export_zoom(page, event_date, outdir):
-              start, end = event_date - timedelta(days=1), event_date
+              plan = selected_schedule(event_date)
+              start, end = date.fromisoformat(plan['start_date']), date.fromisoformat(plan['end_date'])
               open_registration_report(page)
-              # Recorded order: From = previous day, To = event day, Meetings -> Webinars, Search.
+              # Search the schedule window, then select this exact webinar date and time.
               zoom_set_dates(page, start, end, event_date)
               zoom_select_webinars(page)
               total, records = zoom_search_results(page, event_date)
@@ -3850,7 +4151,10 @@ jobs:
 
           def run_zoom_export():
               event_date = date.fromisoformat(os.environ['UTM_TAB_DATE'])
-              print('Zoom: event date for this run:', event_date.isoformat())
+              plan = selected_schedule(event_date)
+              print('Zoom: event session for this run:', plan['event_date'], plan['event_time'], 'IST')
+              print('Zoom: registration window:', plan['start_exclusive'], 'exclusive through',
+                    plan['end_inclusive'], 'inclusive; keeping the exact webinar registrants.')
               stage = 'saved-session'
               seed = zoom_seed_value()
               cache_file = Path(os.environ['RUNNER_TEMP']) / 'zoom-session-cache' / 'state.enc'
@@ -3908,7 +4212,6 @@ jobs:
 
 
           run_zoom_export()
-
           PY
       - name: Save refreshed encrypted Zoom browser session
         if: always()
@@ -3972,8 +4275,100 @@ jobs:
           SELECTED_UTM_BUSINESS_TAB: ${{ needs.test-google-sheets.outputs.utm_landing_tab }}
           SELECTED_UTM_REG_TAB: ${{ needs.test-google-sheets.outputs.utm_reg_tab }}
           UTM_TAB_DATE: ${{ needs.test-google-sheets.outputs.utm_tab_date }}
+          WEBINAR_SLOT: ${{ needs.test-google-sheets.outputs.webinar_slot }}
+          EVENT_PLAN_JSON: ${{ needs.test-google-sheets.outputs.event_plan }}
         run: |
           python -u - <<'PY'
+          """Single event plan shared by discovery, both exports and final publication."""
+          import json
+          import os
+          from datetime import date, datetime, timedelta
+          from zoneinfo import ZoneInfo
+
+          EVENT_TIMEZONE = 'Asia/Kolkata'
+
+
+          def resolve_manual_event(date_text='', session='auto', now=None):
+              """A manual run selects today's event, including an unfinished window."""
+              tz = ZoneInfo(EVENT_TIMEZONE)
+              now = now or datetime.now(tz)
+              if now.tzinfo is None:
+                  raise RuntimeError('Manual event selection requires a timezone-aware clock.')
+              now = now.astimezone(tz)
+              event_date = date.fromisoformat(date_text.strip()) if date_text.strip() else now.date()
+              if event_date > now.date():
+                  raise RuntimeError('The requested webinar date is in the future.')
+              session = session.strip() or 'auto'
+              if session in ('auto', 'choose'):
+                  if event_date.weekday() == 6:
+                      if event_date != now.date():
+                          raise RuntimeError('For a past Sunday, explicitly choose morning (11 AM) or evening (7:30 PM).')
+                      session = 'morning' if now.hour < 9 else 'evening'
+                  else:
+                      session = 'evening'
+              plan = schedule_for(event_date, session)
+              if now < datetime.fromisoformat(plan['start_exclusive']):
+                  raise RuntimeError('This webinar collection window has not started yet.')
+              # Do not wait for the end cutoff and do not choose an older finished event.
+              return event_date, session, plan
+
+
+          def schedule_for(event_date, slot):
+              if isinstance(event_date, str):
+                  event_date = date.fromisoformat(event_date)
+              if slot not in ('morning', 'evening'):
+                  raise RuntimeError('Choose morning or evening for the webinar session.')
+              weekday = event_date.weekday()
+              if weekday not in (1, 2, 6):
+                  raise RuntimeError('Webinar date must be Tuesday, Wednesday or Sunday; no other date substituted.')
+              if slot == 'morning' and weekday != 6:
+                  raise RuntimeError('The 11 AM session is available only on Sunday.')
+              tz = ZoneInfo(EVENT_TIMEZONE)
+              midnight = datetime.combine(event_date, datetime.min.time(), tzinfo=tz)
+              if weekday == 1:
+                  start, end = midnight - timedelta(days=2) + timedelta(hours=18), midnight + timedelta(hours=18)
+              elif weekday == 2:
+                  start, end = midnight - timedelta(days=1) + timedelta(hours=18), midnight + timedelta(hours=18)
+              elif slot == 'morning':
+                  start, end = midnight - timedelta(days=4) + timedelta(hours=18), midnight + timedelta(hours=9)
+              else:
+                  start, end = midnight + timedelta(hours=9), midnight + timedelta(hours=18)
+              event_time = '11:00' if slot == 'morning' else '19:30'
+              return {
+                  'event_date': event_date.isoformat(), 'event_time': event_time, 'slot': slot,
+                  'timezone': EVENT_TIMEZONE, 'start_date': start.date().isoformat(),
+                  'end_date': end.date().isoformat(), 'start_exclusive': start.isoformat(),
+                  'end_inclusive': end.isoformat(),
+              }
+
+
+          def selected_schedule(event_date=None):
+              event_date = event_date or os.environ.get('UTM_TAB_DATE', '')
+              plan = schedule_for(event_date, os.environ.get('WEBINAR_SLOT', 'evening'))
+              recorded = os.environ.get('EVENT_PLAN_JSON', '').strip()
+              if recorded and json.loads(recorded) != plan:
+                  raise RuntimeError('Selected webinar and collection window differ from the verified UTM event.')
+              return plan
+
+
+          def within_event_window(timestamp, plan):
+              tz = ZoneInfo(plan['timezone'])
+              if timestamp.tzinfo is None:
+                  timestamp = timestamp.replace(tzinfo=tz)
+              return datetime.fromisoformat(plan['start_exclusive']) < timestamp <= datetime.fromisoformat(plan['end_inclusive'])
+
+
+          def event_tab_prefix(event_date):
+              plan = selected_schedule(event_date)
+              # Preserve weekday tab names; Sunday has two independently rerunnable events.
+              suffix = (' 11AM' if plan['slot'] == 'morning' else ' 730PM') if date.fromisoformat(plan['event_date']).weekday() == 6 else ''
+              return plan['event_date'] + suffix + ' '
+
+
+          def event_report_window(plan):
+              return {'start_date': plan['start_date'], 'end_date': plan['end_date'],
+                      'timezone': plan['timezone'], 'event_plan': plan}
+
           import csv
           import json
           import os
@@ -4199,15 +4594,80 @@ jobs:
                   raise RuntimeError('ActiveCampaign group is too large for one workflow run.')
 
               def event_contacts(self, event_date):
+                  from datetime import datetime
+
+                  schedule = selected_schedule(event_date)
+                  event_time = schedule['event_time']
                   month = 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split()[event_date.month - 1]
                   search = str(event_date.day) + ' ' + month
+                  override = os.environ.get('ACTIVECAMPAIGN_LIST_ID', '').strip()
+                  if override and not re.fullmatch(r'[1-9][0-9]*', override):
+                      raise RuntimeError('ActiveCampaign list ID must be a positive numeric ID.')
                   lists = self.pages('lists', 'lists', {'filters[name][contains]': search, 'orders[name]': 'ASC'})
-                  pattern = re.compile(r'^0?' + str(event_date.day) + r'\s+' + month
-                                       + r'\s+' + str(event_date.year)
-                                       + r'\s+Flexi\s+Genie\s+10\s+Mins?\s+Business\s+Workshop$', re.I)
-                  candidates = [item for item in lists if pattern.fullmatch(str(item.get('name', '')).strip())]
-                  if not candidates:
-                      raise RuntimeError('No Flexi Genie 10 Mins Business Workshop list found for ' + event_date.isoformat())
+
+                  # The known family stays exact. Optional clock times distinguish Sunday's
+                  # two events; an unrelated title containing the same date never qualifies.
+                  clock = r'(?:0?[1-9]|1[0-2])(?::[0-5][0-9])?\s*[AP]M|(?:[01]?[0-9]|2[0-3]):[0-5][0-9]'
+                  divider = r'\s*[-|\u2013\u2014]?\s*'
+                  pattern = re.compile(
+                      r'^0?' + str(event_date.day) + r'\s+' + month + r'\s+' + str(event_date.year)
+                      + divider + r'(?:(?P<before>' + clock + r')' + divider + r')?'
+                      + r'Flexi\s+Genie\s+10\s+Mins?\s+Business\s+Workshop'
+                      + r'(?:' + divider + r'(?P<after>' + clock + r'))?\s*$', re.I)
+
+                  def declared_time(item):
+                      title = str(item.get('name', '')).strip()
+                      if '\n' in title or '\r' in title:
+                          return False, None
+                      match = pattern.fullmatch(title)
+                      if not match or (match.group('before') and match.group('after')):
+                          return False, None
+                      token = match.group('before') or match.group('after')
+                      if token is None:
+                          return True, None
+                      token = re.sub(r'\s+', '', token).upper()
+                      for fmt in ('%I:%M%p', '%I%p', '%H:%M'):
+                          try:
+                              return True, datetime.strptime(token, fmt).strftime('%H:%M')
+                          except ValueError:
+                              pass
+                      return False, None
+
+                  if override:
+                      candidates = [item for item in lists if str(item.get('id')) == override]
+                      if len(candidates) != 1:
+                          raise RuntimeError('The requested ActiveCampaign list ID was not found uniquely among lists for '
+                                             + event_date.isoformat() + '.')
+                      valid, clock_time = declared_time(candidates[0])
+                      if not valid or (clock_time is not None and clock_time != event_time):
+                          raise RuntimeError('The requested ActiveCampaign list does not match the selected webinar date, '
+                                             '10-minute Business Workshop family and time.')
+                      selection_mode = 'explicit_list_id'
+                      scope = 'shared_sunday_list' if event_date.weekday() == 6 and clock_time is None else 'event_list'
+                  else:
+                      qualified, untimed = [], []
+                      for item in lists:
+                          valid, clock_time = declared_time(item)
+                          if valid and clock_time == event_time:
+                              qualified.append(item)
+                          elif valid and clock_time is None:
+                              untimed.append(item)
+                      if event_date.weekday() == 6:
+                          # The user confirmed the dated Sunday list holds both sessions.
+                          # Prefer a separately named exact-time list if one exists; otherwise
+                          # use that shared list and identify its combined count explicitly.
+                          candidates = qualified or untimed
+                          scope = 'event_list' if qualified else 'shared_sunday_list'
+                      else:
+                          candidates = [item for item in lists if item in qualified or item in untimed]
+                          scope = 'event_list'
+                      if not candidates:
+                          raise RuntimeError('No Flexi Genie 10 Mins Business Workshop list found for '
+                                             + event_date.isoformat() + ' at ' + event_time + '.')
+                      selection_mode = ('shared_sunday_business_most_active' if scope == 'shared_sunday_list'
+                                        else 'dated_time_qualified_most_active' if event_date.weekday() == 6
+                                        else 'dated_business_most_active')
+
                   ranked = []
                   for item in candidates:
                       data = self.get('contacts', {'listid': item['id'], 'status': 1, 'meta': 'only'})
@@ -4218,15 +4678,20 @@ jobs:
                       except (KeyError, TypeError, ValueError):
                           raise RuntimeError('Cannot verify the active contact count for a matching list.') from None
                       ranked.append((count, item))
-                  # max preserves the first result when active counts are equal.
+                  # Preserve the existing first-result tie rule inside the correctly scoped event.
                   _, selected = max(ranked, key=lambda entry: entry[0])
                   records = self.pages('contacts', 'contacts', {'listid': selected['id'], 'status': 1, 'orders[id]': 'ASC'})
                   rows = [{'name': ' '.join(str(c.get(k) or '').strip() for k in ('firstName', 'lastName')).strip(),
                            'email': str(c.get('email') or '').strip(), 'phone': str(c.get('phone') or '').strip()}
                           for c in records]
                   print('ActiveCampaign list selected:', selected['name'])
+                  print('ActiveCampaign webinar:', event_date.isoformat(), event_time)
                   print('Active contacts fetched:', len(rows))
-                  return rows, {'id': str(selected['id']), 'name': selected['name'], 'active_count': len(rows)}
+                  if scope == 'shared_sunday_list':
+                      print('ActiveCampaign: shared Sunday list; this count combines both Sunday sessions:', len(rows))
+                  return rows, {'id': str(selected['id']), 'name': selected['name'], 'active_count': len(rows),
+                                'event_date': event_date.isoformat(), 'event_time': event_time,
+                                'slot': schedule['slot'], 'selection_mode': selection_mode, 'scope': scope}
 
               def contacts(self, selector):
                   kind, value = selector['type'], selector['value']
@@ -4482,7 +4947,7 @@ jobs:
               return rows
 
 
-          def append_summary_with_metadata(book, sheet, expected_headers, row, run_key, prefix_headers=False):
+          def append_summary_with_metadata(book, sheet, expected_headers, row, run_key, prefix_headers=False, cell_notes=None):
               """Append stats while retaining its existing visible columns.
 
               The known headers must be present already. One atomic spreadsheet batch adds
@@ -4524,7 +4989,7 @@ jobs:
               if grid.get("columnCount", 0) < len(expected_headers):
                   raise RuntimeError("Stats worksheet has fewer columns than the configured layout.")
 
-              digest = hashlib.sha256(json.dumps(row, ensure_ascii=False, separators=(",", ":"),
+              digest = hashlib.sha256(json.dumps({"row": row, "notes": cell_notes or {}}, ensure_ascii=False, separators=(",", ":"),
                                                 allow_nan=False).encode("utf-8")).hexdigest()
               marker_value = f"{run_key}|{digest}"
               candidates = list(metadata.get("developerMetadata", []))
@@ -4557,9 +5022,11 @@ jobs:
                                                        "length": start + 1 - capacity}})
               cells = [{"userEnteredValue": {"stringValue" if isinstance(value, str) else "numberValue": value}}
                        for value in row]
+              for index, note in (cell_notes or {}).items():
+                  cells[index]["note"] = note
               requests.extend([
                   {"updateCells": {"start": {"sheetId": sheet_id, "rowIndex": start, "columnIndex": 0},
-                                   "rows": [{"values": cells}], "fields": "userEnteredValue"}},
+                                   "rows": [{"values": cells}], "fields": "userEnteredValue,note"}},
                   {"createDeveloperMetadata": {"developerMetadata": {
                       "metadataKey": "ff_discrepancy_run", "metadataValue": marker_value,
                       "visibility": "DOCUMENT", "location": {"dimensionRange": {
@@ -4574,7 +5041,7 @@ jobs:
           def publish_daily_tabs(book, datasets, event_date, finalize=False):
               """Upsert only the six named daily tabs; reruns reuse them, newest at front."""
               labels = ['UTM', 'LANDING PAGE', 'LANDING PAGE REG', 'ACTIVE CAMPAIGN', 'ZOOM', 'DESCREPANCY']
-              prefix = event_date.isoformat() + ' '
+              prefix = event_tab_prefix(event_date)
               allowed = [prefix + label for label in labels]
               if not datasets or any(title not in allowed for title in datasets):
                   raise ValueError('Only the six daily result tabs may be published.')
@@ -4721,8 +5188,10 @@ jobs:
               if zoom_text(meta['Topic']) != zoom_text(ZOOM_TOPIC):
                   raise RuntimeError('Zoom CSV is for a different webinar topic.')
               scheduled = datetime.strptime(meta['Scheduled Time'], '%m/%d/%Y %I:%M:%S %p')
-              if scheduled.date() != event_date:
-                  raise RuntimeError('Zoom CSV webinar date does not match the selected UTM event date.')
+              plan = selected_schedule(event_date)
+              if (scheduled.date() != event_date
+                      or scheduled.strftime('%H:%M:%S') != plan['event_time'] + ':00'):
+                  raise RuntimeError('Zoom CSV webinar date/time does not match the selected event session.')
               webinar_id = re.sub(r'\s+', '', meta['ID'])
               if not webinar_id.isascii() or not webinar_id.isdigit():
                   raise RuntimeError('Zoom CSV webinar ID is invalid.')
@@ -4755,6 +5224,7 @@ jobs:
               contacts.sort(key=lambda row: (row['name'].casefold(), row['email'].casefold(), row['phone']))
               return contacts, {'topic': ZOOM_TOPIC, 'webinar_id': webinar_id,
                                 'scheduled_time': meta['Scheduled Time'], 'event_date': event_date.isoformat(),
+                                'event_plan': plan,
                                 'report_type': 'All registrants', 'downloaded_count': len(contacts),
                                 'last_name_phone_rows_repaired': repaired_names}
 
@@ -4769,22 +5239,31 @@ jobs:
                   writer = csv.DictWriter(output, fieldnames=['name', 'email', 'phone'])
                   writer.writeheader()
                   writer.writerows(contacts)
-              meta.update({'search_from': (event_date - timedelta(days=1)).isoformat(),
-                           'search_to': event_date.isoformat(), 'timezone': 'Asia/Kolkata',
+              plan = selected_schedule(event_date)
+              meta.update({'search_from': plan['start_date'],
+                           'search_to': plan['end_date'], 'timezone': 'Asia/Kolkata',
+                           'event_plan': plan,
                            'csv_sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
               (outdir / 'manifest.json').write_text(json.dumps(meta, indent=2))
               return meta
 
 
           def load_zoom_contacts(folder, event_date):
+              plan = selected_schedule(event_date)
               meta = json.loads((folder / 'manifest.json').read_text())
-              if (meta.get('event_date') != event_date.isoformat()
-                      or meta.get('search_from') != (event_date - timedelta(days=1)).isoformat()
-                      or meta.get('search_to') != event_date.isoformat()
+              try:
+                  scheduled = datetime.strptime(meta['scheduled_time'], '%m/%d/%Y %I:%M:%S %p')
+                  time_matches = (scheduled.date() == event_date
+                                  and scheduled.strftime('%H:%M:%S') == plan['event_time'] + ':00')
+              except (KeyError, TypeError, ValueError):
+                  time_matches = False
+              if (meta.get('event_date') != plan['event_date']
+                      or meta.get('search_from') != plan['start_date']
+                      or meta.get('search_to') != plan['end_date']
+                      or meta.get('event_plan') != plan
                       or meta.get('topic') != ZOOM_TOPIC or meta.get('report_type') != 'All registrants'
-                      or meta.get('timezone') != 'Asia/Kolkata'
-                      or datetime.strptime(meta['scheduled_time'], '%m/%d/%Y %I:%M:%S %p').date() != event_date):
-                  raise RuntimeError('Zoom report metadata does not match this UTM event.')
+                      or meta.get('timezone') != 'Asia/Kolkata' or not time_matches):
+                  raise RuntimeError('Zoom report metadata does not match this event date, session, and registration window.')
               path = folder / 'registrants.csv'
               if hashlib.sha256(path.read_bytes()).hexdigest() != meta.get('csv_sha256'):
                   raise RuntimeError('Zoom CSV differs from the verified download.')
@@ -4844,7 +5323,7 @@ jobs:
 
 
           def sheet_matrices(event_date, datasets):
-              return {event_date.isoformat() + ' ' + label:
+              return {event_tab_prefix(event_date) + label:
                       [[row['name'], row['email'], row['phone']] for row in rows]
                       for label, rows in datasets.items()}
 
@@ -4874,14 +5353,10 @@ jobs:
               snapshot = json.loads(Path('utm/snapshot.json').read_text())
               window = json.loads(Path('reports/report-window.json').read_text())
               event_date = date.fromisoformat(snapshot['event_date'])
-              window_start = datetime.fromisoformat(snapshot['window_start'])
-              window_end = datetime.fromisoformat(snapshot['window_end'])
-              expected_start = window_start.date()
-              if window != {'start_date': expected_start.isoformat(), 'end_date': window_end.date().isoformat(),
-                            'timezone': snapshot['timezone'], 'window_start': snapshot['window_start'],
-                            'window_end': snapshot['window_end']} or window_end.date() != event_date:
-                  raise RuntimeError('UTM snapshot and FlexiFunnels report windows do not agree.')
-              print('Data window (IST): after', snapshot['window_start'], 'up to', snapshot['window_end'])
+              plan = selected_schedule(event_date)
+              expected_start = date.fromisoformat(plan['start_date'])
+              if snapshot.get('event_plan') != plan or window != event_report_window(plan):
+                  raise RuntimeError('UTM snapshot and FlexiFunnels export must use the same webinar session and collection window.')
               selectors, layout = required_configuration(event_date)
               if snapshot['activecampaign_selectors'] != selectors or snapshot['stats_layout'] != layout:
                   raise RuntimeError('Configuration changed after discovery; rerun the whole workflow.')
@@ -4943,7 +5418,7 @@ jobs:
               (outdir / 'publication.json').write_text(json.dumps(publication, indent=2))
               print('Daily data tabs:', imported['titles'])
               stored = read_verified_snapshot(raw_book, imported['titles'], imported_matrices)
-              key = lambda label: event_date.isoformat() + ' ' + label
+              key = lambda label: event_tab_prefix(event_date) + label
               ff_business, ff_reg = stored[key('LANDING PAGE')], stored[key('LANDING PAGE REG')]
               merged_utm, ac_rows = stored[key('UTM')], stored[key('ACTIVE CAMPAIGN')]
               zoom_rows = stored[key('ZOOM')]
@@ -4984,8 +5459,8 @@ jobs:
               print('STAGE 4: Append totals from verified result tabs to Discrepancy Stats.')
               merged_reports = prepare_contact_rows(ff_business + ff_reg)
               run_key = os.environ['GITHUB_RUN_ID'] + '.' + os.environ['GITHUB_RUN_ATTEMPT']
-              counts = {'event_date': event_date.isoformat(), 'range_start': snapshot['window_start'],
-                        'range_end': snapshot['window_end'], 'run_time': snapshot['captured_at'], 'run_key': run_key,
+              counts = {'event_date': event_date.isoformat(), 'event_time': plan['event_time'], 'event_plan': plan, 'range_start': expected_start.isoformat(),
+                        'range_end': event_date.isoformat(), 'run_time': snapshot['captured_at'], 'run_key': run_key,
                         'landing': len(ff_business), 'landing_reg': len(ff_reg), 'reports': len(merged_reports),
                         'utm': len(merged_utm), 'activecampaign': len(ac_rows), 'zoom': len(zoom_rows), 'discrepancy': len(discrepancy)}
               checked_at = datetime.fromisoformat(snapshot['captured_at']).astimezone(ZoneInfo(snapshot['timezone']))
@@ -4994,13 +5469,16 @@ jobs:
                              'webinar_date': event_date.strftime('%d/%m/%Y'),
                              'webinar_type': '10 minute business'})
               stats_row = [counts[column['key']] for column in layout]
-              stats_status = append_summary_with_metadata(stats_book, stats_sheet, headers, stats_row, run_key, prefix_headers=True)
+              stats_status = append_summary_with_metadata(stats_book, stats_sheet, headers, stats_row, run_key, prefix_headers=True, cell_notes={
+                  2: 'Webinar: ' + plan['event_date'] + ' at ' + plan['event_time'] + ' IST. Collection: after ' + plan['start_exclusive'] + ' through ' + plan['end_inclusive'],
+                  6: ('Shared Sunday list: includes contacts from both Sunday sessions.' if selected_list.get('scope') == 'shared_sunday_list' else 'Selected webinar ActiveCampaign list.')})
               publication.update({'stage': 'complete', 'stats_status': stats_status})
               (outdir / 'publication.json').write_text(json.dumps(publication, indent=2))
               (outdir / 'summary.json').write_text(json.dumps({
                   'start_date': expected_start.isoformat(), 'end_date': event_date.isoformat(),
                   'utm_event_date': event_date.isoformat(), 'timezone': snapshot['timezone'],
                   'matching_rule': 'deduplicated on email+phone; UTM-vs-Zoom presence by email OR phone (Indian numbers to 10 digits)',
+                  'event_plan': plan,
                   'raw_source_counts': raw_counts,
                   'source_tabs': imported['titles'],
                   'reports': summary, 'totals': counts, 'published_tabs': published['titles'], 'stats_status': stats_status,
@@ -5012,7 +5490,6 @@ jobs:
               print('Counts:', counts)
 
           run_complete_workflow()
-
           PY
       - name: Upload calculated and published results
         if: always()
