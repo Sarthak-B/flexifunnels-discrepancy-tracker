@@ -3,12 +3,16 @@ name: FlexiFunnels Discrepancy Tracker
 on:
   workflow_dispatch:
     inputs:
-      event_date:
-        description: "Webinar date YYYY-MM-DD; leave blank for today in India (Tue/Wed/Sun only)."
-        required: false
-        default: ""
+      utm_business_tab:
+        description: "Paste the full 10-minute Business UTM tab name"
+        type: string
+        required: true
+      utm_reg_tab:
+        description: "Paste the full 10-minute Reg team UTM tab name"
+        type: string
+        required: true
       webinar_session:
-        description: "Auto: Sunday before 9 AM = morning, from 9 AM = evening (India time). Override for a rerun."
+        description: "Zoom webinar time on the run date (auto: Sunday before 9 AM selects 11 AM)"
         type: choice
         required: true
         default: auto
@@ -27,7 +31,7 @@ permissions:
 jobs:
 
   test-google-sheets:
-    name: Verify selected webinar and its UTM collection window
+    name: Use run date and manually selected UTM tabs
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -49,7 +53,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install gspread google-auth
 
-      - name: Verify Sheets and the selected webinar UTM tabs
+      - name: Read the two supplied UTM tabs
         id: verify-sheets
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -61,7 +65,8 @@ jobs:
           ACTIVECAMPAIGN_API_URL: ${{ secrets.ACTIVECAMPAIGN_API_URL }}
           ACTIVECAMPAIGN_API_KEY: ${{ secrets.ACTIVECAMPAIGN_API_KEY }}
           ZOOM_STORAGE_STATE_B64: ${{ secrets.ZOOM_STORAGE_STATE_B64 }}
-          TARGET_EVENT_DATE: ${{ inputs.event_date }}
+          UTM_BUSINESS_TAB_NAME: ${{ inputs.utm_business_tab }}
+          UTM_REG_TAB_NAME: ${{ inputs.utm_reg_tab }}
           WEBINAR_SLOT: ${{ inputs.webinar_session }}
 
         run: |
@@ -76,65 +81,39 @@ jobs:
 
 
           def resolve_manual_event(date_text='', session='auto', now=None):
-              """A manual run selects today's event, including an unfinished window."""
               tz = ZoneInfo(EVENT_TIMEZONE)
               now = now or datetime.now(tz)
               if now.tzinfo is None:
-                  raise RuntimeError('Manual event selection requires a timezone-aware clock.')
+                  raise RuntimeError('Run time must include a timezone.')
               now = now.astimezone(tz)
-              event_date = date.fromisoformat(date_text.strip()) if date_text.strip() else now.date()
-              if event_date > now.date():
-                  raise RuntimeError('The requested webinar date is in the future.')
-              session = session.strip() or 'auto'
-              if session in ('auto', 'choose'):
-                  if event_date.weekday() == 6:
-                      if event_date != now.date():
-                          raise RuntimeError('For a past Sunday, explicitly choose morning (11 AM) or evening (7:30 PM).')
-                      session = 'morning' if now.hour < 9 else 'evening'
-                  else:
-                      session = 'evening'
-              plan = schedule_for(event_date, session)
-              if now < datetime.fromisoformat(plan['start_exclusive']):
-                  raise RuntimeError('This webinar collection window has not started yet.')
-              # Do not wait for the end cutoff and do not choose an older finished event.
-              return event_date, session, plan
-
-
-          def schedule_for(event_date, slot):
-              if isinstance(event_date, str):
-                  event_date = date.fromisoformat(event_date)
-              if slot not in ('morning', 'evening'):
-                  raise RuntimeError('Choose morning or evening for the webinar session.')
-              weekday = event_date.weekday()
-              if weekday not in (1, 2, 6):
-                  raise RuntimeError('Webinar date must be Tuesday, Wednesday or Sunday; no other date substituted.')
-              if slot == 'morning' and weekday != 6:
-                  raise RuntimeError('The 11 AM session is available only on Sunday.')
-              tz = ZoneInfo(EVENT_TIMEZONE)
-              midnight = datetime.combine(event_date, datetime.min.time(), tzinfo=tz)
-              if weekday == 1:
-                  start, end = midnight - timedelta(days=2) + timedelta(hours=18), midnight + timedelta(hours=18)
-              elif weekday == 2:
-                  start, end = midnight - timedelta(days=1) + timedelta(hours=18), midnight + timedelta(hours=18)
-              elif slot == 'morning':
-                  start, end = midnight - timedelta(days=4) + timedelta(hours=18), midnight + timedelta(hours=9)
-              else:
-                  start, end = midnight + timedelta(hours=9), midnight + timedelta(hours=18)
-              event_time = '11:00' if slot == 'morning' else '19:30'
-              return {
-                  'event_date': event_date.isoformat(), 'event_time': event_time, 'slot': slot,
-                  'timezone': EVENT_TIMEZONE, 'start_date': start.date().isoformat(),
-                  'end_date': end.date().isoformat(), 'start_exclusive': start.isoformat(),
-                  'end_inclusive': end.isoformat(),
-              }
+              if session == 'auto':
+                  session = 'morning' if now.weekday() == 6 and now.hour < 9 else 'evening'
+              if session not in ('morning', 'evening'):
+                  raise RuntimeError('Select morning or evening.')
+              start = (now - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
+              plan = {'event_date': now.date().isoformat(),
+                      'event_time': '11:00' if session == 'morning' else '19:30',
+                      'slot': session, 'timezone': EVENT_TIMEZONE,
+                      'start_date': start.date().isoformat(), 'end_date': now.date().isoformat(),
+                      'start_exclusive': start.isoformat(), 'end_inclusive': now.isoformat()}
+              os.environ['EVENT_PLAN_JSON'] = json.dumps(plan)
+              return now.date(), session, plan
 
 
           def selected_schedule(event_date=None):
-              event_date = event_date or os.environ.get('UTM_TAB_DATE', '')
-              plan = schedule_for(event_date, os.environ.get('WEBINAR_SLOT', 'evening'))
               recorded = os.environ.get('EVENT_PLAN_JSON', '').strip()
-              if recorded and json.loads(recorded) != plan:
-                  raise RuntimeError('Selected webinar and collection window differ from the verified UTM event.')
+              if not recorded:
+                  raise RuntimeError('The initial run window is missing; do not recalculate dates in later jobs.')
+              plan = json.loads(recorded)
+              expected = str(event_date or os.environ.get('UTM_TAB_DATE', ''))
+              if expected != plan['event_date']:
+                  raise RuntimeError('Job date differs from the pinned run date.')
+              end = datetime.fromisoformat(plan['end_inclusive'])
+              start = datetime.fromisoformat(plan['start_exclusive'])
+              if (end.tzinfo is None or start.tzinfo is None or plan['timezone'] != EVENT_TIMEZONE
+                      or end.date().isoformat() != expected
+                      or start != (end - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)):
+                  raise RuntimeError('Invalid pinned reporting window.')
               return plan
 
 
@@ -166,7 +145,7 @@ jobs:
           from google.oauth2.service_account import Credentials
 
           print("=" * 60)
-          print("GOOGLE SHEETS TEST - VERSION 19-R4")
+          print("GOOGLE SHEETS TEST - VERSION 20-R1")
           print("=" * 60)
 
           required = [
@@ -1490,37 +1469,19 @@ jobs:
 
 
           def discover_webinar_utm_tabs(worksheets, event_date, slot):
-              """Compare full displayed tab names; the fixed 7:30 PM text is not event time."""
-              import json
-              plan = schedule_for(event_date, slot)
-              month = 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split()[event_date.month - 1]
-              prefix = f'{event_date.day} {month} {event_date.year} 7:30 PM Flexi Genie 10 '
-              expected = {'business': prefix + 'Mins Busines', 'registration': prefix + 'Min Reg team'}
-              # Preserve the previously supported spelling/plural variants, but compare
-              # complete names so unrelated dates, times and backup tabs cannot match.
-              accepted = {kind: set() for kind in expected}
-              for day in {str(event_date.day), f'{event_date.day:02d}'}:
-                  stem = f'{day} {month} {event_date.year} 7:30 PM Flexi Genie 10 '
-                  for minute in ('Min', 'Mins'):
-                      for business in ('Busines', 'Business'):
-                          accepted['business'].add(normalize_utm_title(stem + minute + ' ' + business))
-                      accepted['registration'].add(normalize_utm_title(stem + minute + ' Reg team'))
+              names = [os.environ.get('UTM_BUSINESS_TAB_NAME', '').strip(),
+                       os.environ.get('UTM_REG_TAB_NAME', '').strip()]
+              if not all(names) or names[0] == names[1]:
+                  raise RuntimeError('Provide two different full UTM tab names in Run workflow.')
               sheets = list(worksheets)
-              matches = {kind: [ws for ws in sheets if normalize_utm_title(ws.title) in titles]
-                         for kind, titles in accepted.items()}
-              for kind, title in expected.items():
-                  print('UTM full tab name required (' + kind + '):', title)
-              if any(len(items) != 1 for items in matches.values()):
-                  print('UTM title diagnostics: actual titles returned by the configured UTM spreadsheet:')
-                  candidates = [ws for ws in sheets if any(term in normalize_utm_title(ws.title)
-                                for term in ('flexi', 'genie', '10 min'))]
-                  for ws in (candidates or sheets):
-                      print('UTM available title:', json.dumps(ws.title, ensure_ascii=True))
-                  failed = ', '.join(kind + '=' + str(len(items)) for kind, items in matches.items() if len(items) != 1)
-                  raise RuntimeError('Expected exactly one of each full UTM tab name shown above; found ' + failed
-                                     + '. Check the available titles and that UTM_SHEET_ID points to the spreadsheet in your screenshot.')
-              print('UTM fixed tab names matched for', plan['event_date'], '; actual webinar time:', plan['event_time'])
-              return matches['business'][0], matches['registration'][0]
+              result = []
+              for name in names:
+                  matches = [ws for ws in sheets if ws.title == name]
+                  if len(matches) != 1:
+                      raise RuntimeError('Provided UTM tab name not found exactly: ' + name)
+                  result.append(matches[0])
+              print('Using the two manually supplied UTM tabs. Their titles do not choose the run date.')
+              return tuple(result)
 
 
           def read_window_utm_contacts(worksheet, plan):
@@ -1548,11 +1509,11 @@ jobs:
               return contacts
 
 
-          # Manual date defaults to today in India; retries may explicitly select an older event.
+          # Pin the run date and cutoff once; all later jobs reuse this exact plan.
           timezone_name = EVENT_TIMEZONE
           selection_time = datetime.now(ZoneInfo(timezone_name))
           target_tab_date, slot, plan = resolve_manual_event(
-              os.environ.get('TARGET_EVENT_DATE', ''), os.environ.get('WEBINAR_SLOT', 'auto'), selection_time)
+              '', os.environ.get('WEBINAR_SLOT', 'auto'), selection_time)
           os.environ['WEBINAR_SLOT'] = slot
           landing_tab, reg_tab = discover_webinar_utm_tabs(opened['UTM'].worksheets(), target_tab_date, slot)
           print('Selected webinar:', plan['event_date'], plan['event_time'], 'IST')
@@ -1651,65 +1612,39 @@ jobs:
 
 
           def resolve_manual_event(date_text='', session='auto', now=None):
-              """A manual run selects today's event, including an unfinished window."""
               tz = ZoneInfo(EVENT_TIMEZONE)
               now = now or datetime.now(tz)
               if now.tzinfo is None:
-                  raise RuntimeError('Manual event selection requires a timezone-aware clock.')
+                  raise RuntimeError('Run time must include a timezone.')
               now = now.astimezone(tz)
-              event_date = date.fromisoformat(date_text.strip()) if date_text.strip() else now.date()
-              if event_date > now.date():
-                  raise RuntimeError('The requested webinar date is in the future.')
-              session = session.strip() or 'auto'
-              if session in ('auto', 'choose'):
-                  if event_date.weekday() == 6:
-                      if event_date != now.date():
-                          raise RuntimeError('For a past Sunday, explicitly choose morning (11 AM) or evening (7:30 PM).')
-                      session = 'morning' if now.hour < 9 else 'evening'
-                  else:
-                      session = 'evening'
-              plan = schedule_for(event_date, session)
-              if now < datetime.fromisoformat(plan['start_exclusive']):
-                  raise RuntimeError('This webinar collection window has not started yet.')
-              # Do not wait for the end cutoff and do not choose an older finished event.
-              return event_date, session, plan
-
-
-          def schedule_for(event_date, slot):
-              if isinstance(event_date, str):
-                  event_date = date.fromisoformat(event_date)
-              if slot not in ('morning', 'evening'):
-                  raise RuntimeError('Choose morning or evening for the webinar session.')
-              weekday = event_date.weekday()
-              if weekday not in (1, 2, 6):
-                  raise RuntimeError('Webinar date must be Tuesday, Wednesday or Sunday; no other date substituted.')
-              if slot == 'morning' and weekday != 6:
-                  raise RuntimeError('The 11 AM session is available only on Sunday.')
-              tz = ZoneInfo(EVENT_TIMEZONE)
-              midnight = datetime.combine(event_date, datetime.min.time(), tzinfo=tz)
-              if weekday == 1:
-                  start, end = midnight - timedelta(days=2) + timedelta(hours=18), midnight + timedelta(hours=18)
-              elif weekday == 2:
-                  start, end = midnight - timedelta(days=1) + timedelta(hours=18), midnight + timedelta(hours=18)
-              elif slot == 'morning':
-                  start, end = midnight - timedelta(days=4) + timedelta(hours=18), midnight + timedelta(hours=9)
-              else:
-                  start, end = midnight + timedelta(hours=9), midnight + timedelta(hours=18)
-              event_time = '11:00' if slot == 'morning' else '19:30'
-              return {
-                  'event_date': event_date.isoformat(), 'event_time': event_time, 'slot': slot,
-                  'timezone': EVENT_TIMEZONE, 'start_date': start.date().isoformat(),
-                  'end_date': end.date().isoformat(), 'start_exclusive': start.isoformat(),
-                  'end_inclusive': end.isoformat(),
-              }
+              if session == 'auto':
+                  session = 'morning' if now.weekday() == 6 and now.hour < 9 else 'evening'
+              if session not in ('morning', 'evening'):
+                  raise RuntimeError('Select morning or evening.')
+              start = (now - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
+              plan = {'event_date': now.date().isoformat(),
+                      'event_time': '11:00' if session == 'morning' else '19:30',
+                      'slot': session, 'timezone': EVENT_TIMEZONE,
+                      'start_date': start.date().isoformat(), 'end_date': now.date().isoformat(),
+                      'start_exclusive': start.isoformat(), 'end_inclusive': now.isoformat()}
+              os.environ['EVENT_PLAN_JSON'] = json.dumps(plan)
+              return now.date(), session, plan
 
 
           def selected_schedule(event_date=None):
-              event_date = event_date or os.environ.get('UTM_TAB_DATE', '')
-              plan = schedule_for(event_date, os.environ.get('WEBINAR_SLOT', 'evening'))
               recorded = os.environ.get('EVENT_PLAN_JSON', '').strip()
-              if recorded and json.loads(recorded) != plan:
-                  raise RuntimeError('Selected webinar and collection window differ from the verified UTM event.')
+              if not recorded:
+                  raise RuntimeError('The initial run window is missing; do not recalculate dates in later jobs.')
+              plan = json.loads(recorded)
+              expected = str(event_date or os.environ.get('UTM_TAB_DATE', ''))
+              if expected != plan['event_date']:
+                  raise RuntimeError('Job date differs from the pinned run date.')
+              end = datetime.fromisoformat(plan['end_inclusive'])
+              start = datetime.fromisoformat(plan['start_exclusive'])
+              if (end.tzinfo is None or start.tzinfo is None or plan['timezone'] != EVENT_TIMEZONE
+                      or end.date().isoformat() != expected
+                      or start != (end - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)):
+                  raise RuntimeError('Invalid pinned reporting window.')
               return plan
 
 
@@ -1742,7 +1677,7 @@ jobs:
           from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
-          print('WORKFLOW REVISION: V19-R4 — selected event date drives the complete workflow')
+          print('WORKFLOW REVISION: V20-R1 — selected event date drives the complete workflow')
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
           PROJECT_URL = os.environ.get('FLEXIFUNNELS_PROJECT_URL', '').strip()
           LANDING_URL = os.environ.get('FLEXIFUNNELS_LANDING_URL', '').strip()
@@ -2947,9 +2882,9 @@ jobs:
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 19-R4: both CSVs verified; Google Sheets remain read-only.')
+                  print('VERSION 20-R1: both CSVs verified; Google Sheets remain read-only.')
               except Exception as error:
-                  print('VERSION 19-R4 stopped:', type(error).__name__, str(error))
+                  print('VERSION 20-R1 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
@@ -3024,65 +2959,39 @@ jobs:
 
 
           def resolve_manual_event(date_text='', session='auto', now=None):
-              """A manual run selects today's event, including an unfinished window."""
               tz = ZoneInfo(EVENT_TIMEZONE)
               now = now or datetime.now(tz)
               if now.tzinfo is None:
-                  raise RuntimeError('Manual event selection requires a timezone-aware clock.')
+                  raise RuntimeError('Run time must include a timezone.')
               now = now.astimezone(tz)
-              event_date = date.fromisoformat(date_text.strip()) if date_text.strip() else now.date()
-              if event_date > now.date():
-                  raise RuntimeError('The requested webinar date is in the future.')
-              session = session.strip() or 'auto'
-              if session in ('auto', 'choose'):
-                  if event_date.weekday() == 6:
-                      if event_date != now.date():
-                          raise RuntimeError('For a past Sunday, explicitly choose morning (11 AM) or evening (7:30 PM).')
-                      session = 'morning' if now.hour < 9 else 'evening'
-                  else:
-                      session = 'evening'
-              plan = schedule_for(event_date, session)
-              if now < datetime.fromisoformat(plan['start_exclusive']):
-                  raise RuntimeError('This webinar collection window has not started yet.')
-              # Do not wait for the end cutoff and do not choose an older finished event.
-              return event_date, session, plan
-
-
-          def schedule_for(event_date, slot):
-              if isinstance(event_date, str):
-                  event_date = date.fromisoformat(event_date)
-              if slot not in ('morning', 'evening'):
-                  raise RuntimeError('Choose morning or evening for the webinar session.')
-              weekday = event_date.weekday()
-              if weekday not in (1, 2, 6):
-                  raise RuntimeError('Webinar date must be Tuesday, Wednesday or Sunday; no other date substituted.')
-              if slot == 'morning' and weekday != 6:
-                  raise RuntimeError('The 11 AM session is available only on Sunday.')
-              tz = ZoneInfo(EVENT_TIMEZONE)
-              midnight = datetime.combine(event_date, datetime.min.time(), tzinfo=tz)
-              if weekday == 1:
-                  start, end = midnight - timedelta(days=2) + timedelta(hours=18), midnight + timedelta(hours=18)
-              elif weekday == 2:
-                  start, end = midnight - timedelta(days=1) + timedelta(hours=18), midnight + timedelta(hours=18)
-              elif slot == 'morning':
-                  start, end = midnight - timedelta(days=4) + timedelta(hours=18), midnight + timedelta(hours=9)
-              else:
-                  start, end = midnight + timedelta(hours=9), midnight + timedelta(hours=18)
-              event_time = '11:00' if slot == 'morning' else '19:30'
-              return {
-                  'event_date': event_date.isoformat(), 'event_time': event_time, 'slot': slot,
-                  'timezone': EVENT_TIMEZONE, 'start_date': start.date().isoformat(),
-                  'end_date': end.date().isoformat(), 'start_exclusive': start.isoformat(),
-                  'end_inclusive': end.isoformat(),
-              }
+              if session == 'auto':
+                  session = 'morning' if now.weekday() == 6 and now.hour < 9 else 'evening'
+              if session not in ('morning', 'evening'):
+                  raise RuntimeError('Select morning or evening.')
+              start = (now - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
+              plan = {'event_date': now.date().isoformat(),
+                      'event_time': '11:00' if session == 'morning' else '19:30',
+                      'slot': session, 'timezone': EVENT_TIMEZONE,
+                      'start_date': start.date().isoformat(), 'end_date': now.date().isoformat(),
+                      'start_exclusive': start.isoformat(), 'end_inclusive': now.isoformat()}
+              os.environ['EVENT_PLAN_JSON'] = json.dumps(plan)
+              return now.date(), session, plan
 
 
           def selected_schedule(event_date=None):
-              event_date = event_date or os.environ.get('UTM_TAB_DATE', '')
-              plan = schedule_for(event_date, os.environ.get('WEBINAR_SLOT', 'evening'))
               recorded = os.environ.get('EVENT_PLAN_JSON', '').strip()
-              if recorded and json.loads(recorded) != plan:
-                  raise RuntimeError('Selected webinar and collection window differ from the verified UTM event.')
+              if not recorded:
+                  raise RuntimeError('The initial run window is missing; do not recalculate dates in later jobs.')
+              plan = json.loads(recorded)
+              expected = str(event_date or os.environ.get('UTM_TAB_DATE', ''))
+              if expected != plan['event_date']:
+                  raise RuntimeError('Job date differs from the pinned run date.')
+              end = datetime.fromisoformat(plan['end_inclusive'])
+              start = datetime.fromisoformat(plan['start_exclusive'])
+              if (end.tzinfo is None or start.tzinfo is None or plan['timezone'] != EVENT_TIMEZONE
+                      or end.date().isoformat() != expected
+                      or start != (end - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)):
+                  raise RuntimeError('Invalid pinned reporting window.')
               return plan
 
 
@@ -4290,65 +4199,39 @@ jobs:
 
 
           def resolve_manual_event(date_text='', session='auto', now=None):
-              """A manual run selects today's event, including an unfinished window."""
               tz = ZoneInfo(EVENT_TIMEZONE)
               now = now or datetime.now(tz)
               if now.tzinfo is None:
-                  raise RuntimeError('Manual event selection requires a timezone-aware clock.')
+                  raise RuntimeError('Run time must include a timezone.')
               now = now.astimezone(tz)
-              event_date = date.fromisoformat(date_text.strip()) if date_text.strip() else now.date()
-              if event_date > now.date():
-                  raise RuntimeError('The requested webinar date is in the future.')
-              session = session.strip() or 'auto'
-              if session in ('auto', 'choose'):
-                  if event_date.weekday() == 6:
-                      if event_date != now.date():
-                          raise RuntimeError('For a past Sunday, explicitly choose morning (11 AM) or evening (7:30 PM).')
-                      session = 'morning' if now.hour < 9 else 'evening'
-                  else:
-                      session = 'evening'
-              plan = schedule_for(event_date, session)
-              if now < datetime.fromisoformat(plan['start_exclusive']):
-                  raise RuntimeError('This webinar collection window has not started yet.')
-              # Do not wait for the end cutoff and do not choose an older finished event.
-              return event_date, session, plan
-
-
-          def schedule_for(event_date, slot):
-              if isinstance(event_date, str):
-                  event_date = date.fromisoformat(event_date)
-              if slot not in ('morning', 'evening'):
-                  raise RuntimeError('Choose morning or evening for the webinar session.')
-              weekday = event_date.weekday()
-              if weekday not in (1, 2, 6):
-                  raise RuntimeError('Webinar date must be Tuesday, Wednesday or Sunday; no other date substituted.')
-              if slot == 'morning' and weekday != 6:
-                  raise RuntimeError('The 11 AM session is available only on Sunday.')
-              tz = ZoneInfo(EVENT_TIMEZONE)
-              midnight = datetime.combine(event_date, datetime.min.time(), tzinfo=tz)
-              if weekday == 1:
-                  start, end = midnight - timedelta(days=2) + timedelta(hours=18), midnight + timedelta(hours=18)
-              elif weekday == 2:
-                  start, end = midnight - timedelta(days=1) + timedelta(hours=18), midnight + timedelta(hours=18)
-              elif slot == 'morning':
-                  start, end = midnight - timedelta(days=4) + timedelta(hours=18), midnight + timedelta(hours=9)
-              else:
-                  start, end = midnight + timedelta(hours=9), midnight + timedelta(hours=18)
-              event_time = '11:00' if slot == 'morning' else '19:30'
-              return {
-                  'event_date': event_date.isoformat(), 'event_time': event_time, 'slot': slot,
-                  'timezone': EVENT_TIMEZONE, 'start_date': start.date().isoformat(),
-                  'end_date': end.date().isoformat(), 'start_exclusive': start.isoformat(),
-                  'end_inclusive': end.isoformat(),
-              }
+              if session == 'auto':
+                  session = 'morning' if now.weekday() == 6 and now.hour < 9 else 'evening'
+              if session not in ('morning', 'evening'):
+                  raise RuntimeError('Select morning or evening.')
+              start = (now - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
+              plan = {'event_date': now.date().isoformat(),
+                      'event_time': '11:00' if session == 'morning' else '19:30',
+                      'slot': session, 'timezone': EVENT_TIMEZONE,
+                      'start_date': start.date().isoformat(), 'end_date': now.date().isoformat(),
+                      'start_exclusive': start.isoformat(), 'end_inclusive': now.isoformat()}
+              os.environ['EVENT_PLAN_JSON'] = json.dumps(plan)
+              return now.date(), session, plan
 
 
           def selected_schedule(event_date=None):
-              event_date = event_date or os.environ.get('UTM_TAB_DATE', '')
-              plan = schedule_for(event_date, os.environ.get('WEBINAR_SLOT', 'evening'))
               recorded = os.environ.get('EVENT_PLAN_JSON', '').strip()
-              if recorded and json.loads(recorded) != plan:
-                  raise RuntimeError('Selected webinar and collection window differ from the verified UTM event.')
+              if not recorded:
+                  raise RuntimeError('The initial run window is missing; do not recalculate dates in later jobs.')
+              plan = json.loads(recorded)
+              expected = str(event_date or os.environ.get('UTM_TAB_DATE', ''))
+              if expected != plan['event_date']:
+                  raise RuntimeError('Job date differs from the pinned run date.')
+              end = datetime.fromisoformat(plan['end_inclusive'])
+              start = datetime.fromisoformat(plan['start_exclusive'])
+              if (end.tzinfo is None or start.tzinfo is None or plan['timezone'] != EVENT_TIMEZONE
+                      or end.date().isoformat() != expected
+                      or start != (end - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)):
+                  raise RuntimeError('Invalid pinned reporting window.')
               return plan
 
 
