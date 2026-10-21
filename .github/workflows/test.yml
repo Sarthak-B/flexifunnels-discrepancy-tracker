@@ -19,6 +19,15 @@ on:
         description: "FlexiFunnels report END date (2026-10-21 or 21-10-2026)"
         type: string
         required: true
+      ff_start_time:
+        description: "Count registrations AFTER this time on the start date (registration switch-over time)"
+        type: choice
+        required: true
+        default: "6:00 PM"
+        options:
+          - "6:00 PM"
+          - "9:00 AM"
+          - "12:00 AM (whole day)"
       zoom_webinar_date:
         description: "Zoom webinar date to download registrants for (2026-10-21 or 21-10-2026)"
         type: string
@@ -78,6 +87,7 @@ jobs:
           FF_END_DATE: ${{ inputs.ff_end_date }}
           ZOOM_WEBINAR_DATE: ${{ inputs.zoom_webinar_date }}
           ZOOM_WEBINAR_TIME: ${{ inputs.zoom_webinar_time }}
+          FF_START_TIME: ${{ inputs.ff_start_time }}
         run: |
           python -u - <<'PY'
           import base64
@@ -163,7 +173,7 @@ jobs:
                   return None
 
 
-          def read_utm_contacts(worksheet, start, end):
+          def read_utm_contacts(worksheet, window_start, end):
               """Keep rows whose timestamp_incoming_webhook date is within the FlexiFunnels range."""
               values = worksheet.get_all_values()
               if not values:
@@ -187,7 +197,9 @@ jobs:
                   if stamp is None:
                       raise RuntimeError('Unrecognized timestamp in ' + worksheet.title + ' row ' + str(row_number)
                                          + ': ' + cells[0])
-                  if start <= stamp.date() <= end:
+                  # Same window as FlexiFunnels: strictly after the start time, through the end date.
+                  if (window_start.hour == 0 and window_start.minute == 0 and stamp >= window_start
+                          or stamp > window_start) and stamp.date() <= end:
                       contacts.append({'name': cells[1], 'email': cells[2], 'phone': cells[3]})
                   else:
                       outside += 1
@@ -255,13 +267,19 @@ jobs:
           if not business_name or not reg_name or business_name == reg_name:
               raise RuntimeError('Provide two different UTM tab names.')
 
-          plan = {'timezone': TZ_NAME,
+          start_times = {'6:00 PM': '18:00', '9:00 AM': '09:00', '12:00 AM (whole day)': '00:00'}
+          start_choice = os.environ.get('FF_START_TIME', '6:00 PM').strip()
+          if start_choice not in start_times:
+              raise RuntimeError('Choose a valid start time.')
+          ff_start_time = start_times[start_choice]
+          window_start = datetime.combine(ff_start, datetime.strptime(ff_start_time, '%H:%M').time(), tzinfo=TZ)
+          plan = {'timezone': TZ_NAME, 'ff_start_time': ff_start_time,
                   'ff_start': ff_start.isoformat(), 'ff_end': ff_end.isoformat(),
                   'webinar_date': webinar_date.isoformat(), 'webinar_time': webinar_time, 'slot': slot,
                   'zoom_search_from': (webinar_date - timedelta(days=1)).isoformat(),
                   'zoom_search_to': webinar_date.isoformat(),
                   'captured_at': now.isoformat(timespec='seconds')}
-          print('FlexiFunnels + UTM date range:', plan['ff_start'], 'to', plan['ff_end'], '(inclusive)')
+          print('FlexiFunnels + UTM window: after', plan['ff_start'], start_choice, 'through end of', plan['ff_end'])
           print('Zoom / ActiveCampaign webinar:', plan['webinar_date'], time_choice, 'IST')
 
           # ---- 2. Connect to the three spreadsheets (read-only) ---------------------------
@@ -288,8 +306,8 @@ jobs:
           utm_tabs = books['UTM'].worksheets()
           business_tab = find_tab(utm_tabs, business_name, 'Business UTM')
           reg_tab = find_tab(utm_tabs, reg_name, 'Reg team UTM')
-          business_rows = read_utm_contacts(business_tab, ff_start, ff_end)
-          registration_rows = read_utm_contacts(reg_tab, ff_start, ff_end)
+          business_rows = read_utm_contacts(business_tab, window_start, ff_end)
+          registration_rows = read_utm_contacts(reg_tab, window_start, ff_end)
 
           Path('utm').mkdir(exist_ok=True)
           write_rows(Path('utm/business.csv'), business_rows)
@@ -352,7 +370,7 @@ jobs:
 
           TZ_NAME = 'Asia/Kolkata'
           PLAN_KEYS = {'timezone', 'ff_start', 'ff_end', 'webinar_date', 'webinar_time', 'slot',
-                       'zoom_search_from', 'zoom_search_to', 'captured_at'}
+                       'zoom_search_from', 'zoom_search_to', 'captured_at', 'ff_start_time'}
 
 
           def load_plan():
@@ -384,6 +402,7 @@ jobs:
           PLAN = load_plan()
           RANGE_START = date.fromisoformat(PLAN['ff_start'])
           RANGE_END = date.fromisoformat(PLAN['ff_end'])
+          WINDOW_START = datetime.combine(RANGE_START, datetime.strptime(PLAN['ff_start_time'], '%H:%M').time())
 
           EMAIL = os.environ.get('FLEXIFUNNELS_EMAIL', '').strip()
           PASSWORD = os.environ.get('FLEXIFUNNELS_PASSWORD', '')
@@ -1103,20 +1122,24 @@ jobs:
                   required = ('first_name', 'email', 'phone', 'created_at')
                   if any(key not in (reader.fieldnames or []) for key in required):
                       raise RuntimeError('CSV is missing required identity/timestamp columns.')
-                  identities = []
+                  identities, downloaded, before_cutoff = [], 0, 0
                   for record in reader:
+                      downloaded += 1
                       timestamp = datetime.strptime(record['created_at'].strip(), '%b %d, %Y %I:%M %p (IST)')
                       if not RANGE_START <= timestamp.date() <= RANGE_END:
                           raise RuntimeError('Export contains a record dated ' + timestamp.date().isoformat()
                                              + ', outside the requested range.')
+                      if WINDOW_START.time() != datetime.min.time() and timestamp <= WINDOW_START:
+                          before_cutoff += 1   # signed up before the switch-over: previous webinar
+                          continue
                       identities.append({'name': record['first_name'].strip(), 'email': record['email'].strip(),
                                          'phone': record['phone'].strip()})
               with path.open('w', encoding='utf-8-sig', newline='') as output:
                   writer = csv.DictWriter(output, fieldnames=['name', 'email', 'phone'])
                   writer.writeheader()
                   writer.writerows(identities)
-              print(path.name + ': ' + RANGE_START.isoformat() + ' to ' + RANGE_END.isoformat()
-                    + ' -> records=' + str(len(identities)))
+              print(path.name + ': downloaded=' + str(downloaded) + ' | before ' + WINDOW_START.strftime('%Y-%m-%d %H:%M')
+                    + ' (dropped)=' + str(before_cutoff) + ' | kept=' + str(len(identities)))
               return len(identities)
 
 
@@ -1272,7 +1295,7 @@ jobs:
 
           TZ_NAME = 'Asia/Kolkata'
           PLAN_KEYS = {'timezone', 'ff_start', 'ff_end', 'webinar_date', 'webinar_time', 'slot',
-                       'zoom_search_from', 'zoom_search_to', 'captured_at'}
+                       'zoom_search_from', 'zoom_search_to', 'captured_at', 'ff_start_time'}
 
 
           def load_plan():
@@ -2359,7 +2382,7 @@ jobs:
 
           TZ_NAME = 'Asia/Kolkata'
           PLAN_KEYS = {'timezone', 'ff_start', 'ff_end', 'webinar_date', 'webinar_time', 'slot',
-                       'zoom_search_from', 'zoom_search_to', 'captured_at'}
+                       'zoom_search_from', 'zoom_search_to', 'captured_at', 'ff_start_time'}
 
 
           def load_plan():
@@ -2969,7 +2992,7 @@ jobs:
                            len(merged_reports), len(merged_utm), len(ac_rows), len(zoom_rows)]
               if has_discrepancy_column:
                   stats_row.append(len(discrepancy))
-              ff_range = plan['ff_start'] + ' to ' + plan['ff_end']
+              ff_range = 'after ' + plan['ff_start'] + ' ' + plan['ff_start_time'] + ' through ' + plan['ff_end']
               notes = {
                   2: 'Webinar ' + plan['webinar_date'] + ' at ' + webinar_label + ' IST.',
                   4: ('FlexiFunnels ' + ff_range + ': funnel-agent ' + str(len(ff_business))
