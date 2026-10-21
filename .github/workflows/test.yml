@@ -46,7 +46,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      run_plan: ${{ steps.prepare.outputs.run_plan }}
       utm_business_tab: ${{ steps.prepare.outputs.utm_business_tab }}
       utm_reg_tab: ${{ steps.prepare.outputs.utm_reg_tab }}
 
@@ -301,7 +300,6 @@ jobs:
           }, indent=2))
 
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
-              output.write('run_plan=' + json.dumps(plan, separators=(',', ':')) + '\n')
               output.write('utm_business_tab=' + business_tab.title + '\n')
               output.write('utm_reg_tab=' + reg_tab.title + '\n')
 
@@ -328,6 +326,11 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+      - name: Download this run's inputs (UTM snapshot with run plan)
+        uses: actions/download-artifact@v4
+        with:
+          name: utm-source-${{ github.run_id }}
+          path: utm
       - name: Install Playwright
         run: |
           python -m pip install playwright
@@ -339,7 +342,6 @@ jobs:
           FLEXIFUNNELS_PROJECT_URL: ${{ vars.FLEXIFUNNELS_PROJECT_URL }}
           FLEXIFUNNELS_LANDING_URL: ${{ vars.FLEXIFUNNELS_LANDING_URL }}
           FLEXIFUNNELS_REG_URL: ${{ vars.FLEXIFUNNELS_REG_URL }}
-          RUN_PLAN_JSON: ${{ needs.prepare.outputs.run_plan }}
         run: |
           python -u - <<'PY'
           """Run plan created once by the prepare job and reused unchanged by every job."""
@@ -354,10 +356,15 @@ jobs:
 
 
           def load_plan():
-              raw = os.environ.get('RUN_PLAN_JSON', '').strip()
-              if not raw:
-                  raise RuntimeError('Run plan is missing; the prepare job must create it.')
-              plan = json.loads(raw)
+              # The plan travels inside the UTM snapshot artifact (job outputs containing
+              # JSON can be silently dropped by GitHub's secret masking).
+              from pathlib import Path as _Path
+              source = _Path('utm/snapshot.json')
+              if not source.is_file():
+                  raise RuntimeError('Run plan is missing: utm/snapshot.json was not downloaded from the prepare job.')
+              plan = json.loads(source.read_text()).get('plan')
+              if not isinstance(plan, dict):
+                  raise RuntimeError('Run plan is missing from utm/snapshot.json.')
               if (set(plan) != PLAN_KEYS or plan['timezone'] != TZ_NAME
                       or plan['slot'] not in ('morning', 'evening')
                       or plan['webinar_time'] != ('11:00' if plan['slot'] == 'morning' else '19:30')):
@@ -1222,6 +1229,11 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+      - name: Download this run's inputs (UTM snapshot with run plan)
+        uses: actions/download-artifact@v4
+        with:
+          name: utm-source-${{ github.run_id }}
+          path: utm
       - name: Install Playwright
         run: |
           python -m pip install "playwright>=1.51,<2" cryptography
@@ -1250,7 +1262,6 @@ jobs:
       - name: Reuse Zoom session and download All registrants
         env:
           ZOOM_STORAGE_STATE_B64: ${{ secrets.ZOOM_STORAGE_STATE_B64 }}
-          RUN_PLAN_JSON: ${{ needs.prepare.outputs.run_plan }}
         run: |
           python -u - <<'PY'
           """Run plan created once by the prepare job and reused unchanged by every job."""
@@ -1265,10 +1276,15 @@ jobs:
 
 
           def load_plan():
-              raw = os.environ.get('RUN_PLAN_JSON', '').strip()
-              if not raw:
-                  raise RuntimeError('Run plan is missing; the prepare job must create it.')
-              plan = json.loads(raw)
+              # The plan travels inside the UTM snapshot artifact (job outputs containing
+              # JSON can be silently dropped by GitHub's secret masking).
+              from pathlib import Path as _Path
+              source = _Path('utm/snapshot.json')
+              if not source.is_file():
+                  raise RuntimeError('Run plan is missing: utm/snapshot.json was not downloaded from the prepare job.')
+              plan = json.loads(source.read_text()).get('plan')
+              if not isinstance(plan, dict):
+                  raise RuntimeError('Run plan is missing from utm/snapshot.json.')
               if (set(plan) != PLAN_KEYS or plan['timezone'] != TZ_NAME
                       or plan['slot'] not in ('morning', 'evening')
                       or plan['webinar_time'] != ('11:00' if plan['slot'] == 'morning' else '19:30')):
@@ -2333,7 +2349,6 @@ jobs:
           DISCREPANCY_TAB_NAME: ${{ vars.DISCREPANCY_TAB_NAME }}
           ACTIVECAMPAIGN_API_URL: ${{ secrets.ACTIVECAMPAIGN_API_URL }}
           ACTIVECAMPAIGN_API_KEY: ${{ secrets.ACTIVECAMPAIGN_API_KEY }}
-          RUN_PLAN_JSON: ${{ needs.prepare.outputs.run_plan }}
         run: |
           python -u - <<'PY'
           """Run plan created once by the prepare job and reused unchanged by every job."""
@@ -2348,10 +2363,15 @@ jobs:
 
 
           def load_plan():
-              raw = os.environ.get('RUN_PLAN_JSON', '').strip()
-              if not raw:
-                  raise RuntimeError('Run plan is missing; the prepare job must create it.')
-              plan = json.loads(raw)
+              # The plan travels inside the UTM snapshot artifact (job outputs containing
+              # JSON can be silently dropped by GitHub's secret masking).
+              from pathlib import Path as _Path
+              source = _Path('utm/snapshot.json')
+              if not source.is_file():
+                  raise RuntimeError('Run plan is missing: utm/snapshot.json was not downloaded from the prepare job.')
+              plan = json.loads(source.read_text()).get('plan')
+              if not isinstance(plan, dict):
+                  raise RuntimeError('Run plan is missing from utm/snapshot.json.')
               if (set(plan) != PLAN_KEYS or plan['timezone'] != TZ_NAME
                       or plan['slot'] not in ('morning', 'evening')
                       or plan['webinar_time'] != ('11:00' if plan['slot'] == 'morning' else '19:30')):
