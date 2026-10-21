@@ -2405,19 +2405,34 @@ jobs:
               if re.search(r'[A-Za-z]', raw):
                   return ''
               digits = re.sub(r'\D', '', raw)
-              if digits.startswith('0091'):
-                  digits = digits[4:]
-              elif digits.startswith('00'):
+              if digits.startswith('00'):
                   digits = digits[2:]
-              if len(digits) == 12 and digits.startswith('91'):
-                  digits = digits[2:]
-              elif len(digits) == 11 and digits.startswith('0'):
-                  digits = digits[1:]
+              if digits.startswith('91') and len(digits) in (12, 13):
+                  digits = digits[2:]          # 91XXXXXXXXXX or 910XXXXXXXXXX
+              if len(digits) == 11 and digits.startswith('0'):
+                  digits = digits[1:]          # 0XXXXXXXXXX
               return digits
 
 
+          _INVISIBLE = re.compile(r'[\s\u200b-\u200f\u2060\ufeff\u00a0]+')
+
+
+          def clean_email(value):
+              """Lower-case email with spaces and invisible characters removed."""
+              return _INVISIBLE.sub('', str(value or '')).casefold()
+
+
+          def dedupe_key(row):
+              """Duplicate key used on every tab: email + phone after cleaning.
+              Rows missing one of the two still dedupe on what they have."""
+              email, phone = clean_email(row['email']), normalized_phone(row['phone'])
+              if not email and not phone:
+                  return ('name-only', ' '.join(row['name'].split()).casefold())
+              return email, phone
+
+
           def match_key(row):
-              email = row['email'].strip().casefold()
+              email = clean_email(row['email'])
               phone = normalized_phone(row['phone'])
               if not email or not phone or not phone.isascii() or not phone.isdigit():
                   return None
@@ -2460,10 +2475,10 @@ jobs:
               merged, seen = [], {}
               for group in groups:
                   for row in group:
-                      key = match_key(row)
-                      if key is None:
-                          merged.append(dict(row))
-                      elif key not in seen:
+                      key = dedupe_key(row)
+                      if key == ('name-only', ''):
+                          continue  # completely blank row
+                      if key not in seen:
                           seen[key] = len(merged)
                           merged.append(dict(row))
                       elif not merged[seen[key]]['name'] and row['name']:
@@ -2472,7 +2487,7 @@ jobs:
 
 
           def prepare_contact_rows(rows):
-              cleaned = [{'name': row['name'].strip(), 'email': row['email'].strip(),
+              cleaned = [{'name': ' '.join(str(row['name']).split()), 'email': clean_email(row['email']),
                           'phone': normalized_phone(row['phone'])} for row in rows]
               return merge_records(sorted_records(cleaned))
 
@@ -2895,17 +2910,29 @@ jobs:
               ff_business, ff_reg = stored[key('LANDING PAGE')], stored[key('LANDING PAGE REG')]
               merged_utm, ac_rows, zoom_rows = stored[key('UTM')], stored[key('ACTIVE CAMPAIGN')], stored[key('ZOOM')]
 
-              # STAGE 3: discrepancy = UTM people not found in Zoom (by email OR phone)
-              zoom_emails = {row['email'].strip().casefold() for row in zoom_rows if row['email'].strip()}
-              zoom_phones = {normalized_phone(row['phone']) for row in zoom_rows
-                             if len(normalized_phone(row['phone'])) >= 7}
+              # STAGE 3: discrepancy = UTM people missing from Zoom.
+              # DISCREPANCY_MATCH decides when a UTM person counts as "found in Zoom":
+              #   'email'          -> same email in Zoom (like a VLOOKUP/COUNTIF on email)
+              #   'email_or_phone' -> same email OR same phone
+              #   'email_and_phone'-> same email AND same phone
+              DISCREPANCY_MATCH = 'email'
+              zoom_emails = {clean_email(r['email']) for r in zoom_rows if clean_email(r['email'])}
+              zoom_phones = {normalized_phone(r['phone']) for r in zoom_rows if len(normalized_phone(r['phone'])) >= 7}
+              zoom_pairs = {(clean_email(r['email']), normalized_phone(r['phone'])) for r in zoom_rows}
 
-              def in_zoom(row):
-                  return (row['email'].strip().casefold() in zoom_emails
-                          or normalized_phone(row['phone']) in zoom_phones)
+              def found(row, rule):
+                  email, phone = clean_email(row['email']), normalized_phone(row['phone'])
+                  if rule == 'email':
+                      return bool(email) and email in zoom_emails
+                  if rule == 'email_and_phone':
+                      return (email, phone) in zoom_pairs
+                  return (bool(email) and email in zoom_emails) or (len(phone) >= 7 and phone in zoom_phones)
 
-              discrepancy = [row for row in merged_utm if not in_zoom(row)]
-              print('STAGE 3: UTM people not found in Zoom:', len(discrepancy), 'of', len(merged_utm))
+              for rule in ('email', 'email_or_phone', 'email_and_phone'):
+                  print('Check: UTM missing from Zoom by', rule, '=',
+                        sum(not found(r, rule) for r in merged_utm), 'of', len(merged_utm))
+              discrepancy = merge_records([row for row in merged_utm if not found(row, DISCREPANCY_MATCH)])
+              print('STAGE 3: DESCREPANCY tab (rule:', DISCREPANCY_MATCH + '):', len(discrepancy), 'people')
 
               # Side check (CSV artifact only): each FlexiFunnels page vs its own UTM tab.
               summary = {}
