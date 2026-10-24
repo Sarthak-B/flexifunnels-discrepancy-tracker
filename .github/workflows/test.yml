@@ -40,6 +40,10 @@ on:
         options:
           - "7:30 PM"
           - "11:00 AM"
+      ac_list_date:
+        description: "ActiveCampaign: date written in the '10 Min Business' list name (2026-10-21 or 21-10-2026)"
+        type: string
+        required: true
 
 concurrency:
   group: flexifunnels-discrepancy-sheets
@@ -51,7 +55,7 @@ permissions:
 jobs:
 
   prepare:
-    name: Check inputs and read the two UTM tabs
+    name: Check inputs, pick the ActiveCampaign list and read the two UTM tabs
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -68,7 +72,7 @@ jobs:
       - name: Install Google Sheets dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install gspread google-auth
+          python -m pip install gspread google-auth requests
 
       - name: Validate inputs, read UTM tabs and preflight destinations
         id: prepare
@@ -88,6 +92,7 @@ jobs:
           ZOOM_WEBINAR_DATE: ${{ inputs.zoom_webinar_date }}
           ZOOM_WEBINAR_TIME: ${{ inputs.zoom_webinar_time }}
           FF_START_TIME: ${{ inputs.ff_start_time }}
+          AC_LIST_DATE: ${{ inputs.ac_list_date }}
         run: |
           python -u - <<'PY'
           import base64
@@ -95,6 +100,7 @@ jobs:
           import json
           import os
           import re
+          import time
           import zlib
           from datetime import date, datetime, timedelta
           from pathlib import Path
@@ -234,8 +240,141 @@ jobs:
                   raise RuntimeError('Saved Zoom session cannot be read; run the Zoom session setup again.')
 
 
+          # ---- ActiveCampaign list picker ------------------------------------------------
+          # Picks ONLY the "10 Min Business" list for the ActiveCampaign date you entered.
+          # It never falls back to the first list: if nothing (or more than one) matches, the run
+          # stops here, before any FlexiFunnels/Zoom work, and the log shows every list on that date.
+          MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july',
+                    'august', 'september', 'october', 'november', 'december']
+
+
+          def ac_text(name):
+              return ' '.join(str(name or '').split()).casefold()
+
+
+          def ac_name_has_date(name, day):
+              """True when the list name contains this date (24 Oct 2026, 24th October, Oct 24, 24/10/2026 ...)."""
+              text = ac_text(name)
+              years = set(re.findall(r'(?<!\d)(20\d{2})(?!\d)', text))
+              if years and str(day.year) not in years:
+                  return False
+              full = MONTHS[day.month - 1]
+              month = '(?:' + full + '|' + full[:3] + ('|sept' if day.month == 9 else '') + r')\.?'
+              dd = r'0?' + str(day.day) + r'(?:st|nd|rd|th)?'
+              patterns = [
+                  r'(?<!\d)' + dd + r'[\s\-/.,]*' + month + r'(?![a-z])',
+                  r'(?<![a-z])' + month + r'[\s\-/.,]*' + dd + r'(?!\d)',
+                  r'(?<!\d)0?' + str(day.day) + r'[/\-.]0?' + str(day.month)
+                  + r'(?:[/\-.](?:' + str(day.year) + '|' + str(day.year)[2:] + r'))?(?!\d)',
+              ]
+              return any(re.search(pattern, text) for pattern in patterns)
+
+
+          def ac_is_10min_business(name):
+              """True only for the 10-minute Business workshop lists (10 Min / 10 Mins / 10-Minute ... Business)."""
+              text = ac_text(name)
+              return (re.search(r'(?<!\d)10\s*-?\s*min(?:ute)?s?(?![a-z])', text) is not None
+                      and re.search(r'\bbusiness\b', text) is not None)
+
+
+          def ac_clock(name):
+              """Time written in the list name as HH:MM, None if there is no time, 'ambiguous' if several."""
+              text = str(name or '')
+              found = set()
+              for hour, minute, half in re.findall(
+                      r'(?<!\d)(\d{1,2})(?:[:.]?([0-5]\d))?\s*([AaPp])\.?\s*[Mm](?![A-Za-z])', text):
+                  hour = int(hour)
+                  if 1 <= hour <= 12:
+                      found.add('%02d:%02d' % (hour % 12 + (12 if half.lower() == 'p' else 0), int(minute or 0)))
+              for hour, minute in re.findall(
+                      r'(?<![\d:.])([01]?\d|2[0-3]):([0-5]\d)(?!\d)(?!\s*[AaPp]\.?\s*[Mm])', text):
+                  found.add('%02d:%s' % (int(hour), minute))
+              if not found:
+                  return None
+              return found.pop() if len(found) == 1 else 'ambiguous'
+
+
+          def ac_all_lists():
+              import requests
+              parsed = urlparse(os.environ['ACTIVECAMPAIGN_API_URL'].strip())
+              if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password
+                      or parsed.path.rstrip('/') not in ('', '/api/3')):
+                  raise RuntimeError('ACTIVECAMPAIGN_API_URL must be the HTTPS account host or end at /api/3.')
+              endpoint = 'https://' + parsed.netloc + '/api/3/lists'
+              session = requests.Session()
+              session.headers.update({'Api-Token': os.environ['ACTIVECAMPAIGN_API_KEY'].strip(),
+                                      'Accept': 'application/json'})
+              lists, seen, offset = [], set(), 0
+              for _ in range(200):
+                  for attempt in range(4):
+                      response = session.get(endpoint, params={'limit': 100, 'offset': offset, 'orders[name]': 'ASC'},
+                                             timeout=60, allow_redirects=False)
+                      if (response.status_code == 429 or response.status_code >= 500) and attempt < 3:
+                          time.sleep(2 ** attempt)
+                          continue
+                      break
+                  if response.status_code != 200:
+                      raise RuntimeError('ActiveCampaign lists read failed (HTTP ' + str(response.status_code) + ').')
+                  data = response.json()
+                  batch = data.get('lists') or []
+                  try:
+                      total = int(data['meta']['total'])
+                  except (KeyError, TypeError, ValueError):
+                      raise RuntimeError('ActiveCampaign lists response did not include a total.') from None
+                  for item in batch:
+                      key = str(item.get('id', ''))
+                      if key and key not in seen:
+                          seen.add(key)
+                          lists.append(item)
+                  offset += len(batch)
+                  if not batch or offset >= total:
+                      return lists
+              raise RuntimeError('Too many ActiveCampaign lists to read in one run.')
+
+
+          def resolve_ac_list(ac_date, webinar_time):
+              lists = ac_all_lists()
+              dated = [item for item in lists if ac_name_has_date(item.get('name', ''), ac_date)]
+              print('ActiveCampaign: lists read:', len(lists), '| lists with', ac_date.isoformat(),
+                    'in the name:', len(dated))
+              for item in dated:
+                  print('   -', item.get('name'), '(id ' + str(item.get('id')) + ')',
+                        '<- 10 Min Business' if ac_is_10min_business(item.get('name', '')) else '')
+              business = [item for item in dated if ac_is_10min_business(item.get('name', ''))]
+              if not business:
+                  raise RuntimeError('No ActiveCampaign "10 Min Business" list found for ' + ac_date.isoformat()
+                                     + '. Lists on that date: '
+                                     + (' | '.join(str(i.get('name')) for i in dated) or 'none')
+                                     + '. Check the ActiveCampaign date you entered.')
+              exact, untimed, other = [], [], []
+              for item in business:
+                  clock = ac_clock(item.get('name', ''))
+                  if clock == webinar_time:
+                      exact.append(item)
+                  elif clock is None:
+                      untimed.append(item)
+                  else:
+                      other.append(item)
+              pool = exact or untimed
+              if not pool:
+                  raise RuntimeError('The "10 Min Business" lists on ' + ac_date.isoformat() + ' are for other times: '
+                                     + ' | '.join(str(i.get('name')) for i in other)
+                                     + '. Check the Zoom webinar time you chose.')
+              if len(pool) > 1:
+                  raise RuntimeError('More than one ActiveCampaign "10 Min Business" list matches '
+                                     + ac_date.isoformat() + ' ' + webinar_time + ' (not guessing): '
+                                     + ' | '.join(str(i.get('name')) + ' (id ' + str(i.get('id')) + ')' for i in pool)
+                                     + '. Put the time in the list names or remove the duplicate list.')
+              chosen = pool[0]
+              scope = 'event_list' if exact or ac_date.weekday() != 6 else 'shared_sunday_list'
+              print('ActiveCampaign list chosen:', chosen.get('name'), '(id ' + str(chosen.get('id')) + ')')
+              if scope == 'shared_sunday_list':
+                  print('ActiveCampaign: Sunday list has no time in its name; it covers both Sunday sessions.')
+              return chosen, scope
+
+
           print('=' * 60)
-          print('DISCREPANCY TRACKER — VERSION 21 (manual dates)')
+          print('DISCREPANCY TRACKER — VERSION 22 (manual dates + ActiveCampaign date)')
           print('=' * 60)
 
           required = ['GOOGLE_SERVICE_ACCOUNT_JSON', 'RAW_DATA_SHEET_ID', 'UTM_SHEET_ID',
@@ -250,6 +389,7 @@ jobs:
           ff_start = parse_input_date(os.environ.get('FF_START_DATE'), 'FlexiFunnels start date')
           ff_end = parse_input_date(os.environ.get('FF_END_DATE'), 'FlexiFunnels end date')
           webinar_date = parse_input_date(os.environ.get('ZOOM_WEBINAR_DATE'), 'Zoom webinar date')
+          ac_date = parse_input_date(os.environ.get('AC_LIST_DATE'), 'ActiveCampaign list date')
           if ff_start > ff_end:
               raise RuntimeError('FlexiFunnels start date ' + ff_start.isoformat() + ' is after the end date '
                                  + ff_end.isoformat() + '.')
@@ -280,9 +420,17 @@ jobs:
                   'zoom_search_to': webinar_date.isoformat(),
                   'captured_at': now.isoformat(timespec='seconds')}
           print('FlexiFunnels + UTM window: after', plan['ff_start'], start_choice, 'through end of', plan['ff_end'])
-          print('Zoom / ActiveCampaign webinar:', plan['webinar_date'], time_choice, 'IST')
+          print('Zoom webinar:', plan['webinar_date'], time_choice, 'IST')
+          print('ActiveCampaign list date:', ac_date.isoformat(), '| time:', time_choice)
+          if ac_date != webinar_date:
+              print('Note: ActiveCampaign date differs from the Zoom webinar date (as entered).')
 
-          # ---- 2. Connect to the three spreadsheets (read-only) ---------------------------
+          # ---- 2. Pick the ActiveCampaign "10 Min Business" list (fails fast) -------------
+          ac_list, ac_scope = resolve_ac_list(ac_date, webinar_time)
+          plan.update({'ac_date': ac_date.isoformat(), 'ac_list_id': str(ac_list['id']),
+                       'ac_list_name': str(ac_list['name']), 'ac_list_scope': ac_scope})
+
+          # ---- 3. Connect to the three spreadsheets (read-only) ---------------------------
           credentials = Credentials.from_service_account_info(
               json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT_JSON']),
               scopes=['https://www.googleapis.com/auth/spreadsheets.readonly'])
@@ -295,14 +443,14 @@ jobs:
               books[label] = client.open_by_key(os.environ[key])
               print(label + ': connected ->', books[label].title)
 
-          # ---- 3. Preflight everything that later jobs need ------------------------------
+          # ---- 4. Preflight everything that later jobs need ------------------------------
           stats_sheet = books['STATS'].worksheet(os.environ['DISCREPANCY_TAB_NAME'].strip())
           _, has_discrepancy_column = stats_layout(stats_sheet)
           print('Stats headings found. Discrepancy column (I):', 'yes' if has_discrepancy_column else 'no')
           check_zoom_seed(os.environ.get('ZOOM_STORAGE_STATE_B64', ''))
           print('Zoom saved session: readable.')
 
-          # ---- 4. Read the two UTM tabs, filtered to the FlexiFunnels date range -----------
+          # ---- 5. Read the two UTM tabs, filtered to the FlexiFunnels date range -----------
           utm_tabs = books['UTM'].worksheets()
           business_tab = find_tab(utm_tabs, business_name, 'Business UTM')
           reg_tab = find_tab(utm_tabs, reg_name, 'Reg team UTM')
@@ -370,7 +518,8 @@ jobs:
 
           TZ_NAME = 'Asia/Kolkata'
           PLAN_KEYS = {'timezone', 'ff_start', 'ff_end', 'webinar_date', 'webinar_time', 'slot',
-                       'zoom_search_from', 'zoom_search_to', 'captured_at', 'ff_start_time'}
+                       'zoom_search_from', 'zoom_search_to', 'captured_at', 'ff_start_time',
+                       'ac_date', 'ac_list_id', 'ac_list_name', 'ac_list_scope'}
 
 
           def load_plan():
@@ -387,7 +536,7 @@ jobs:
                       or plan['slot'] not in ('morning', 'evening')
                       or plan['webinar_time'] != ('11:00' if plan['slot'] == 'morning' else '19:30')):
                   raise RuntimeError('Run plan is invalid.')
-              for key in ('ff_start', 'ff_end', 'webinar_date', 'zoom_search_from', 'zoom_search_to'):
+              for key in ('ff_start', 'ff_end', 'webinar_date', 'zoom_search_from', 'zoom_search_to', 'ac_date'):
                   date.fromisoformat(plan[key])
               datetime.fromisoformat(plan['captured_at'])
               return plan
@@ -414,7 +563,7 @@ jobs:
           EXPECTED_LANDING_URL = 'https://sb.flexifunnels.com/funnel-agent'
           EXPECTED_REG_URL = 'https://sb.flexifunnels.com/flexi-genie-regteam'
 
-          print('WORKFLOW REVISION: V21 — manual FlexiFunnels date range')
+          print('WORKFLOW REVISION: V22 — manual FlexiFunnels date range')
           if not EMAIL or not PASSWORD:
               raise RuntimeError('FlexiFunnels credentials missing.')
           if PROJECT_URL.rstrip('/') != EXPECTED_PROJECT_URL:
@@ -1218,9 +1367,9 @@ jobs:
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 21: both CSVs verified; Google Sheets untouched in this job.')
+                  print('VERSION 22: both CSVs verified; Google Sheets untouched in this job.')
               except Exception as error:
-                  print('VERSION 21 stopped:', type(error).__name__, str(error))
+                  print('VERSION 22 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
@@ -1295,7 +1444,8 @@ jobs:
 
           TZ_NAME = 'Asia/Kolkata'
           PLAN_KEYS = {'timezone', 'ff_start', 'ff_end', 'webinar_date', 'webinar_time', 'slot',
-                       'zoom_search_from', 'zoom_search_to', 'captured_at', 'ff_start_time'}
+                       'zoom_search_from', 'zoom_search_to', 'captured_at', 'ff_start_time',
+                       'ac_date', 'ac_list_id', 'ac_list_name', 'ac_list_scope'}
 
 
           def load_plan():
@@ -1312,7 +1462,7 @@ jobs:
                       or plan['slot'] not in ('morning', 'evening')
                       or plan['webinar_time'] != ('11:00' if plan['slot'] == 'morning' else '19:30')):
                   raise RuntimeError('Run plan is invalid.')
-              for key in ('ff_start', 'ff_end', 'webinar_date', 'zoom_search_from', 'zoom_search_to'):
+              for key in ('ff_start', 'ff_end', 'webinar_date', 'zoom_search_from', 'zoom_search_to', 'ac_date'):
                   date.fromisoformat(plan[key])
               datetime.fromisoformat(plan['captured_at'])
               return plan
@@ -2382,7 +2532,8 @@ jobs:
 
           TZ_NAME = 'Asia/Kolkata'
           PLAN_KEYS = {'timezone', 'ff_start', 'ff_end', 'webinar_date', 'webinar_time', 'slot',
-                       'zoom_search_from', 'zoom_search_to', 'captured_at', 'ff_start_time'}
+                       'zoom_search_from', 'zoom_search_to', 'captured_at', 'ff_start_time',
+                       'ac_date', 'ac_list_id', 'ac_list_name', 'ac_list_scope'}
 
 
           def load_plan():
@@ -2399,7 +2550,7 @@ jobs:
                       or plan['slot'] not in ('morning', 'evening')
                       or plan['webinar_time'] != ('11:00' if plan['slot'] == 'morning' else '19:30')):
                   raise RuntimeError('Run plan is invalid.')
-              for key in ('ff_start', 'ff_end', 'webinar_date', 'zoom_search_from', 'zoom_search_to'):
+              for key in ('ff_start', 'ff_end', 'webinar_date', 'zoom_search_from', 'zoom_search_to', 'ac_date'):
                   date.fromisoformat(plan[key])
               datetime.fromisoformat(plan['captured_at'])
               return plan
@@ -2580,71 +2731,22 @@ jobs:
                   raise RuntimeError('ActiveCampaign group is too large for one workflow run.')
 
               def event_contacts(self, plan):
-                  event_date = date.fromisoformat(plan['webinar_date'])
-                  event_time = plan['webinar_time']
-                  month = 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split()[event_date.month - 1]
-                  lists = self.pages('lists', 'lists', {'filters[name][contains]': str(event_date.day) + ' ' + month,
-                                                        'orders[name]': 'ASC'})
-                  clock = r'(?:0?[1-9]|1[0-2])(?::[0-5][0-9])?\s*[AP]M|(?:[01]?[0-9]|2[0-3]):[0-5][0-9]'
-                  divider = r'\s*[-|\u2013\u2014]?\s*'
-                  pattern = re.compile(
-                      r'^0?' + str(event_date.day) + r'\s+' + month + r'\s+' + str(event_date.year)
-                      + divider + r'(?:(?P<before>' + clock + r')' + divider + r')?'
-                      + r'Flexi\s+Genie\s+10\s+Mins?\s+Business\s+Workshop'
-                      + r'(?:' + divider + r'(?P<after>' + clock + r'))?\s*$', re.I)
-
-                  def declared_time(item):
-                      title = str(item.get('name', '')).strip()
-                      if '\n' in title or '\r' in title:
-                          return False, None
-                      match = pattern.fullmatch(title)
-                      if not match or (match.group('before') and match.group('after')):
-                          return False, None
-                      token = match.group('before') or match.group('after')
-                      if token is None:
-                          return True, None
-                      token = re.sub(r'\s+', '', token).upper()
-                      for fmt in ('%I:%M%p', '%I%p', '%H:%M'):
-                          try:
-                              return True, datetime.strptime(token, fmt).strftime('%H:%M')
-                          except ValueError:
-                              pass
-                      return False, None
-
-                  qualified, untimed = [], []
-                  for item in lists:
-                      valid, clock_time = declared_time(item)
-                      if valid and clock_time == event_time:
-                          qualified.append(item)
-                      elif valid and clock_time is None:
-                          untimed.append(item)
-                  if event_date.weekday() == 6:
-                      candidates = qualified or untimed
-                      scope = 'event_list' if qualified else 'shared_sunday_list'
-                  else:
-                      candidates = qualified + untimed
-                      scope = 'event_list'
-                  if not candidates:
-                      raise RuntimeError('No "Flexi Genie 10 Mins Business Workshop" ActiveCampaign list found for '
-                                         + event_date.isoformat() + ' at ' + event_time + '.')
-                  ranked = []
-                  for item in candidates:
-                      data = self.get('contacts', {'listid': item['id'], 'status': 1, 'meta': 'only'})
-                      try:
-                          count = int(data['meta']['total'])
-                      except (KeyError, TypeError, ValueError):
-                          raise RuntimeError('Cannot verify the active contact count for a matching list.') from None
-                      ranked.append((count, item))
-                  _, selected = max(ranked, key=lambda entry: entry[0])
-                  records = self.pages('contacts', 'contacts', {'listid': selected['id'], 'status': 1, 'orders[id]': 'ASC'})
+                  """Read the exact "10 Min Business" list the prepare job picked for the ActiveCampaign date."""
+                  list_id = str(plan['ac_list_id'])
+                  data = self.get('lists/' + list_id, {})
+                  current = str((data.get('list') or {}).get('name', ''))
+                  if current != plan['ac_list_name']:
+                      raise RuntimeError('ActiveCampaign list ' + list_id + ' is now named "' + current
+                                         + '" instead of "' + plan['ac_list_name'] + '". Rerun the workflow.')
+                  records = self.pages('contacts', 'contacts', {'listid': list_id, 'status': 1, 'orders[id]': 'ASC'})
                   rows = [{'name': ' '.join(str(c.get(k) or '').strip() for k in ('firstName', 'lastName')).strip(),
                            'email': str(c.get('email') or '').strip(), 'phone': str(c.get('phone') or '').strip()}
                           for c in records]
-                  print('ActiveCampaign list selected:', selected['name'], '| active contacts:', len(rows))
-                  if scope == 'shared_sunday_list':
+                  print('ActiveCampaign list (date ' + plan['ac_date'] + '):', current, '| active contacts:', len(rows))
+                  if plan['ac_list_scope'] == 'shared_sunday_list':
                       print('ActiveCampaign: shared Sunday list; this count combines both Sunday sessions.')
-                  return rows, {'id': str(selected['id']), 'name': selected['name'], 'active_count': len(rows),
-                                'scope': scope}
+                  return rows, {'id': list_id, 'name': current, 'active_count': len(rows),
+                                'scope': plan['ac_list_scope']}
 
           # ---------------------------------------------------------------- Zoom artifact
 
@@ -2872,7 +2974,8 @@ jobs:
               webinar_date = date.fromisoformat(plan['webinar_date'])
               tz = ZoneInfo(plan['timezone'])
               print('FlexiFunnels/UTM range:', plan['ff_start'], 'to', plan['ff_end'],
-                    '| webinar:', plan['webinar_date'], plan['webinar_time'], 'IST')
+                    '| webinar:', plan['webinar_date'], plan['webinar_time'], 'IST',
+                    '| ActiveCampaign date:', plan['ac_date'])
 
               # STAGE 0: load every source
               utm_business = load_identity_csv(Path('utm/business.csv'))
@@ -3000,7 +3103,7 @@ jobs:
                       + ' unique (email+phone).'),
                   5: ('UTM tabs "' + snapshot['business_tab'] + '" + "' + snapshot['registration_tab']
                       + '", filtered ' + ff_range + '; ' + str(len(merged_utm)) + ' unique.'),
-                  6: ('ActiveCampaign list: ' + selected_list['name']
+                  6: ('ActiveCampaign list (date ' + plan['ac_date'] + '): ' + selected_list['name']
                       + (' (shared Sunday list: includes both Sunday sessions).'
                          if selected_list['scope'] == 'shared_sunday_list' else '.')),
                   7: ('Zoom All registrants, webinar ID ' + zoom_report['webinar_id'] + '. UTM not in Zoom: '
