@@ -44,6 +44,16 @@ on:
         description: "ActiveCampaign: date written in the '10 Min Business' list name (2026-10-21 or 21-10-2026)"
         type: string
         required: true
+      ac_list_encore:
+        description: "ActiveCampaign: tick for the ENCORE list (name contains 'Encore'); leave unticked for the regular list"
+        type: boolean
+        required: false
+        default: false
+      ac_list_name:
+        description: "ActiveCampaign (optional): exact list name, e.g. '25 Oct 2026 Flexi Genie 10 Mins Business Workshop Encore'. Blank = auto-pick by date + Encore box"
+        type: string
+        required: false
+        default: ""
 
 concurrency:
   group: flexifunnels-discrepancy-sheets
@@ -93,6 +103,8 @@ jobs:
           ZOOM_WEBINAR_TIME: ${{ inputs.zoom_webinar_time }}
           FF_START_TIME: ${{ inputs.ff_start_time }}
           AC_LIST_DATE: ${{ inputs.ac_list_date }}
+          AC_LIST_ENCORE: ${{ inputs.ac_list_encore }}
+          AC_LIST_NAME: ${{ inputs.ac_list_name }}
         run: |
           python -u - <<'PY'
           import base64
@@ -242,8 +254,10 @@ jobs:
 
           # ---- ActiveCampaign list picker ------------------------------------------------
           # Picks ONLY the "10 Min Business" list for the ActiveCampaign date you entered.
-          # It never falls back to the first list: if nothing (or more than one) matches, the run
-          # stops here, before any FlexiFunnels/Zoom work, and the log shows every list on that date.
+          # The "Encore" checkbox decides between the regular list and the Encore list.
+          # If you type an exact list name, that list is used (it must agree with the Encore box).
+          # It never guesses: if nothing (or more than one) matches, the run stops here,
+          # before any FlexiFunnels/Zoom work, and the log shows every list on that date.
           MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july',
                     'august', 'september', 'october', 'november', 'december']
 
@@ -275,6 +289,15 @@ jobs:
               text = ac_text(name)
               return (re.search(r'(?<!\d)10\s*-?\s*min(?:ute)?s?(?![a-z])', text) is not None
                       and re.search(r'\bbusiness\b', text) is not None)
+
+
+          def ac_is_encore(name):
+              """True when the list name contains the word Encore."""
+              return re.search(r'\bencore\b', ac_text(name)) is not None
+
+
+          def ac_kind(want_encore):
+              return 'Encore' if want_encore else 'regular (non-Encore)'
 
 
           def ac_clock(name):
@@ -332,22 +355,60 @@ jobs:
               raise RuntimeError('Too many ActiveCampaign lists to read in one run.')
 
 
-          def resolve_ac_list(ac_date, webinar_time):
+          def resolve_ac_list(ac_date, webinar_time, want_encore, exact_name):
               lists = ac_all_lists()
               dated = [item for item in lists if ac_name_has_date(item.get('name', ''), ac_date)]
               print('ActiveCampaign: lists read:', len(lists), '| lists with', ac_date.isoformat(),
                     'in the name:', len(dated))
               for item in dated:
-                  print('   -', item.get('name'), '(id ' + str(item.get('id')) + ')',
-                        '<- 10 Min Business' if ac_is_10min_business(item.get('name', '')) else '')
+                  name = item.get('name', '')
+                  tag = ''
+                  if ac_is_10min_business(name):
+                      tag = '<- 10 Min Business' + (' (Encore)' if ac_is_encore(name) else ' (regular)')
+                  print('   -', name, '(id ' + str(item.get('id')) + ')', tag)
+              print('ActiveCampaign: Encore box ticked:', 'yes' if want_encore else 'no',
+                    '-> looking for the', ac_kind(want_encore), 'list')
+
+              # ---- A. Exact list name typed in the form -----------------------------------
+              if exact_name:
+                  named = [item for item in lists if ac_text(item.get('name', '')) == ac_text(exact_name)]
+                  if not named:
+                      raise RuntimeError('No ActiveCampaign list is named exactly "' + exact_name + '". Lists on '
+                                         + ac_date.isoformat() + ': '
+                                         + (' | '.join(str(i.get('name')) for i in dated) or 'none') + '.')
+                  if len(named) > 1:
+                      raise RuntimeError('More than one ActiveCampaign list is named "' + exact_name + '": '
+                                         + ' | '.join('id ' + str(i.get('id')) for i in named)
+                                         + '. Rename or remove the duplicate.')
+                  chosen = named[0]
+                  name = chosen.get('name', '')
+                  if ac_is_encore(name) != want_encore:
+                      raise RuntimeError('The list name you typed ("' + name + '") is '
+                                         + ('an Encore' if ac_is_encore(name) else 'a regular (non-Encore)')
+                                         + ' list, but the Encore box was ' + ('ticked' if want_encore else 'not ticked')
+                                         + '. Fix the box or the name and rerun.')
+                  if not ac_is_10min_business(name):
+                      print('ActiveCampaign WARNING: typed list does not look like a "10 Min Business" list.')
+                  if not ac_name_has_date(name, ac_date):
+                      print('ActiveCampaign WARNING: typed list name does not contain', ac_date.isoformat())
+                  print('ActiveCampaign list chosen (typed name):', name, '(id ' + str(chosen.get('id')) + ')')
+                  return chosen, 'event_list'
+
+              # ---- B. Auto-pick by date + Encore box ---------------------------------------
               business = [item for item in dated if ac_is_10min_business(item.get('name', ''))]
               if not business:
                   raise RuntimeError('No ActiveCampaign "10 Min Business" list found for ' + ac_date.isoformat()
                                      + '. Lists on that date: '
                                      + (' | '.join(str(i.get('name')) for i in dated) or 'none')
                                      + '. Check the ActiveCampaign date you entered.')
+              wanted = [item for item in business if ac_is_encore(item.get('name', '')) == want_encore]
+              if not wanted:
+                  raise RuntimeError('No ' + ac_kind(want_encore) + ' "10 Min Business" list found for '
+                                     + ac_date.isoformat() + '. The lists on that date are: '
+                                     + ' | '.join(str(i.get('name')) for i in business)
+                                     + '. ' + ('Untick' if want_encore else 'Tick') + ' the Encore box if you meant that one.')
               exact, untimed, other = [], [], []
-              for item in business:
+              for item in wanted:
                   clock = ac_clock(item.get('name', ''))
                   if clock == webinar_time:
                       exact.append(item)
@@ -357,16 +418,19 @@ jobs:
                       other.append(item)
               pool = exact or untimed
               if not pool:
-                  raise RuntimeError('The "10 Min Business" lists on ' + ac_date.isoformat() + ' are for other times: '
-                                     + ' | '.join(str(i.get('name')) for i in other)
+                  raise RuntimeError('The ' + ac_kind(want_encore) + ' "10 Min Business" lists on ' + ac_date.isoformat()
+                                     + ' are for other times: ' + ' | '.join(str(i.get('name')) for i in other)
                                      + '. Check the Zoom webinar time you chose.')
               if len(pool) > 1:
-                  raise RuntimeError('More than one ActiveCampaign "10 Min Business" list matches '
+                  raise RuntimeError('More than one ' + ac_kind(want_encore) + ' "10 Min Business" list matches '
                                      + ac_date.isoformat() + ' ' + webinar_time + ' (not guessing): '
                                      + ' | '.join(str(i.get('name')) + ' (id ' + str(i.get('id')) + ')' for i in pool)
-                                     + '. Put the time in the list names or remove the duplicate list.')
+                                     + '. Type the exact list name in the "ActiveCampaign list name" field.')
               chosen = pool[0]
-              scope = 'event_list' if exact or ac_date.weekday() != 6 else 'shared_sunday_list'
+              # A Sunday list is "shared" only when it has no time and is the ONLY 10 Min Business
+              # list that day (no separate Encore list for the second session).
+              shared = not exact and ac_date.weekday() == 6 and len(business) == 1
+              scope = 'shared_sunday_list' if shared else 'event_list'
               print('ActiveCampaign list chosen:', chosen.get('name'), '(id ' + str(chosen.get('id')) + ')')
               if scope == 'shared_sunday_list':
                   print('ActiveCampaign: Sunday list has no time in its name; it covers both Sunday sessions.')
@@ -374,7 +438,7 @@ jobs:
 
 
           print('=' * 60)
-          print('DISCREPANCY TRACKER — VERSION 22 (manual dates + ActiveCampaign date)')
+          print('DISCREPANCY TRACKER — VERSION 23 (manual dates + ActiveCampaign date + Encore choice)')
           print('=' * 60)
 
           required = ['GOOGLE_SERVICE_ACCOUNT_JSON', 'RAW_DATA_SHEET_ID', 'UTM_SHEET_ID',
@@ -390,6 +454,8 @@ jobs:
           ff_end = parse_input_date(os.environ.get('FF_END_DATE'), 'FlexiFunnels end date')
           webinar_date = parse_input_date(os.environ.get('ZOOM_WEBINAR_DATE'), 'Zoom webinar date')
           ac_date = parse_input_date(os.environ.get('AC_LIST_DATE'), 'ActiveCampaign list date')
+          ac_want_encore = os.environ.get('AC_LIST_ENCORE', 'false').strip().casefold() == 'true'
+          ac_exact_name = ' '.join(os.environ.get('AC_LIST_NAME', '').split())
           if ff_start > ff_end:
               raise RuntimeError('FlexiFunnels start date ' + ff_start.isoformat() + ' is after the end date '
                                  + ff_end.isoformat() + '.')
@@ -421,12 +487,14 @@ jobs:
                   'captured_at': now.isoformat(timespec='seconds')}
           print('FlexiFunnels + UTM window: after', plan['ff_start'], start_choice, 'through end of', plan['ff_end'])
           print('Zoom webinar:', plan['webinar_date'], time_choice, 'IST')
-          print('ActiveCampaign list date:', ac_date.isoformat(), '| time:', time_choice)
+          print('ActiveCampaign list date:', ac_date.isoformat(), '| time:', time_choice,
+                '| Encore:', 'yes' if ac_want_encore else 'no',
+                '| typed name:', ac_exact_name or '(none, auto-pick)')
           if ac_date != webinar_date:
               print('Note: ActiveCampaign date differs from the Zoom webinar date (as entered).')
 
           # ---- 2. Pick the ActiveCampaign "10 Min Business" list (fails fast) -------------
-          ac_list, ac_scope = resolve_ac_list(ac_date, webinar_time)
+          ac_list, ac_scope = resolve_ac_list(ac_date, webinar_time, ac_want_encore, ac_exact_name)
           plan.update({'ac_date': ac_date.isoformat(), 'ac_list_id': str(ac_list['id']),
                        'ac_list_name': str(ac_list['name']), 'ac_list_scope': ac_scope})
 
@@ -563,7 +631,7 @@ jobs:
           EXPECTED_LANDING_URL = 'https://sb.flexifunnels.com/funnel-agent'
           EXPECTED_REG_URL = 'https://sb.flexifunnels.com/flexi-genie-regteam'
 
-          print('WORKFLOW REVISION: V22 — manual FlexiFunnels date range')
+          print('WORKFLOW REVISION: V23 — manual FlexiFunnels date range')
           if not EMAIL or not PASSWORD:
               raise RuntimeError('FlexiFunnels credentials missing.')
           if PROJECT_URL.rstrip('/') != EXPECTED_PROJECT_URL:
@@ -1367,9 +1435,9 @@ jobs:
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 22: both CSVs verified; Google Sheets untouched in this job.')
+                  print('VERSION 23: both CSVs verified; Google Sheets untouched in this job.')
               except Exception as error:
-                  print('VERSION 22 stopped:', type(error).__name__, str(error))
+                  print('VERSION 23 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
@@ -2975,7 +3043,7 @@ jobs:
               tz = ZoneInfo(plan['timezone'])
               print('FlexiFunnels/UTM range:', plan['ff_start'], 'to', plan['ff_end'],
                     '| webinar:', plan['webinar_date'], plan['webinar_time'], 'IST',
-                    '| ActiveCampaign date:', plan['ac_date'])
+                    '| ActiveCampaign date:', plan['ac_date'], '| list:', plan['ac_list_name'])
 
               # STAGE 0: load every source
               utm_business = load_identity_csv(Path('utm/business.csv'))
