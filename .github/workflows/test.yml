@@ -438,7 +438,7 @@ jobs:
 
 
           print('=' * 60)
-          print('DISCREPANCY TRACKER — VERSION 23 (manual dates + ActiveCampaign date + Encore choice)')
+          print('DISCREPANCY TRACKER — VERSION 24 (DESCREPANCY = every tab checked against Zoom)')
           print('=' * 60)
 
           required = ['GOOGLE_SERVICE_ACCOUNT_JSON', 'RAW_DATA_SHEET_ID', 'UTM_SHEET_ID',
@@ -3104,12 +3104,18 @@ jobs:
               ff_business, ff_reg = stored[key('LANDING PAGE')], stored[key('LANDING PAGE REG')]
               merged_utm, ac_rows, zoom_rows = stored[key('UTM')], stored[key('ACTIVE CAMPAIGN')], stored[key('ZOOM')]
 
-              # STAGE 3: discrepancy = UTM people missing from Zoom.
-              # DISCREPANCY_MATCH decides when a UTM person counts as "found in Zoom":
-              #   'email'          -> same email in Zoom (like a VLOOKUP/COUNTIF on email)
-              #   'email_or_phone' -> same email OR same phone
-              #   'email_and_phone'-> same email AND same phone
+              # STAGE 3: DESCREPANCY = everyone in ANY source tab who is NOT in ZOOM.
+              # Tabs checked against ZOOM: UTM, LANDING PAGE, LANDING PAGE REG and ACTIVE CAMPAIGN.
+              # The result has one row per email (Zoom registers people by email), ready to import into Zoom.
+              # DISCREPANCY_MATCH decides when a person counts as "already in Zoom":
+              #   'email'           -> same email in Zoom (what a VLOOKUP/COUNTIF on email does)
+              #   'email_or_phone'  -> same email OR same phone
+              #   'email_and_phone' -> same email AND same phone
               DISCREPANCY_MATCH = 'email'
+              # A Sunday ActiveCampaign list with no time in its name covers BOTH Sunday sessions.
+              # Checking it against one session's Zoom would push the other session's people into
+              # this webinar, so it is skipped unless this is set to True.
+              INCLUDE_SHARED_SUNDAY_AC = False
               zoom_emails = {clean_email(r['email']) for r in zoom_rows if clean_email(r['email'])}
               zoom_phones = {normalized_phone(r['phone']) for r in zoom_rows if len(normalized_phone(r['phone'])) >= 7}
               zoom_pairs = {(clean_email(r['email']), normalized_phone(r['phone'])) for r in zoom_rows}
@@ -3122,11 +3128,55 @@ jobs:
                       return (email, phone) in zoom_pairs
                   return (bool(email) and email in zoom_emails) or (len(phone) >= 7 and phone in zoom_phones)
 
+              def importable_email(value):
+                  email = clean_email(value)
+                  return email if re.fullmatch(r'[^@]+@[^@]+\.[^@]+', email) else ''
+
+              check_tabs = [('UTM', merged_utm), ('LANDING PAGE', ff_business), ('LANDING PAGE REG', ff_reg)]
+              ac_skipped = selected_list['scope'] == 'shared_sunday_list' and not INCLUDE_SHARED_SUNDAY_AC
+              if ac_skipped:
+                  print('STAGE 3: ACTIVE CAMPAIGN not checked - this Sunday list covers both Sunday sessions.')
+              else:
+                  check_tabs.append(('ACTIVE CAMPAIGN', ac_rows))
+
+              def missing_from_zoom(rule):
+                  """People in any checked tab but not in Zoom: one row per email, per-tab counts,
+                  and the rows with no usable email (Zoom cannot import those)."""
+                  people, per_tab, no_email = {}, {}, []
+                  for label, tab_rows in check_tabs:
+                      missing = new = 0
+                      for row in tab_rows:
+                          if found(row, rule):
+                              continue
+                          missing += 1
+                          email = importable_email(row['email'])
+                          if not email:
+                              no_email.append(row)
+                              continue
+                          kept = people.get(email)
+                          if kept is None:
+                              people[email] = {'name': row['name'], 'email': email, 'phone': row['phone']}
+                              new += 1
+                          else:
+                              kept['name'] = kept['name'] or row['name']
+                              kept['phone'] = kept['phone'] or row['phone']
+                      per_tab[label] = {'rows': len(tab_rows), 'not_in_zoom': missing, 'new_unique': new}
+                  return sorted_records(list(people.values())), per_tab, merge_records(no_email)
+
               for rule in ('email', 'email_or_phone', 'email_and_phone'):
-                  print('Check: UTM missing from Zoom by', rule, '=',
-                        sum(not found(r, rule) for r in merged_utm), 'of', len(merged_utm))
-              discrepancy = merge_records([row for row in merged_utm if not found(row, DISCREPANCY_MATCH)])
-              print('STAGE 3: DESCREPANCY tab (rule:', DISCREPANCY_MATCH + '):', len(discrepancy), 'people')
+                  rule_rows, _, rule_no_email = missing_from_zoom(rule)
+                  print('Check: not in Zoom by', rule, '=', len(rule_rows), 'unique people |',
+                        len(rule_no_email), 'more with no usable email')
+              discrepancy, discrepancy_by_tab, no_email_rows = missing_from_zoom(DISCREPANCY_MATCH)
+              for label, counts in discrepancy_by_tab.items():
+                  print('STAGE 3:', label, '->', counts['not_in_zoom'], 'of', counts['rows'], 'not in Zoom |',
+                        counts['new_unique'], 'not already listed from an earlier tab')
+              write_rows(outdir / 'not-in-zoom-without-email.csv', no_email_rows)
+              if no_email_rows:
+                  print('STAGE 3:', len(no_email_rows), 'people not in Zoom have no usable email, so Zoom cannot '
+                        'import them; they are in not-in-zoom-without-email.csv (comparison artifact).')
+              print('STAGE 3: DESCREPANCY tab (rule:', DISCREPANCY_MATCH + '):', len(discrepancy),
+                    'unique people to import into Zoom')
 
               # Side check (CSV artifact only): each FlexiFunnels page vs its own UTM tab.
               summary = {}
@@ -3174,8 +3224,12 @@ jobs:
                   6: ('ActiveCampaign list (date ' + plan['ac_date'] + '): ' + selected_list['name']
                       + (' (shared Sunday list: includes both Sunday sessions).'
                          if selected_list['scope'] == 'shared_sunday_list' else '.')),
-                  7: ('Zoom All registrants, webinar ID ' + zoom_report['webinar_id'] + '. UTM not in Zoom: '
-                      + str(len(discrepancy)) + '.'),
+                  7: ('Zoom All registrants, webinar ID ' + zoom_report['webinar_id'] + '. Not in Zoom (by '
+                      + DISCREPANCY_MATCH + '): ' + str(len(discrepancy)) + ' unique to import; per tab: '
+                      + ', '.join(label + ' ' + str(c['not_in_zoom']) for label, c in discrepancy_by_tab.items())
+                      + ('; ActiveCampaign not checked (shared Sunday list)' if ac_skipped else '')
+                      + ('; ' + str(len(no_email_rows)) + ' without email left out' if no_email_rows else '')
+                      + '.'),
               }
               run_key = os.environ['GITHUB_RUN_ID'] + '.' + os.environ['GITHUB_RUN_ATTEMPT']
               stats_status = append_stats_row(stats_book, stats_sheet, stats_row, run_key, notes)
@@ -3184,6 +3238,8 @@ jobs:
               (outdir / 'summary.json').write_text(json.dumps({
                   'plan': plan, 'raw_source_counts': raw_counts, 'flexifunnels_vs_utm': summary,
                   'stats_row': stats_row, 'stats_status': stats_status, 'discrepancy': len(discrepancy),
+                  'discrepancy_rule': DISCREPANCY_MATCH, 'discrepancy_by_tab': discrepancy_by_tab,
+                  'activecampaign_checked': not ac_skipped, 'not_in_zoom_without_email': len(no_email_rows),
                   'published_tabs': list(published), 'activecampaign_list': selected_list,
                   'zoom_report': {k: v for k, v in zoom_report.items() if k != 'plan'},
               }, indent=2))
