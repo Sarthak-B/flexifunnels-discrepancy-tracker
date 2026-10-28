@@ -631,7 +631,7 @@ jobs:
           EXPECTED_LANDING_URL = 'https://sb.flexifunnels.com/funnel-agent'
           EXPECTED_REG_URL = 'https://sb.flexifunnels.com/flexi-genie-regteam'
 
-          print('WORKFLOW REVISION: V23.3 — calendar fix + open page from project list')
+          print('WORKFLOW REVISION: V24.1 — direct project navigation with exact page verification')
           if not EMAIL or not PASSWORD:
               raise RuntimeError('FlexiFunnels credentials missing.')
           if PROJECT_URL.rstrip('/') != EXPECTED_PROJECT_URL:
@@ -825,210 +825,169 @@ jobs:
               return original_page
 
 
-          def open_projects(page):
-              print()
-              print('Opening Projects page')
-              page.goto('https://app.flexifunnels.com/projects', wait_until='domcontentloaded', timeout=60000)
-              search_field = None
-              for attempt in range(2):
-                  # Wait up to 45 s for the list to load; close any pop-up that covers it.
-                  deadline = time.monotonic() + 45
-                  while time.monotonic() < deadline:
-                      search_field = unique_visible(page.locator('input[placeholder*="Search" i]'))
-                      if search_field is not None:
-                          break
-                      for close in visible_items(page.locator(
-                              '[aria-label="Close" i], button.close, .modal [data-dismiss="modal"], '
-                              '.modal [data-bs-dismiss="modal"], button:has-text("Skip"), button:has-text("Got it")'), 5):
-                          try:
-                              close.click(timeout=2000)
-                          except Exception:
-                              pass
-                      time.sleep(1)
-                  print('Projects location:', safe_location(page))
-                  if current_path(page) != '/projects':
-                      raise RuntimeError('Projects page inaccessible.')
-                  if search_field is not None:
-                      break
-                  if attempt == 0:
-                      print('Projects search field not visible yet; reloading the page once.')
-                      page.reload(wait_until='domcontentloaded', timeout=60000)
-              if search_field is None:
-                  Path('diagnostics').mkdir(exist_ok=True)
-                  try:
-                      page.screenshot(path='diagnostics/projects.png', full_page=True)
-                  except Exception:
-                      pass
-                  print('Visible search inputs:', len(visible_items(page.locator('input[placeholder*="Search" i]'))))
-                  raise RuntimeError('Projects search field missing (see diagnostics/projects.png).')
-              print('Projects page verified.')
+          def require_project(page):
+              parsed = urlparse(page.url)
+              if (parsed.scheme != 'https' or parsed.netloc != 'app.flexifunnels.com'
+                      or parsed.path.rstrip('/') != urlparse(PROJECT_URL).path.rstrip('/')):
+                  raise RuntimeError('Expected authenticated project kvapNzyj; got ' + safe_location(page))
 
 
-          def select_published_url(page):
-              print()
-              print('Selecting Published URL filter')
-              for select in visible_items(page.locator('select')):
-                  options = select.locator('option')
-                  labels = [options.nth(i).inner_text().strip() for i in range(options.count())]
-                  if 'Published URL' in labels:
-                      select.select_option(label='Published URL')
-                      print('Published URL selected using native dropdown.')
-                      return
-              dropdown = first_unique_visible([
-                  page.get_by_role('button', name=re.compile(r'Project Name', re.IGNORECASE)),
-                  page.get_by_role('combobox', name=re.compile(r'Project', re.IGNORECASE)),
-                  page.get_by_text('Project Name', exact=True),
-              ])
-              if dropdown is None:
-                  raise RuntimeError('Project Name dropdown missing.')
-              dropdown.click(timeout=15000)
-              print('Project Name dropdown opened.')
-              page.wait_for_timeout(700)
-              option = first_unique_visible([
-                  page.get_by_role('option', name=re.compile(r'^\s*Published URL\s*$', re.IGNORECASE)),
-                  page.get_by_role('menuitem', name=re.compile(r'^\s*Published URL\s*$', re.IGNORECASE)),
-                  page.get_by_text('Published URL', exact=True),
-              ])
-              if option is None:
-                  raise RuntimeError('Published URL option missing.')
-              option.click(timeout=15000)
-              print('Published URL selected.')
-
-
-          def wait_for_project_page(page, seconds):
-              project_path = urlparse(PROJECT_URL).path.rstrip('/')
-              deadline = time.monotonic() + seconds
-              while time.monotonic() < deadline:
-                  if current_path(page) == project_path:
-                      return True
-                  time.sleep(0.5)
-              return current_path(page) == project_path
-
-
-          def search_published_url(page, published_url):
-              """Search by published URL and make sure the project actually opens.
-              FlexiFunnels does not always jump straight to the project (it can leave the
-              results on /projects), so this waits, clicks the matching project link if one
-              is shown, and otherwise opens the page from the project's own page list."""
-              project_path = urlparse(PROJECT_URL).path.rstrip('/')
-              for attempt in range(1, 2):
-                  print()
-                  print('Entering published URL')
-                  search_field = unique_visible(page.locator('input[placeholder*="Search" i]'))
-                  if search_field is None:
-                      raise RuntimeError('Published URL search field missing.')
-                  search_field.fill('')
-                  search_field.fill(published_url)
-                  print('Published URL entered.')
-                  search_button = unique_visible(page.get_by_role('button', name=re.compile(r'^\s*Search\s*$', re.IGNORECASE)))
-                  if search_button is not None:
-                      print('Clicking Search.')
-                      search_button.click(timeout=15000)
-                  else:
-                      print('No separate Search button. Pressing Enter.')
-                      search_field.press('Enter')
-                  print('Published URL search submitted.')
-                  opened = wait_for_project_page(page, 20)
-                  print('Location after search:', safe_location(page))
-                  if opened:
-                      return
-                  links = visible_items(page.locator('a[href*="' + project_path + '"]'))
-                  print('Search stayed on Projects; links to the project visible:', len(links))
-                  if links:
-                      links[0].click(timeout=15000)
-                      if wait_for_project_page(page, 20):
-                          print('Opened the project from the search results:', safe_location(page))
-                          return
-                  Path('diagnostics').mkdir(exist_ok=True)
-                  try:
-                      page.screenshot(path='diagnostics/projects-search-attempt-' + str(attempt) + '.png', full_page=True)
-                  except Exception:
-                      pass
-              print('Projects search did not open the project; opening the page from the project page list instead.')
-              open_page_from_project_sidebar(page, published_url)
+          def overview_card(page):
+              more = unique_visible(page.get_by_text('More', exact=True))
+              if more is None:
+                  return None
+              card = more.locator("xpath=ancestor::*[contains(., 'Page Id')][1]")
+              if card.count() != 1 or not card.is_visible():
+                  return None
+              # Never accept an ancestor that accidentally includes the page list.
+              if card.locator('input[placeholder*="Search pages" i]').count():
+                  return None
+              return card
 
 
           def overview_urls(page):
-              """Published web addresses currently shown on the page (input boxes or plain text)."""
+              card = overview_card(page)
+              if card is None:
+                  return set()
               found = set()
-              for field in visible_items(page.locator('input'), 120):
-                  try:
-                      value = field.input_value().strip()
-                  except Exception:
-                      continue
-                  if re.match(r'^https?://\S+$', value):
+              for field in visible_items(card.locator('input'), 120):
+                  value = field.input_value().strip()
+                  if re.fullmatch(r'https?://\S+', value):
                       found.add(value.rstrip('/'))
-              for item in visible_items(page.get_by_text(re.compile(r'^\s*https?://\S+\s*$')), 60):
-                  try:
-                      found.add(item.inner_text().strip().rstrip('/'))
-                  except Exception:
-                      pass
+              for item in visible_items(card.get_by_text(re.compile(r'^\s*https?://\S+\s*$')), 120):
+                  found.add(item.inner_text().strip().rstrip('/'))
               return found
 
 
+          def project_page_names(page):
+              search = wait_unique(page.locator('input[placeholder*="Search pages" i]'), 'Project page search', 45)
+              if search.input_value():
+                  search.fill('')
+              # The recording shows a narrow left column with a Pages heading and search.
+              # Identify that column by its layout, not by the ED badges or framework classes.
+              names = search.evaluate('''input => {
+                  document.querySelectorAll('[data-ff-page-list]').forEach(el => el.removeAttribute('data-ff-page-list'));
+                  const searchBox = input.getBoundingClientRect();
+                  for (let root = input.parentElement; root && root !== document.body; root = root.parentElement) {
+                      const box = root.getBoundingClientRect();
+                      if (box.width > innerWidth * 0.45) break;
+                      if (!Array.from(root.querySelectorAll('*')).some(el => el.textContent.trim() === 'Pages')) continue;
+                      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                      const names = new Set();
+                      let node;
+                      while ((node = walker.nextNode())) {
+                          const el = node.parentElement, text = node.textContent.trim();
+                          if (!el || text.length < 3 || !/[a-z]/i.test(text)) continue;
+                          if (el.closest('button, input, script, style')) continue;
+                          const rect = el.getBoundingClientRect(), style = getComputedStyle(el);
+                          if (!rect.width || !rect.height || style.visibility === 'hidden' || style.display === 'none') continue;
+                          if (rect.top < searchBox.bottom || rect.left < box.left || rect.right > box.right + 2) continue;
+                          if (/^(?:Add New Page|Pages|Load more|Show more)$/i.test(text)) continue;
+                          names.add(text);
+                      }
+                      if (names.size) {
+                          root.setAttribute('data-ff-page-list', 'true');
+                          return Array.from(names);
+                      }
+                  }
+                  return [];
+              }''')
+              return names
+
+
+          def save_navigation_diagnostic(page, seen):
+              Path('diagnostics').mkdir(exist_ok=True)
+              Path('diagnostics/project-navigation.json').write_text(json.dumps({
+                  'location': safe_location(page), 'pages_checked': seen,
+                  'page_search_controls': len(visible_items(page.locator('input[placeholder*="Search pages" i]'))),
+                  'overview_available': overview_card(page) is not None,
+              }, indent=2))
+
+
           def open_page_from_project_sidebar(page, published_url):
-              """Open the project directly and click through its page list (left sidebar)
-              until the Overview shows the requested published URL. Both landing pages live in
-              this one project, so this does not depend on the Projects search at all."""
               target = published_url.rstrip('/')
+              print('Opening authenticated project directly:', EXPECTED_PROJECT_URL)
               page.goto(PROJECT_URL, wait_until='domcontentloaded', timeout=60000)
               if not wait_for_project_page(page, 30):
-                  raise RuntimeError('Project page did not open from its direct address.')
-              search = wait_unique(page.locator('input[placeholder*="Search pages" i]'), 'Project page list', 45)
-              sidebar = search.locator(
-                  "xpath=ancestor::*[count(.//*[not(*) and string-length(normalize-space(.))=2 and "
-                  "normalize-space(.)=translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz',"
-                  "'ABCDEFGHIJKLMNOPQRSTUVWXYZ')])>=3][1]")
-              if sidebar.count() != 1:
-                  raise RuntimeError('Project page list could not be identified.')
-              badge_pattern = re.compile(r'^\s*[A-Z]{2}\s*$')
-              deadline = time.monotonic() + 30
-              total = 0
+                  raise RuntimeError('Direct project navigation failed; no export attempted.')
+              require_project(page)
+              wait_unique(page.locator('input[placeholder*="Search pages" i]'), 'Project page search', 45)
+              seen, checked = [], set()
+              deadline = time.monotonic() + 300
               while time.monotonic() < deadline:
-                  total = sidebar.get_by_text(badge_pattern).count()
-                  if total:
-                      break
-                  time.sleep(0.5)
-              print('Project page list loaded; pages listed:', total)
-              page.wait_for_timeout(2000)
-              if target in overview_urls(page):
-                  print('Requested page is already open in Overview.')
-                  return
-              seen = []
-              for index in range(total):
-                  badge = sidebar.get_by_text(badge_pattern).nth(index)
-                  try:
-                      badge.scroll_into_view_if_needed(timeout=5000)
-                      name = ' '.join(badge.locator('xpath=..').inner_text().split())[:60]
-                  except Exception:
-                      name = '?'
-                  before = overview_urls(page)
-                  try:
-                      badge.locator('xpath=..').click(timeout=5000)
-                  except Exception:
-                      badge.click(timeout=5000)
-                  urls, settle_until, last = set(), time.monotonic() + 8, None
-                  while time.monotonic() < settle_until:
-                      urls = overview_urls(page)
-                      if target in urls:
-                          print('Found the page in the project list: #' + str(index + 1), name)
+                  require_project(page)
+                  if target in overview_urls(page):
+                      verify_overview(page, target)
+                      print('Correct page verified by its exact published URL:', target)
+                      return
+                  names = project_page_names(page)
+                  remaining = [name for name in names if name not in checked]
+                  if not remaining:
+                      # Also support lists that render more entries when scrolled.
+                      sidebar = page.locator('[data-ff-page-list="true"]')
+                      if sidebar.count() != 1:
+                          time.sleep(0.5)
+                          continue
+                      moved = sidebar.evaluate('''root => {
+                          let moved = false;
+                          for (const el of [root, ...root.querySelectorAll('*')]) {
+                              if (el.scrollHeight > el.clientHeight + 2 && /auto|scroll/.test(getComputedStyle(el).overflowY)) {
+                                  const old = el.scrollTop;
+                                  el.scrollTop += Math.max(100, el.clientHeight - 50);
+                                  moved = moved || el.scrollTop > old;
+                              }
+                          }
+                          return moved;
+                      }''')
+                      if not moved:
+                          break
+                      page.wait_for_timeout(500)
+                      continue
+                  name = remaining[0]
+                  checked.add(name)
+                  candidate = page.locator('[data-ff-page-list="true"]').get_by_text(name, exact=True)
+                  if candidate.count() != 1:
+                      raise RuntimeError('Ambiguous page title in project sidebar: ' + name)
+                  candidate.scroll_into_view_if_needed(timeout=5000)
+                  candidate.click(timeout=10000)
+                  settled_until = time.monotonic() + 5
+                  while time.monotonic() < settled_until:
+                      require_project(page)
+                      if target in overview_urls(page):
+                          verify_overview(page, target)
+                          print('Page selected and URL verified:', name)
                           return
-                      if urls and urls != before:
-                          if last == urls:
-                              break
-                          last = urls
-                      time.sleep(0.7)
-                  seen.append(name + ' -> ' + (', '.join(sorted(urls)) or 'no URL shown'))
-                  print('  page ' + str(index + 1) + ':', seen[-1])
-              Path('diagnostics').mkdir(exist_ok=True)
-              try:
-                  page.screenshot(path='diagnostics/project-page-list.png', full_page=True)
-              except Exception:
-                  pass
-              Path('diagnostics/project-page-list.txt').write_text('\n'.join(seen))
-              raise RuntimeError('No page in the project shows the published URL ' + published_url
-                                 + '. The log lists every page and its URL; check FLEXIFUNNELS_REG_URL / '
-                                 'FLEXIFUNNELS_LANDING_URL against it.')
+                      time.sleep(0.25)
+                  seen.append({'page': name, 'published_urls': sorted(overview_urls(page))})
+              save_navigation_diagnostic(page, seen)
+              raise RuntimeError('Requested published URL was not verified in project kvapNzyj. '
+                                 'See project-navigation.json; no report was exported.')
+
+
+          def wait_for_project_page(page, seconds):
+              deadline = time.monotonic() + seconds
+              while time.monotonic() < deadline:
+                  parsed = urlparse(page.url)
+                  if (parsed.scheme == 'https' and parsed.netloc == 'app.flexifunnels.com'
+                          and parsed.path.rstrip('/') == urlparse(PROJECT_URL).path.rstrip('/')):
+                      return True
+                  time.sleep(0.5)
+              return False
+
+
+          def verify_overview(page, published_url):
+              deadline, stable_since = time.monotonic() + 30, None
+              while time.monotonic() < deadline:
+                  require_project(page)
+                  if published_url.rstrip('/') in overview_urls(page):
+                      if stable_since is None:
+                          stable_since = time.monotonic()
+                      elif time.monotonic() - stable_since >= 2:
+                          return
+                  else:
+                      stable_since = None
+                  time.sleep(0.25)
+              raise RuntimeError('Page Overview did not confirm the exact published URL; stopping.')
 
 
           def wait_unique(locator, description, seconds=30):
@@ -1045,27 +1004,14 @@ jobs:
               wait_unique(page.get_by_text(text, exact=True), text).click()
 
 
-          def verify_overview(page, published_url):
-              deadline = time.monotonic() + 45
-              while time.monotonic() < deadline:
-                  if current_path(page) != urlparse(PROJECT_URL).path.rstrip('/'):
-                      time.sleep(0.5)
-                      continue
-                  values = [x.input_value() for x in visible_items(page.locator('input'))]
-                  exact = visible_items(page.get_by_text(published_url, exact=True))
-                  if published_url in values or len(exact) == 1:
-                      return
-                  time.sleep(0.5)
-              raise RuntimeError('Overview did not confirm the requested published URL.')
-
-
           def open_recorded_reports(page, published_url):
+              verify_overview(page, published_url)
               more = wait_unique(page.get_by_text('More', exact=True), 'Overview More')
               card = more.locator("xpath=ancestor::*[contains(., 'Page Id')][1]")
               if card.count() != 1 or not card.is_visible():
                   raise RuntimeError('Page Overview card could not be identified.')
               card_values = [x.input_value() for x in visible_items(card.locator('input'))]
-              if published_url not in card_values and published_url not in card.inner_text():
+              if published_url.rstrip('/') not in overview_urls(page):
                   raise RuntimeError('Overview card does not contain the requested published URL.')
               locators = [
                   card.get_by_role('button', name='Reports', exact=True),
@@ -1100,13 +1046,16 @@ jobs:
                       raise RuntimeError('Recorded Reports icon cannot be identified uniquely inside Overview.')
                   control = next(iter(matched.values()))
               control.click()
-              page.get_by_text(re.compile(r'^Page Reports')).wait_for(timeout=45000)
+              wait_unique(page.get_by_text(re.compile(r'^\s*Page Reports\b')), 'Page Reports', 45)
+              require_project(page)
               wait_unique(page.get_by_text('Export Data', exact=True), 'Export Data', 45)
 
 
           def choose_recorded_custom_range(page):
               custom_pattern = re.compile(r'^\s*Custom\s+range\s*$', re.IGNORECASE)
               all_time_pattern = re.compile(r'^\s*All\s+Time\s*$', re.IGNORECASE)
+              if unique_visible(page.get_by_text(custom_pattern)) is not None:
+                  return
               deadline = time.monotonic() + 30
               while time.monotonic() < deadline:
                   selects = []
@@ -1353,8 +1302,10 @@ jobs:
 
 
           def set_recorded_date_range(page):
-              click_text(page, 'Filters')
-              print('Filters clicked; waiting for the date control to appear.')
+              require_project(page)
+              if not visible_items(page.get_by_text(re.compile(r'^\s*(?:All\s+Time|Custom\s+range)\s*$', re.IGNORECASE))):
+                  click_text(page, 'Filters')
+              print('Waiting for the date control to appear.')
               choose_recorded_custom_range(page)
               deadline = time.monotonic() + 30
               picker = None
@@ -1504,6 +1455,9 @@ jobs:
               before = wait_downloads_snapshot(page)
               click_text(page, 'Reports')
               count = set_recorded_date_range(page)
+              require_project(page)
+              if not applied_range_matches(page):
+                  raise RuntimeError('Date range changed before export; stopping.')
               wait_unique(page.get_by_text('Export Data', exact=True), 'Export Data').click()
               click_text(page, 'Filtered Data')
               click_text(page, 'Downloads')
@@ -1512,7 +1466,11 @@ jobs:
               last_observed = None
               while time.monotonic() < deadline:
                   current = export_row_metadata(page)
+                  require_project(page)
                   new_rows = new_export_rows(before, current)
+                  if len(new_rows) > 1:
+                      save_export_diagnostic(label, count, before, current)
+                      raise RuntimeError('Multiple new exports appeared; cannot identify this run safely.')
                   observed = [(row['records'], row['status'], row['created']) for row in new_rows]
                   if observed != last_observed:
                       print(label + ': new export states (records, status, created):', observed)
@@ -1523,6 +1481,8 @@ jobs:
                       raise RuntimeError('Multiple new completed exports appeared; cannot identify this export uniquely.')
                   if len(candidates) == 1:
                       chosen = candidates[0]
+                      if any(export_identity(old) == export_identity(chosen) for old in before):
+                          raise RuntimeError('New export identity collides with an older export; stopping.')
                       first = download_rows(page).nth(chosen['index'])
                       cells = first.get_by_role('cell')
                       if (cells.count() >= 5
@@ -1558,15 +1518,17 @@ jobs:
                   page = locate_switched_page(context, page)
                   page.set_default_timeout(15000)
                   for label, published_url in [('funnel-agent', LANDING_URL), ('flexi-genie-regteam', REG_URL)]:
-                      open_projects(page)
-                      select_published_url(page)
-                      search_published_url(page, published_url)
+                      open_page_from_project_sidebar(page, published_url)
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 23: both CSVs verified; Google Sheets untouched in this job.')
+                  print('VERSION 24.1: both CSVs verified; Google Sheets untouched in this job.')
               except Exception as error:
-                  print('VERSION 23 stopped:', type(error).__name__, str(error))
+                  try:
+                      save_navigation_diagnostic(page, [])
+                  except Exception:
+                      pass
+                  print('VERSION 24.1 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
