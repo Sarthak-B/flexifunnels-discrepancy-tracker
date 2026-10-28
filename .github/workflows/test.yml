@@ -631,7 +631,7 @@ jobs:
           EXPECTED_LANDING_URL = 'https://sb.flexifunnels.com/funnel-agent'
           EXPECTED_REG_URL = 'https://sb.flexifunnels.com/flexi-genie-regteam'
 
-          print('WORKFLOW REVISION: V24.3 — apply report dates after Downloads snapshot')
+          print('WORKFLOW REVISION: V24.4 — reuse project and return to Overview for the second page')
           if not EMAIL or not PASSWORD:
               raise RuntimeError('FlexiFunnels credentials missing.')
           if PROJECT_URL.rstrip('/') != EXPECTED_PROJECT_URL:
@@ -906,12 +906,44 @@ jobs:
 
           def open_page_from_project_sidebar(page, published_url):
               target = published_url.rstrip('/')
-              print('Opening authenticated project directly:', EXPECTED_PROJECT_URL)
-              page.goto(PROJECT_URL, wait_until='domcontentloaded', timeout=60000)
-              if not wait_for_project_page(page, 30):
-                  raise RuntimeError('Direct project navigation failed; no export attempted.')
+              parsed = urlparse(page.url)
+              in_project = (parsed.scheme == 'https' and parsed.netloc == 'app.flexifunnels.com'
+                            and parsed.path.rstrip('/') == urlparse(PROJECT_URL).path.rstrip('/'))
+              if not in_project:
+                  print('Opening authenticated project directly:', EXPECTED_PROJECT_URL)
+                  page.goto(PROJECT_URL, wait_until='domcontentloaded', timeout=60000)
+                  if not wait_for_project_page(page, 30):
+                      raise RuntimeError('Direct project navigation failed; no export attempted.')
+              else:
+                  print('Reusing the current project session to select the next page.')
               require_project(page)
-              wait_unique(page.locator('input[placeholder*="Search pages" i]'), 'Project page search', 45)
+              # Reports/Downloads is a view inside this project. Return through its
+              # own Back to Overview control instead of restarting the application.
+              back_pattern = re.compile(r'^\s*Back to Overview\s*$', re.IGNORECASE)
+              back = first_unique_visible([
+                  page.get_by_role('button', name=back_pattern),
+                  page.get_by_role('link', name=back_pattern),
+                  page.get_by_text(back_pattern),
+              ])
+              if back is not None:
+                  back.click(timeout=15000)
+                  wait_unique(page.get_by_text('More', exact=True), 'Page Overview after Reports', 45)
+                  print('Returned from Reports/Downloads to Page Overview.')
+              search = wait_unique(page.locator('input[placeholder*="Search pages" i]'), 'Project page search', 45)
+              if search.input_value():
+                  search.fill('')
+              # The first page selection may leave the list scrolled down. Start
+              # each scan at the top, including independently scrolling child lists.
+              search.evaluate('''input => {
+                  for (let root = input.parentElement; root && root !== document.body; root = root.parentElement) {
+                      if (root.getBoundingClientRect().width > innerWidth * 0.45) break;
+                      for (const el of [root, ...root.querySelectorAll('*')]) {
+                          if (el.scrollHeight > el.clientHeight && /auto|scroll/.test(getComputedStyle(el).overflowY)) {
+                              el.scrollTop = 0;
+                          }
+                      }
+                  }
+              }''')
               seen, checked = [], set()
               deadline = time.monotonic() + 300
               while time.monotonic() < deadline:
@@ -1583,13 +1615,13 @@ jobs:
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 24.3: both CSVs verified; Google Sheets untouched in this job.')
+                  print('VERSION 24.4: both CSVs verified; Google Sheets untouched in this job.')
               except Exception as error:
                   try:
                       save_navigation_diagnostic(page, [])
                   except Exception:
                       pass
-                  print('VERSION 24.3 stopped:', type(error).__name__, str(error))
+                  print('VERSION 24.4 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
