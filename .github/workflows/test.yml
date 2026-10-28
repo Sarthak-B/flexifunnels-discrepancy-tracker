@@ -631,7 +631,7 @@ jobs:
           EXPECTED_LANDING_URL = 'https://sb.flexifunnels.com/funnel-agent'
           EXPECTED_REG_URL = 'https://sb.flexifunnels.com/flexi-genie-regteam'
 
-          print('WORKFLOW REVISION: V24.1 — direct project navigation with exact page verification')
+          print('WORKFLOW REVISION: V24.2 — fresh export identity and Downloads refresh')
           if not EMAIL or not PASSWORD:
               raise RuntimeError('FlexiFunnels credentials missing.')
           if PROJECT_URL.rstrip('/') != EXPECTED_PROJECT_URL:
@@ -1332,7 +1332,7 @@ jobs:
 
 
           def download_rows(page):
-              return page.get_by_role('row').filter(has_text='Filter: Custom')
+              return page.get_by_role('row').filter(has_text='Filter: Custom').filter(visible=True)
 
 
           def downloads_view_ready(page):
@@ -1350,40 +1350,83 @@ jobs:
 
 
           def export_row_metadata(page):
+              import hashlib
+              from urllib.parse import parse_qsl, urlencode
               result = []
               rows = download_rows(page)
               for index in range(rows.count()):
-                  cells = rows.nth(index).get_by_role('cell')
+                  row = rows.nth(index)
+                  cells = row.get_by_role('cell')
                   if cells.count() < 5:
                       continue
-                  result.append({'index': index,
-                                 'details': ' '.join(cells.nth(0).inner_text().split()),
-                                 'records': cells.nth(1).inner_text().strip(),
-                                 'status': cells.nth(2).inner_text().strip(),
-                                 'created': ' '.join(cells.nth(3).inner_text().split())})
+                  stable = row.get_attribute('data-export-id') or row.get_attribute('data-file-id')
+                  if stable:
+                      stable = 'export-id:' + stable
+                  else:
+                      links = cells.nth(4).locator('a[href]')
+                      targets = set()
+                      for link in visible_items(links):
+                          href = link.get_attribute('href') or ''
+                          parsed = urlparse(href)
+                          if parsed.scheme not in ('', 'https', 'http') or parsed.path in ('', '/'):
+                              continue
+                          # Ignore expiring signatures; never store signed download URLs in diagnostics.
+                          ids = [(key, value) for key, value in parse_qsl(parsed.query)
+                                 if key.lower() in ('id', 'file', 'file_id', 'export', 'export_id', 'filename', 'key')]
+                          targets.add(parsed.netloc + parsed.path + '?' + urlencode(sorted(ids)))
+                      if len(targets) == 1:
+                          stable = 'download:' + targets.pop()
+                  result.append({
+                      'index': index,
+                      'details': ' '.join(cells.nth(0).inner_text().split()),
+                      'records': cells.nth(1).inner_text().strip(),
+                      'status': cells.nth(2).inner_text().strip(),
+                      'created': ' '.join(cells.nth(3).inner_text().split()),
+                      'file_key': hashlib.sha256(stable.encode()).hexdigest() if stable else '',
+                  })
               return result
 
 
           def export_identity(row):
-              return row['details'], row['created']
+              return row['details'], row['created'], row.get('file_key', '')
 
 
-          def new_export_rows(before, current):
+          def export_created_minute(row):
+              value = re.sub(r'\s+(?:Kolkata|IST|Asia/Kolkata)\s*$', '', row['created'], flags=re.I).strip()
+              for fmt in ('%d %b %Y / %I:%M %p', '%d %B %Y / %I:%M %p',
+                          '%d %b %Y %I:%M %p', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M'):
+                  try:
+                      return datetime.strptime(value, fmt).replace(tzinfo=ZoneInfo(TZ_NAME), second=0, microsecond=0)
+                  except ValueError:
+                      pass
+              return None
+
+
+          def new_export_rows(before, current, requested_at=None):
+              # A surplus count of identical display rows cannot identify which row is new.
+              # Only a unique, previously unseen identity is eligible for download.
               from collections import Counter
-              old = Counter(export_identity(row) for row in before)
-              now = Counter(export_identity(row) for row in current)
-              surplus = now - old
+              old = {export_identity(row) for row in before}
+              counts = Counter(export_identity(row) for row in current)
               result = []
               for row in current:
                   key = export_identity(row)
-                  if surplus[key] > 0:
-                      result.append(row)
-                      surplus[key] -= 1
+                  if key in old or counts[key] != 1:
+                      continue
+                  # A missing file key becoming available on an old pending row is not a new export.
+                  if any((prior['details'], prior['created']) == (row['details'], row['created'])
+                         and not prior.get('file_key') for prior in before):
+                      continue
+                  if requested_at is not None:
+                      created = export_created_minute(row)
+                      if created is None or not requested_at.replace(second=0, microsecond=0) <= created <= datetime.now(ZoneInfo(TZ_NAME)):
+                          continue
+                  result.append(row)
               return result
 
 
-          def completed_export_candidates(before, current):
-              return [row for row in new_export_rows(before, current)
+          def completed_export_candidates(before, current, requested_at=None):
+              return [row for row in new_export_rows(before, current, requested_at)
                       if row['status'].strip().casefold() == 'completed']
 
 
@@ -1451,44 +1494,44 @@ jobs:
 
 
           def export_current_report(page, label):
+              count = set_recorded_date_range(page)
               click_text(page, 'Downloads')
               before = wait_downloads_snapshot(page)
               click_text(page, 'Reports')
-              count = set_recorded_date_range(page)
               require_project(page)
-              if not applied_range_matches(page):
-                  raise RuntimeError('Date range changed before export; stopping.')
+              # Returning from Downloads must preserve the verified custom range.
+              wait_applied_report(page)
               wait_unique(page.get_by_text('Export Data', exact=True), 'Export Data').click()
+              requested_at = datetime.now(ZoneInfo(TZ_NAME))
               click_text(page, 'Filtered Data')
+              print('Export requested at:', requested_at.isoformat())
               click_text(page, 'Downloads')
               deadline = time.monotonic() + 600
-              current = []
-              last_observed = None
+              refresh_at = time.monotonic() + 8
+              current, last_observed = [], None
               while time.monotonic() < deadline:
-                  current = export_row_metadata(page)
                   require_project(page)
-                  new_rows = new_export_rows(before, current)
-                  if len(new_rows) > 1:
-                      save_export_diagnostic(label, count, before, current)
-                      raise RuntimeError('Multiple new exports appeared; cannot identify this run safely.')
-                  observed = [(row['records'], row['status'], row['created']) for row in new_rows]
+                  current = export_row_metadata(page)
+                  fresh = new_export_rows(before, current, requested_at)
+                  observed = [(row['records'], row['status'], row['created']) for row in fresh]
                   if observed != last_observed:
-                      print(label + ': new export states (records, status, created):', observed)
+                      print(label + ': verified new export states (records, status, created):', observed)
                       last_observed = observed
-                  candidates = completed_export_candidates(before, current)
-                  if len(candidates) > 1:
+                  if len(fresh) > 1:
                       save_export_diagnostic(label, count, before, current)
-                      raise RuntimeError('Multiple new completed exports appeared; cannot identify this export uniquely.')
+                      raise RuntimeError('Multiple fresh exports appeared; cannot identify this run uniquely.')
+                  candidates = completed_export_candidates(before, current, requested_at)
                   if len(candidates) == 1:
                       chosen = candidates[0]
-                      if any(export_identity(old) == export_identity(chosen) for old in before):
-                          raise RuntimeError('New export identity collides with an older export; stopping.')
-                      first = download_rows(page).nth(chosen['index'])
-                      cells = first.get_by_role('cell')
-                      if (cells.count() >= 5
-                              and ' '.join(cells.nth(0).inner_text().split()) == chosen['details']
-                              and ' '.join(cells.nth(3).inner_text().split()) == chosen['created']
-                              and cells.nth(2).inner_text().strip().casefold() == 'completed'):
+                      # Re-resolve after metadata collection so a reordered table cannot select an old row.
+                      latest = export_row_metadata(page)
+                      matching = [row for row in latest if export_identity(row) == export_identity(chosen)]
+                      if len(matching) == 1 and matching[0]['status'].strip().casefold() == 'completed':
+                          chosen = matching[0]
+                          first = download_rows(page).nth(chosen['index'])
+                          numeric_count = chosen['records'].replace(',', '').strip()
+                          if not numeric_count.isdigit():
+                              raise RuntimeError('Completed export has no unambiguous record count.')
                           with page.expect_download(timeout=60000) as event:
                               wait_unique(first.get_by_text('Download', exact=True), 'new export Download').click()
                           download = event.value
@@ -1496,13 +1539,29 @@ jobs:
                               raise RuntimeError('CSV download failed.')
                           path = Path('reports') / (label + '.csv')
                           download.save_as(str(path))
+                          with path.open(encoding='utf-8-sig', newline='') as source:
+                              reader = csv.DictReader(source)
+                              downloaded_count = sum(1 for _ in reader)
+                          if downloaded_count != int(numeric_count):
+                              raise RuntimeError('CSV row count disagrees with the selected completed export; stopping.')
                           total = validate_and_reduce_export(path)
                           print(label + ': CSV verified; records=' + str(total))
                           return
+                  if time.monotonic() >= refresh_at:
+                      # Some Downloads tables do not poll automatically. Refresh only the view,
+                      # never submit another export or reload the project/page selection.
+                      click_text(page, 'Reports')
+                      click_text(page, 'Downloads')
+                      wait_downloads_snapshot(page)
+                      refresh_at = time.monotonic() + 8
                   time.sleep(2)
               save_export_diagnostic(label, count, before, current)
-              raise RuntimeError('No uniquely new completed export appeared within 10 minutes. '
-                                 'See export diagnostics; no older CSV was used.')
+              Path('diagnostics/' + label + '-request.json').write_text(json.dumps({
+                  'requested_at': requested_at.isoformat(),
+                  'eligible_rows': new_export_rows(before, current, requested_at),
+              }, indent=2))
+              raise RuntimeError('No uniquely identifiable fresh completed export appeared within 10 minutes. '
+                                 'Old or indistinguishable rows were ignored; no older CSV was used.')
 
 
           Path('reports').mkdir(exist_ok=True)
@@ -1522,13 +1581,13 @@ jobs:
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 24.1: both CSVs verified; Google Sheets untouched in this job.')
+                  print('VERSION 24.2: both CSVs verified; Google Sheets untouched in this job.')
               except Exception as error:
                   try:
                       save_navigation_diagnostic(page, [])
                   except Exception:
                       pass
-                  print('VERSION 24.1 stopped:', type(error).__name__, str(error))
+                  print('VERSION 24.2 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
