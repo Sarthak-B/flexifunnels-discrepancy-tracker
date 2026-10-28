@@ -631,7 +631,7 @@ jobs:
           EXPECTED_LANDING_URL = 'https://sb.flexifunnels.com/funnel-agent'
           EXPECTED_REG_URL = 'https://sb.flexifunnels.com/flexi-genie-regteam'
 
-          print('WORKFLOW REVISION: V24.2 — fresh export identity and Downloads refresh')
+          print('WORKFLOW REVISION: V24.3 — apply report dates after Downloads snapshot')
           if not EMAIL or not PASSWORD:
               raise RuntimeError('FlexiFunnels credentials missing.')
           if PROJECT_URL.rstrip('/') != EXPECTED_PROJECT_URL:
@@ -1494,13 +1494,15 @@ jobs:
 
 
           def export_current_report(page, label):
-              count = set_recorded_date_range(page)
               click_text(page, 'Downloads')
               before = wait_downloads_snapshot(page)
               click_text(page, 'Reports')
               require_project(page)
-              # Returning from Downloads must preserve the verified custom range.
-              wait_applied_report(page)
+              # Switching tabs can reset the date control. Apply the range AFTER
+              # the Downloads snapshot; do not switch tabs again before exporting.
+              count = set_recorded_date_range(page)
+              if not applied_range_matches(page):
+                  raise RuntimeError('Date range changed immediately before export; stopping.')
               wait_unique(page.get_by_text('Export Data', exact=True), 'Export Data').click()
               requested_at = datetime.now(ZoneInfo(TZ_NAME))
               click_text(page, 'Filtered Data')
@@ -1581,13 +1583,13 @@ jobs:
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 24.2: both CSVs verified; Google Sheets untouched in this job.')
+                  print('VERSION 24.3: both CSVs verified; Google Sheets untouched in this job.')
               except Exception as error:
                   try:
                       save_navigation_diagnostic(page, [])
                   except Exception:
                       pass
-                  print('VERSION 24.2 stopped:', type(error).__name__, str(error))
+                  print('VERSION 24.3 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
