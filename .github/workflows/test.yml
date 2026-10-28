@@ -631,7 +631,7 @@ jobs:
           EXPECTED_LANDING_URL = 'https://sb.flexifunnels.com/funnel-agent'
           EXPECTED_REG_URL = 'https://sb.flexifunnels.com/flexi-genie-regteam'
 
-          print('WORKFLOW REVISION: V24.4 — reuse project and return to Overview for the second page')
+          print('WORKFLOW REVISION: V24.5 — wait for unobstructed controls and center scrolling')
           if not EMAIL or not PASSWORD:
               raise RuntimeError('FlexiFunnels credentials missing.')
           if PROJECT_URL.rstrip('/') != EXPECTED_PROJECT_URL:
@@ -904,6 +904,62 @@ jobs:
               }, indent=2))
 
 
+          def click_unobstructed(page, locator, timeout=30000):
+              """Wait for a physically reachable control; never force or dispatch a click.
+              Trials do not activate controls. The real click is issued exactly once.
+              """
+              deadline = time.monotonic() + max(timeout, 30000) / 1000
+              last_blockers = []
+              while time.monotonic() < deadline:
+                  locator.wait_for(state='visible', timeout=5000)
+                  # Playwright's nearest-edge scrolling can place a control under the
+                  # sticky header. Center it within ALL scrolling ancestors instead.
+                  locator.evaluate("el => el.scrollIntoView({block:'center', inline:'center', behavior:'instant'})")
+                  page.wait_for_timeout(150)
+                  points = locator.evaluate('''el => {
+                      const r = el.getBoundingClientRect();
+                      return [[0.5,0.5],[0.25,0.5],[0.75,0.5],[0.5,0.75],[0.5,0.25]].map(([x,y]) => {
+                          const px=r.width*x, py=r.height*y;
+                          const top=document.elementFromPoint(r.left+px,r.top+py);
+                          return {x:px,y:py,clear:!!top&&(top===el||el.contains(top)),
+                                  blocker:top ? {tag:top.tagName,role:top.getAttribute('role'),
+                                    position:getComputedStyle(top).position,
+                                    fixedAncestor:!!top.closest('.fixed, .sticky, nav')} : null};
+                      });
+                  }''')
+                  last_blockers = [item['blocker'] for item in points if not item['clear']]
+                  for point in points:
+                      if not point['clear']:
+                          continue
+                      position = {'x': point['x'], 'y': point['y']}
+                      try:
+                          locator.click(trial=True, position=position, timeout=1000)
+                      except PlaywrightTimeoutError:
+                          continue
+                      locator.click(position=position, timeout=15000)
+                      return
+                  # Dismiss only the observed notification container, and only when it
+                  # exposes an explicit close control. Never remove DOM or bypass overlays.
+                  notices = page.locator('div.fixed.top-6.z-50.bg-gradient-to-r').filter(visible=True)
+                  for notice in visible_items(notices):
+                      close = first_unique_visible([
+                          notice.get_by_role('button', name=re.compile(r'^\s*(?:Close|Dismiss)(?: notification| alert)?\s*$', re.I)),
+                          notice.locator('[aria-label="Close" i], [aria-label="Dismiss" i], button[title="Close" i]'),
+                      ])
+                      if close is not None:
+                          try:
+                              close.click(trial=True, timeout=700)
+                          except PlaywrightTimeoutError:
+                              continue
+                          close.click(timeout=3000)
+                  page.wait_for_timeout(500)
+              Path('diagnostics').mkdir(exist_ok=True)
+              Path('diagnostics/blocked-click.json').write_text(json.dumps({
+                  'location': safe_location(page), 'blockers': last_blockers,
+              }, indent=2))
+              raise RuntimeError('Control remains covered by another element; see blocked-click.json. No forced click attempted.')
+
+
           def open_page_from_project_sidebar(page, published_url):
               target = published_url.rstrip('/')
               parsed = urlparse(page.url)
@@ -926,7 +982,7 @@ jobs:
                   page.get_by_text(back_pattern),
               ])
               if back is not None:
-                  back.click(timeout=15000)
+                  click_unobstructed(page, back, timeout=15000)
                   wait_unique(page.get_by_text('More', exact=True), 'Page Overview after Reports', 45)
                   print('Returned from Reports/Downloads to Page Overview.')
               search = wait_unique(page.locator('input[placeholder*="Search pages" i]'), 'Project page search', 45)
@@ -981,7 +1037,7 @@ jobs:
                   if candidate.count() != 1:
                       raise RuntimeError('Ambiguous page title in project sidebar: ' + name)
                   candidate.scroll_into_view_if_needed(timeout=5000)
-                  candidate.click(timeout=10000)
+                  click_unobstructed(page, candidate, timeout=10000)
                   settled_until = time.monotonic() + 5
                   while time.monotonic() < settled_until:
                       require_project(page)
@@ -1033,7 +1089,7 @@ jobs:
 
 
           def click_text(page, text):
-              wait_unique(page.get_by_text(text, exact=True), text).click()
+              click_unobstructed(page, wait_unique(page.get_by_text(text, exact=True), text))
 
 
           def open_recorded_reports(page, published_url):
@@ -1077,7 +1133,7 @@ jobs:
                   if len(matched) != 1:
                       raise RuntimeError('Recorded Reports icon cannot be identified uniquely inside Overview.')
                   control = next(iter(matched.values()))
-              control.click()
+              click_unobstructed(page, control)
               wait_unique(page.get_by_text(re.compile(r'^\s*Page Reports\b')), 'Page Reports', 45)
               require_project(page)
               wait_unique(page.get_by_text('Export Data', exact=True), 'Export Data', 45)
@@ -1114,7 +1170,7 @@ jobs:
                       page.get_by_text(all_time_pattern),
                   ])
                   if trigger is not None:
-                      trigger.click(timeout=15000)
+                      click_unobstructed(page, trigger, timeout=15000)
                       option_deadline = time.monotonic() + 15
                       while time.monotonic() < option_deadline:
                           option = first_unique_visible([
@@ -1123,7 +1179,7 @@ jobs:
                               page.get_by_text(custom_pattern),
                           ])
                           if option is not None:
-                              option.click(timeout=15000)
+                              click_unobstructed(page, option, timeout=15000)
                               print('Custom range selected using visible All Time control.')
                               return
                           time.sleep(0.25)
@@ -1176,7 +1232,7 @@ jobs:
                           navigation = labeled[0]
                   if navigation is None:
                       raise RuntimeError('Calendar month arrow lacks a unique directional label; stopping.')
-                  navigation.click()
+                  click_unobstructed(page, navigation)
                   deadline = time.monotonic() + 5
                   while time.monotonic() < deadline:
                       calendar = recorded_calendar(page)
@@ -1226,7 +1282,7 @@ jobs:
                   if not usable and disabled:
                       raise RuntimeError('Calendar day ' + target.isoformat() + ' is disabled in FlexiFunnels (future or unavailable date).')
                   raise RuntimeError('Calendar day ' + target.isoformat() + ' is missing or ambiguous.')
-              usable[0]['item'].click()
+              click_unobstructed(page, usable[0]['item'])
               print('Calendar date clicked:', target.isoformat())
 
 
@@ -1351,12 +1407,12 @@ jobs:
                   time.sleep(0.25)
               if picker is None:
                   raise RuntimeError('Custom range selected, but Select Date Range did not appear.')
-              picker.click()
+              click_unobstructed(page, picker)
               try:
                   click_calendar_date(page, RANGE_START)
                   click_calendar_date(page, RANGE_END)
                   verify_calendar_preview(page)
-                  wait_unique(page.get_by_text(re.compile(r'^\s*OK\s*$', re.IGNORECASE)), 'Calendar OK').click()
+                  click_unobstructed(page, wait_unique(page.get_by_text(re.compile(r'^\s*OK\s*$', re.IGNORECASE)), 'Calendar OK'))
               except Exception:
                   save_calendar_diagnostic(page)
                   raise
@@ -1535,7 +1591,7 @@ jobs:
               count = set_recorded_date_range(page)
               if not applied_range_matches(page):
                   raise RuntimeError('Date range changed immediately before export; stopping.')
-              wait_unique(page.get_by_text('Export Data', exact=True), 'Export Data').click()
+              click_unobstructed(page, wait_unique(page.get_by_text('Export Data', exact=True), 'Export Data'))
               requested_at = datetime.now(ZoneInfo(TZ_NAME))
               click_text(page, 'Filtered Data')
               print('Export requested at:', requested_at.isoformat())
@@ -1567,7 +1623,7 @@ jobs:
                           if not numeric_count.isdigit():
                               raise RuntimeError('Completed export has no unambiguous record count.')
                           with page.expect_download(timeout=60000) as event:
-                              wait_unique(first.get_by_text('Download', exact=True), 'new export Download').click()
+                              click_unobstructed(page, wait_unique(first.get_by_text('Download', exact=True), 'new export Download'))
                           download = event.value
                           if download.failure():
                               raise RuntimeError('CSV download failed.')
@@ -1615,13 +1671,13 @@ jobs:
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 24.4: both CSVs verified; Google Sheets untouched in this job.')
+                  print('VERSION 24.5: both CSVs verified; Google Sheets untouched in this job.')
               except Exception as error:
                   try:
                       save_navigation_diagnostic(page, [])
                   except Exception:
                       pass
-                  print('VERSION 24.4 stopped:', type(error).__name__, str(error))
+                  print('VERSION 24.5 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
