@@ -631,7 +631,7 @@ jobs:
           EXPECTED_LANDING_URL = 'https://sb.flexifunnels.com/funnel-agent'
           EXPECTED_REG_URL = 'https://sb.flexifunnels.com/flexi-genie-regteam'
 
-          print('WORKFLOW REVISION: V23 — manual FlexiFunnels date range')
+          print('WORKFLOW REVISION: V23.1 — manual FlexiFunnels date range (adjacent-month calendar fix)')
           if not EMAIL or not PASSWORD:
               raise RuntimeError('FlexiFunnels credentials missing.')
           if PROJECT_URL.rstrip('/') != EXPECTED_PROJECT_URL:
@@ -1106,10 +1106,22 @@ jobs:
                       return {key: Array.from(document.querySelectorAll('*')).indexOf(cell),
                               disabled: flags.includes('disabled'), outside: flags.includes('outside')};
                   }''')
-                  entry = cells.setdefault(info['key'], {'item': item, 'disabled': False, 'outside': False})
+                  entry = cells.setdefault(info['key'], {'item': item, 'key': info['key'],
+                                                         'disabled': False, 'outside': False})
                   entry['disabled'] = entry['disabled'] or info['disabled']
                   entry['outside'] = entry['outside'] or info['outside']
               usable = [e for e in cells.values() if not e['disabled'] and not e['outside']]
+              if len(usable) > 1:
+                  # The grid also shows leftover days from the neighbouring months.
+                  # Previous-month days (e.g. 28-30 Sep) come BEFORE day 1 of this month;
+                  # next-month days (e.g. 1-8 Nov) come AFTER the month's last day.
+                  # So for day >= 15 the real cell is the LAST match, otherwise the FIRST.
+                  # verify_calendar_preview() still checks the final range afterwards.
+                  ordered = sorted(usable, key=lambda e: e['key'])
+                  pick_last = target.day >= 15
+                  print('Calendar day', target.isoformat(), '- duplicates from adjacent months:', len(usable),
+                        '| picked the', 'last' if pick_last else 'first', 'by grid position')
+                  usable = [ordered[-1] if pick_last else ordered[0]]
               if len(usable) != 1:
                   disabled = sum(1 for e in cells.values() if e['disabled'] and not e['outside'])
                   print('Calendar day', target.isoformat(), '- cells:', len(cells), 'disabled:', disabled, 'usable:', len(usable))
@@ -2656,7 +2668,7 @@ jobs:
               return digits
 
 
-          _INVISIBLE = re.compile(r'[\s\u200b-\u200f\u2060\ufeff\u00a0]+')
+          _INVISIBLE = re.compile(r'[\s​-‏⁠﻿ ]+')
 
 
           def clean_email(value):
