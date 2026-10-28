@@ -631,7 +631,7 @@ jobs:
           EXPECTED_LANDING_URL = 'https://sb.flexifunnels.com/funnel-agent'
           EXPECTED_REG_URL = 'https://sb.flexifunnels.com/flexi-genie-regteam'
 
-          print('WORKFLOW REVISION: V23.1 — manual FlexiFunnels date range (adjacent-month calendar fix)')
+          print('WORKFLOW REVISION: V23.2 — calendar fix + project-search retry')
           if not EMAIL or not PASSWORD:
               raise RuntimeError('FlexiFunnels credentials missing.')
           if PROJECT_URL.rstrip('/') != EXPECTED_PROJECT_URL:
@@ -895,23 +895,61 @@ jobs:
               print('Published URL selected.')
 
 
+          def wait_for_project_page(page, seconds):
+              project_path = urlparse(PROJECT_URL).path.rstrip('/')
+              deadline = time.monotonic() + seconds
+              while time.monotonic() < deadline:
+                  if current_path(page) == project_path:
+                      return True
+                  time.sleep(0.5)
+              return current_path(page) == project_path
+
+
           def search_published_url(page, published_url):
-              print()
-              print('Entering published URL')
-              search_field = unique_visible(page.locator('input[placeholder*="Search" i]'))
-              if search_field is None:
-                  raise RuntimeError('Published URL search field missing.')
-              search_field.fill(published_url)
-              print('Published URL entered.')
-              search_button = unique_visible(page.get_by_role('button', name=re.compile(r'^\s*Search\s*$', re.IGNORECASE)))
-              if search_button is not None:
-                  print('Clicking Search.')
-                  search_button.click(timeout=15000)
-              else:
-                  print('No separate Search button. Waiting for reactive search.')
-              print('Published URL search submitted.')
-              page.wait_for_timeout(4000)
-              print('Location after search:', safe_location(page))
+              """Search by published URL and make sure the project actually opens.
+              FlexiFunnels does not always jump straight to the project (it can leave the
+              results on /projects), so this waits, clicks the matching project link if one
+              is shown, and otherwise reloads Projects and tries again (3 attempts)."""
+              project_path = urlparse(PROJECT_URL).path.rstrip('/')
+              for attempt in range(1, 4):
+                  print()
+                  print('Entering published URL (attempt ' + str(attempt) + ' of 3)')
+                  search_field = unique_visible(page.locator('input[placeholder*="Search" i]'))
+                  if search_field is None:
+                      raise RuntimeError('Published URL search field missing.')
+                  search_field.fill('')
+                  search_field.fill(published_url)
+                  print('Published URL entered.')
+                  search_button = unique_visible(page.get_by_role('button', name=re.compile(r'^\s*Search\s*$', re.IGNORECASE)))
+                  if search_button is not None:
+                      print('Clicking Search.')
+                      search_button.click(timeout=15000)
+                  else:
+                      print('No separate Search button. Pressing Enter.')
+                      search_field.press('Enter')
+                  print('Published URL search submitted.')
+                  opened = wait_for_project_page(page, 20)
+                  print('Location after search:', safe_location(page))
+                  if opened:
+                      return
+                  links = visible_items(page.locator('a[href*="' + project_path + '"]'))
+                  print('Search stayed on Projects; links to the project visible:', len(links))
+                  if links:
+                      links[0].click(timeout=15000)
+                      if wait_for_project_page(page, 20):
+                          print('Opened the project from the search results:', safe_location(page))
+                          return
+                  Path('diagnostics').mkdir(exist_ok=True)
+                  try:
+                      page.screenshot(path='diagnostics/projects-search-attempt-' + str(attempt) + '.png', full_page=True)
+                  except Exception:
+                      pass
+                  if attempt < 3:
+                      print('Project did not open; reloading Projects and searching again.')
+                      open_projects(page)
+                      select_published_url(page)
+              raise RuntimeError('Published URL search did not open the project after 3 attempts '
+                                 '(see diagnostics/projects-search-attempt-*.png).')
 
 
           def wait_unique(locator, description, seconds=30):
