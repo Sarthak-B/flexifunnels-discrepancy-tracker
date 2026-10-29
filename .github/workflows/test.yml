@@ -629,14 +629,17 @@ jobs:
 
           EXPECTED_PROJECT_URL = 'https://app.flexifunnels.com/projects/kvapNzyj'
           EXPECTED_LANDING_URL = 'https://sb.flexifunnels.com/funnel-agent'
-          EXPECTED_REG_URL = 'https://b68n9p.flexifunnels.com/flexi-genie-regteam'
+          EXPECTED_REG_URL = 'https://b68n9p.flexifunnels.com/flexi-genie-regteam-1nov'
           # User selected the newer Reg Team page on 29 Oct 2026. Accept the
-          # previous repository variable while migrating to this explicit target.
-          if REG_URL.rstrip('/') == 'https://sb.flexifunnels.com/flexi-genie-regteam':
+          # previous repository variables; same page ID, current URL verified 30 Oct.
+          if REG_URL.rstrip('/') in {
+              'https://sb.flexifunnels.com/flexi-genie-regteam',
+              'https://b68n9p.flexifunnels.com/flexi-genie-regteam',
+          }:
               print('Using the user-selected newer Reg Team URL in place of the legacy variable.')
               REG_URL = EXPECTED_REG_URL
 
-          print('WORKFLOW REVISION: V24.6 — verified page identities and keyboard return to Overview')
+          print('WORKFLOW REVISION: V24.7 — live-verified Reg Team URL and explicit identity diagnostics')
           if not EMAIL or not PASSWORD:
               raise RuntimeError('FlexiFunnels credentials missing.')
           if PROJECT_URL.rstrip('/') != EXPECTED_PROJECT_URL:
@@ -1026,16 +1029,28 @@ jobs:
               return False
 
 
+          def overview_identity(page):
+              card = overview_card(page)
+              if card is None:
+                  return {'card_found': False, 'titles': [], 'page_ids': [], 'urls': []}
+              return {
+                  'card_found': True,
+                  'titles': [item.inner_text().strip() for item in visible_items(card.get_by_role('heading'))],
+                  'page_ids': re.findall(r'Page\s+Id\s*[-:]\s*([A-Za-z0-9]+)', card.inner_text(), re.I),
+                  'urls': sorted(overview_urls(page)),
+              }
+
+
           def verify_overview(page, published_url):
               title, page_id = expected_page(published_url)
+              expected = {'title': title, 'page_id': page_id, 'url': published_url.rstrip('/')}
               deadline, stable_since = time.monotonic() + 30, None
+              observed = None
               while time.monotonic() < deadline:
                   require_project(page)
-                  card = overview_card(page)
-                  text = card.inner_text() if card is not None else ''
-                  ids = re.findall(r'Page\s+Id\s*[-:]\s*([A-Za-z0-9]+)', text, re.I)
-                  valid = (published_url.rstrip('/') in overview_urls(page) and ids == [page_id]
-                           and card.get_by_role('heading', name=title, exact=True).count() == 1)
+                  observed = overview_identity(page)
+                  valid = (expected['url'] in observed['urls'] and observed['page_ids'] == [page_id]
+                           and observed['titles'].count(title) == 1)
                   if valid:
                       if stable_since is None:
                           stable_since = time.monotonic()
@@ -1044,7 +1059,11 @@ jobs:
                   else:
                       stable_since = None
                   time.sleep(0.25)
-              raise RuntimeError('Overview did not confirm the expected page title, page ID and exact URL; stopping.')
+              Path('diagnostics').mkdir(exist_ok=True)
+              diagnostic = {'expected': expected, 'observed': observed, 'location': safe_location(page)}
+              Path('diagnostics/page-identity-mismatch.json').write_text(json.dumps(diagnostic, indent=2))
+              print('Page identity mismatch:', json.dumps(diagnostic))
+              raise RuntimeError('Page identity differs from the approved target. See expected/observed values above; no export attempted.')
 
 
           def wait_unique(locator, description, seconds=30):
@@ -1644,13 +1663,13 @@ jobs:
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 24.6: both CSVs verified; Google Sheets untouched in this job.')
+                  print('VERSION 24.7: both CSVs verified; Google Sheets untouched in this job.')
               except Exception as error:
                   try:
                       save_navigation_diagnostic(page, [])
                   except Exception:
                       pass
-                  print('VERSION 24.6 stopped:', type(error).__name__, str(error))
+                  print('VERSION 24.7 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
