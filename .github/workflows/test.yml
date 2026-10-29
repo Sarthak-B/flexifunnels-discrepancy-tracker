@@ -629,9 +629,14 @@ jobs:
 
           EXPECTED_PROJECT_URL = 'https://app.flexifunnels.com/projects/kvapNzyj'
           EXPECTED_LANDING_URL = 'https://sb.flexifunnels.com/funnel-agent'
-          EXPECTED_REG_URL = 'https://sb.flexifunnels.com/flexi-genie-regteam'
+          EXPECTED_REG_URL = 'https://b68n9p.flexifunnels.com/flexi-genie-regteam'
+          # User selected the newer Reg Team page on 29 Oct 2026. Accept the
+          # previous repository variable while migrating to this explicit target.
+          if REG_URL.rstrip('/') == 'https://sb.flexifunnels.com/flexi-genie-regteam':
+              print('Using the user-selected newer Reg Team URL in place of the legacy variable.')
+              REG_URL = EXPECTED_REG_URL
 
-          print('WORKFLOW REVISION: V24.5 — wait for unobstructed controls and center scrolling')
+          print('WORKFLOW REVISION: V24.6 — verified page identities and keyboard return to Overview')
           if not EMAIL or not PASSWORD:
               raise RuntimeError('FlexiFunnels credentials missing.')
           if PROJECT_URL.rstrip('/') != EXPECTED_PROJECT_URL:
@@ -960,8 +965,35 @@ jobs:
               raise RuntimeError('Control remains covered by another element; see blocked-click.json. No forced click attempted.')
 
 
-          def open_page_from_project_sidebar(page, published_url):
+          def return_to_overview(page):
+              back = unique_visible(page.get_by_role('button', name='Back to Overview', exact=True))
+              if back is not None:
+                  # Live DOM inspection confirmed this is a native BUTTON. Keyboard activation
+                  # works through its normal handler even when fixed banners obscure its pixels.
+                  if not back.is_enabled():
+                      raise RuntimeError('Back to Overview is disabled; stopping.')
+                  back.focus()
+                  if not back.evaluate('el => document.activeElement === el && el.tagName === "BUTTON"'):
+                      raise RuntimeError('Could not focus the exact Back to Overview button.')
+                  back.press('Enter', timeout=15000)
+                  wait_unique(page.get_by_text('More', exact=True), 'Page Overview after Reports', 45)
+                  require_project(page)
+                  print('Returned to Overview using the native button keyboard action.')
+
+
+          def expected_page(published_url):
+              mapping = {
+                  EXPECTED_LANDING_URL: ('Funnel Builder Agent Launch Workshop (Original)', 'dQn48rz3Z79xGlD9'),
+                  EXPECTED_REG_URL: ('Flexi Genie Freelancing Workshop (Reg Team)', 'M3XDnxOoVqLxpmR0'),
+              }
               target = published_url.rstrip('/')
+              if target not in mapping:
+                  raise RuntimeError('No verified page identity for the requested published URL.')
+              return mapping[target]
+
+
+          def open_page_from_project_sidebar(page, published_url):
+              title, page_id = expected_page(published_url)
               parsed = urlparse(page.url)
               in_project = (parsed.scheme == 'https' and parsed.netloc == 'app.flexifunnels.com'
                             and parsed.path.rstrip('/') == urlparse(PROJECT_URL).path.rstrip('/'))
@@ -970,86 +1002,17 @@ jobs:
                   page.goto(PROJECT_URL, wait_until='domcontentloaded', timeout=60000)
                   if not wait_for_project_page(page, 30):
                       raise RuntimeError('Direct project navigation failed; no export attempted.')
-              else:
-                  print('Reusing the current project session to select the next page.')
               require_project(page)
-              # Reports/Downloads is a view inside this project. Return through its
-              # own Back to Overview control instead of restarting the application.
-              back_pattern = re.compile(r'^\s*Back to Overview\s*$', re.IGNORECASE)
-              back = first_unique_visible([
-                  page.get_by_role('button', name=back_pattern),
-                  page.get_by_role('link', name=back_pattern),
-                  page.get_by_text(back_pattern),
-              ])
-              if back is not None:
-                  click_unobstructed(page, back, timeout=15000)
-                  wait_unique(page.get_by_text('More', exact=True), 'Page Overview after Reports', 45)
-                  print('Returned from Reports/Downloads to Page Overview.')
+              return_to_overview(page)
               search = wait_unique(page.locator('input[placeholder*="Search pages" i]'), 'Project page search', 45)
-              if search.input_value():
-                  search.fill('')
-              # The first page selection may leave the list scrolled down. Start
-              # each scan at the top, including independently scrolling child lists.
-              search.evaluate('''input => {
-                  for (let root = input.parentElement; root && root !== document.body; root = root.parentElement) {
-                      if (root.getBoundingClientRect().width > innerWidth * 0.45) break;
-                      for (const el of [root, ...root.querySelectorAll('*')]) {
-                          if (el.scrollHeight > el.clientHeight && /auto|scroll/.test(getComputedStyle(el).overflowY)) {
-                              el.scrollTop = 0;
-                          }
-                      }
-                  }
-              }''')
-              seen, checked = [], set()
-              deadline = time.monotonic() + 300
-              while time.monotonic() < deadline:
-                  require_project(page)
-                  if target in overview_urls(page):
-                      verify_overview(page, target)
-                      print('Correct page verified by its exact published URL:', target)
-                      return
-                  names = project_page_names(page)
-                  remaining = [name for name in names if name not in checked]
-                  if not remaining:
-                      # Also support lists that render more entries when scrolled.
-                      sidebar = page.locator('[data-ff-page-list="true"]')
-                      if sidebar.count() != 1:
-                          time.sleep(0.5)
-                          continue
-                      moved = sidebar.evaluate('''root => {
-                          let moved = false;
-                          for (const el of [root, ...root.querySelectorAll('*')]) {
-                              if (el.scrollHeight > el.clientHeight + 2 && /auto|scroll/.test(getComputedStyle(el).overflowY)) {
-                                  const old = el.scrollTop;
-                                  el.scrollTop += Math.max(100, el.clientHeight - 50);
-                                  moved = moved || el.scrollTop > old;
-                              }
-                          }
-                          return moved;
-                      }''')
-                      if not moved:
-                          break
-                      page.wait_for_timeout(500)
-                      continue
-                  name = remaining[0]
-                  checked.add(name)
-                  candidate = page.locator('[data-ff-page-list="true"]').get_by_text(name, exact=True)
-                  if candidate.count() != 1:
-                      raise RuntimeError('Ambiguous page title in project sidebar: ' + name)
-                  candidate.scroll_into_view_if_needed(timeout=5000)
-                  click_unobstructed(page, candidate, timeout=10000)
-                  settled_until = time.monotonic() + 5
-                  while time.monotonic() < settled_until:
-                      require_project(page)
-                      if target in overview_urls(page):
-                          verify_overview(page, target)
-                          print('Page selected and URL verified:', name)
-                          return
-                      time.sleep(0.25)
-                  seen.append({'page': name, 'published_urls': sorted(overview_urls(page))})
-              save_navigation_diagnostic(page, seen)
-              raise RuntimeError('Requested published URL was not verified in project kvapNzyj. '
-                                 'See project-navigation.json; no report was exported.')
+              search.fill(title)
+              # Scope to the actual sidebar list observed in the live DOM. Duplicate titles
+              # elsewhere (breadcrumb and Overview heading) must never become click targets.
+              candidate = wait_unique(page.get_by_role('list').get_by_text(title, exact=True),
+                                      'Exact page title in filtered sidebar', 30)
+              click_unobstructed(page, candidate, timeout=15000)
+              verify_overview(page, published_url)
+              print('Page verified:', title, '| Page Id:', page_id, '| URL:', published_url)
 
 
           def wait_for_project_page(page, seconds):
@@ -1064,10 +1027,16 @@ jobs:
 
 
           def verify_overview(page, published_url):
+              title, page_id = expected_page(published_url)
               deadline, stable_since = time.monotonic() + 30, None
               while time.monotonic() < deadline:
                   require_project(page)
-                  if published_url.rstrip('/') in overview_urls(page):
+                  card = overview_card(page)
+                  text = card.inner_text() if card is not None else ''
+                  ids = re.findall(r'Page\s+Id\s*[-:]\s*([A-Za-z0-9]+)', text, re.I)
+                  valid = (published_url.rstrip('/') in overview_urls(page) and ids == [page_id]
+                           and card.get_by_role('heading', name=title, exact=True).count() == 1)
+                  if valid:
                       if stable_since is None:
                           stable_since = time.monotonic()
                       elif time.monotonic() - stable_since >= 2:
@@ -1075,7 +1044,7 @@ jobs:
                   else:
                       stable_since = None
                   time.sleep(0.25)
-              raise RuntimeError('Page Overview did not confirm the exact published URL; stopping.')
+              raise RuntimeError('Overview did not confirm the expected page title, page ID and exact URL; stopping.')
 
 
           def wait_unique(locator, description, seconds=30):
@@ -1666,18 +1635,22 @@ jobs:
                   select_saurabh(page)
                   page = locate_switched_page(context, page)
                   page.set_default_timeout(15000)
-                  for label, published_url in [('funnel-agent', LANDING_URL), ('flexi-genie-regteam', REG_URL)]:
+                  targets = [('funnel-agent', LANDING_URL), ('flexi-genie-regteam', REG_URL)]
+                  for label, published_url in targets:
+                      open_page_from_project_sidebar(page, published_url)
+                  print('Both page identities verified before creating exports.')
+                  for label, published_url in targets:
                       open_page_from_project_sidebar(page, published_url)
                       verify_overview(page, published_url)
                       open_recorded_reports(page, published_url)
                       export_current_report(page, label)
-                  print('VERSION 24.5: both CSVs verified; Google Sheets untouched in this job.')
+                  print('VERSION 24.6: both CSVs verified; Google Sheets untouched in this job.')
               except Exception as error:
                   try:
                       save_navigation_diagnostic(page, [])
                   except Exception:
                       pass
-                  print('VERSION 24.5 stopped:', type(error).__name__, str(error))
+                  print('VERSION 24.6 stopped:', type(error).__name__, str(error))
                   raise RuntimeError('Report automation failed; no fallback export was attempted.') from None
               finally:
                   browser.close()
