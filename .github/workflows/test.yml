@@ -2142,31 +2142,32 @@ jobs:
 
 
           def open_registration_report(page):
-              print('Zoom: Profile -> Reports -> Meetings & Webinars -> Meeting and webinar registrations.')
-              if urlparse(page.url).path.rstrip('/') != '/profile':
-                  page.goto('https://us06web.zoom.us/profile', wait_until='domcontentloaded')
-              if not zoom_visible(page.get_by_text('Meetings & Webinars', exact=True)):
-                  zoom_click_first(page, ['Reports'], 'Reports menu')
-                  page.wait_for_timeout(1500)
-              zoom_click_first(page, ['Meetings & Webinars', 'Meetings and Webinars'], 'Meetings & Webinars menu')
-              page.wait_for_timeout(2500)
-              deadline = time.monotonic() + 60
-              while time.monotonic() < deadline and not zoom_on_registration_report(page):
-                  links = (zoom_visible(page.get_by_role('link', name='Meeting and webinar registrations', exact=True))
-                           or zoom_visible(page.get_by_text('Meeting and webinar registrations', exact=True))
-                           or zoom_visible(page.get_by_text(re.compile(r'^\s*Meeting and webinar registrations?\s*$', re.I))))
-                  if links:
-                      links[0].click()
-                      page.wait_for_timeout(2500)
-                  else:
+              # Verified through the user's personal Reports menu on 30 Oct 2026.
+              target = 'https://us06web.zoom.us/account/report?isPersonal=true#/usageReports/meetingRegistration'
+              print('Zoom: opening the verified personal registration report directly.')
+              try:
+                  page.goto(target, wait_until='domcontentloaded')
+                  deadline = time.monotonic() + 60
+                  while time.monotonic() < deadline:
+                      address = urlparse(page.url)
+                      valid = (address.scheme == 'https' and zoom_session_host(address.hostname)
+                               and address.path.rstrip('/') == '/account/report'
+                               and dict(parse_qsl(address.query)).get('isPersonal') == 'true'
+                               and address.fragment.partition('?')[0] == '/usageReports/meetingRegistration')
+                      title = zoom_visible(page.get_by_text('Meeting and webinar registrations', exact=True))
+                      if valid and title:
+                          break
                       time.sleep(0.5)
-              if not zoom_on_registration_report(page):
+                  else:
+                      raise RuntimeError('Expected personal registration report did not load.')
+                  zoom_one(page.get_by_text('From', exact=True), 'From label', seconds=45)
+                  zoom_one(page.get_by_text('To', exact=True), 'To label', seconds=15)
+                  zoom_one(page.get_by_role('button', name='Search', exact=True), 'Search button', seconds=15)
+                  print('Zoom: personal registrations report and date controls verified.')
+              except Exception:
                   zoom_filter_diagnostic(page, date.today())
-                  print('Zoom: route reached:', zoom_route(page))
-                  raise RuntimeError('Could not open the Meeting and webinar registrations report. See filters.png.')
-              zoom_one(page.get_by_text('From', exact=True), 'From label', seconds=45)
-              zoom_one(page.get_by_text('To', exact=True), 'To label', seconds=15)
-              print('Zoom: registrations report opened.')
+                  print('Zoom: report navigation stopped at:', zoom_route(page))
+                  raise RuntimeError('Could not verify personal registration report. See Zoom report diagnostics; no export attempted.') from None
 
 
           ZOOM_BOX_JS = '''(label) => {
